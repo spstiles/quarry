@@ -976,23 +976,6 @@ void FilePanel::BindEvents() {
   list_->Bind(wxEVT_LEFT_DCLICK, [this](wxMouseEvent& e) {
     renameArmedItem_ = wxDataViewItem();
     renameArmedAtMs_ = 0;
-    // In non-directory (virtual/remote) views we don't support inline rename, and
-    // some platforms may not emit ITEM_ACTIVATED reliably when the first column
-    // is editable. Ensure double-click navigates.
-    if (listingMode_ != ListingMode::Directory && list_) {
-      wxDataViewItem item;
-      wxDataViewColumn* col = nullptr;
-      list_->HitTest(e.GetPosition(), item, col);
-      if (item.IsOk()) {
-        if (!list_->IsSelected(item)) {
-          list_->UnselectAll();
-          list_->Select(item);
-        }
-        list_->SetCurrentItem(item);
-        OpenSelection();
-        return;
-      }
-    }
     e.Skip();
   });
   list_->Bind(wxEVT_MOTION, [this](wxMouseEvent& e) {
@@ -1037,12 +1020,7 @@ void FilePanel::BindEvents() {
     if (renameArmedItem_.IsOk() && item == renameArmedItem_ && (now - renameArmedAtMs_) > dclickMs) {
       renameArmedItem_ = wxDataViewItem();
       renameArmedAtMs_ = 0;
-      if (listingMode_ == ListingMode::Directory) {
-        BeginInlineRename();
-      } else {
-        // In remote/virtual views we don't rename; treat a slow double-click as open.
-        OpenSelection();
-      }
+      BeginInlineRename();
       return;
     }
 
