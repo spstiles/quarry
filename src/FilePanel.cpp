@@ -219,7 +219,7 @@ int UppercaseCount(const std::string& s) {
 std::optional<std::string> HostRootForUri(const std::string& uri) {
   if (!LooksLikeUri(uri)) return std::nullopt;
   const auto scheme = UriScheme(uri);
-  if (scheme != "smb" && scheme != "afp") return std::nullopt;
+  if (scheme != "smb" && scheme != "afp" && scheme != "sftp") return std::nullopt;
 
   auto host = UriAuthorityHost(uri);
   if (host.empty()) return std::nullopt;
@@ -237,6 +237,7 @@ bool AddRecentHost(const std::string& uri) {
 
   std::string display = hostDisplay;
   if (scheme == "afp") display = hostDisplay + "(AFP)";
+  else if (scheme == "sftp") display = hostDisplay + "(SSH)";
 
   // De-dupe by canonical key (case-insensitive host).
   auto it = std::find_if(g_recentHosts.begin(), g_recentHosts.end(),
@@ -1690,7 +1691,9 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
           return false;
         }
 
-        if ((UriScheme(effectiveUri) == "smb" || UriScheme(effectiveUri) == "afp") && AddRecentHost(effectiveUri) &&
+        if ((UriScheme(effectiveUri) == "smb" || UriScheme(effectiveUri) == "afp" ||
+             UriScheme(effectiveUri) == "sftp") &&
+            AddRecentHost(effectiveUri) &&
             networkRoot_.IsOk()) {
           PopulateNetwork(networkRoot_);
           // Now that the host exists in the sidebar, sync selection to it (instead of the group header).
