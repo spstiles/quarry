@@ -21,16 +21,19 @@ bool ConfirmFileOp(wxWindow* parent,
 
 using CancelFn = std::function<bool()>;
 using CopyProgressFn = std::function<void(const std::filesystem::path& current)>;
+using CopyBytesProgressFn = std::function<void(std::uintmax_t bytesDelta)>;
 
 OpResult CopyPathRecursive(const std::filesystem::path& src, const std::filesystem::path& dst);
 OpResult CopyPathRecursive(const std::filesystem::path& src,
                            const std::filesystem::path& dst,
                            const CancelFn& shouldCancel,
-                           const CopyProgressFn& onProgress);
+                           const CopyProgressFn& onProgress,
+                           const CopyBytesProgressFn& onBytes);
 OpResult MovePath(const std::filesystem::path& src, const std::filesystem::path& dst);
 OpResult MovePath(const std::filesystem::path& src,
                   const std::filesystem::path& dst,
                   const CancelFn& shouldCancel,
-                  const CopyProgressFn& onProgress);
+                  const CopyProgressFn& onProgress,
+                  const CopyBytesProgressFn& onBytes);
 OpResult DeletePath(const std::filesystem::path& src);
 OpResult TrashPath(const std::filesystem::path& src);

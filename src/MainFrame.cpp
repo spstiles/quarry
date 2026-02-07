@@ -8,6 +8,7 @@
 #include <mutex>
 #include <optional>
 #include <thread>
+#include <limits>
 
 #include <wx/accel.h>
 #include <wx/choicdlg.h>
@@ -81,9 +82,12 @@ struct AsyncFileOpState {
 
   std::atomic<bool> cancelRequested{false};
   std::atomic<size_t> done{0};
+  std::atomic<std::uintmax_t> bytesDone{0};
 
   bool finished{false};
   bool hasDir{false};
+  bool scanDone{false};
+  std::uintmax_t totalBytes{0};
   std::string currentLabel{};
 
   std::optional<AsyncFileOpPrompt> prompt{};
@@ -93,6 +97,52 @@ struct AsyncFileOpState {
 bool LooksLikeUriPath(const std::filesystem::path& p) {
   const auto s = p.string();
   return s.find("://") != std::string::npos;
+}
+
+std::uintmax_t EstimateTotalBytes(const std::vector<std::filesystem::path>& sources,
+                                 const CancelFn& shouldCancel,
+                                 const CopyProgressFn& onProgress) {
+  namespace fs = std::filesystem;
+  std::uintmax_t total = 0;
+  std::error_code ec;
+
+  for (const auto& src : sources) {
+    if (shouldCancel && shouldCancel()) break;
+    if (src.empty()) continue;
+
+    ec.clear();
+    const auto st = fs::symlink_status(src, ec);
+    if (ec) continue;
+
+    if (fs::is_directory(st)) {
+      fs::recursive_directory_iterator it(src, fs::directory_options::skip_permission_denied, ec);
+      if (ec) continue;
+      for (const auto& entry : it) {
+        if (shouldCancel && shouldCancel()) break;
+        if (onProgress) onProgress(entry.path());
+
+        ec.clear();
+        const auto est = entry.symlink_status(ec);
+        if (ec) continue;
+        if (!fs::is_regular_file(est)) continue;
+
+        ec.clear();
+        const auto sz = fs::file_size(entry.path(), ec);
+        if (ec) continue;
+        total += sz;
+      }
+      continue;
+    }
+
+    if (fs::is_regular_file(st)) {
+      ec.clear();
+      const auto sz = fs::file_size(src, ec);
+      if (ec) continue;
+      total += sz;
+    }
+  }
+
+  return total;
 }
 
 std::string PercentEncode(std::string s) {
@@ -507,6 +557,24 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
 
   std::thread worker([&state, sources, dstDir, move]() {
     std::error_code workerEc;
+
+    const CancelFn shouldCancel = [&state]() { return state.cancelRequested.load(); };
+    const CopyProgressFn scanProgress = [&state](const std::filesystem::path& current) {
+      std::string label = current.filename().string();
+      if (label.empty()) label = current.string();
+      std::lock_guard<std::mutex> lock(state.mu);
+      state.currentLabel = "Scanning: " + label;
+    };
+
+    const auto total = EstimateTotalBytes(sources, shouldCancel, scanProgress);
+    {
+      std::lock_guard<std::mutex> lock(state.mu);
+      state.totalBytes = total;
+      state.scanDone = true;
+      if (state.currentLabel.rfind("Scanning:", 0) == 0) state.currentLabel = "Preparing...";
+    }
+    state.cv.notify_all();
+
     for (const auto& src : sources) {
       if (state.cancelRequested.load()) break;
       if (src.empty()) {
@@ -570,7 +638,6 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
         continue;
       }
 
-      const CancelFn shouldCancel = [&state]() { return state.cancelRequested.load(); };
       const CopyProgressFn onProgress = [&state, src](const std::filesystem::path& current) {
         const auto rel = current.lexically_relative(src);
         std::string label;
@@ -581,8 +648,12 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
         state.currentLabel = std::move(label);
       };
 
-      const auto result = move ? MovePath(src, dst, shouldCancel, onProgress)
-                               : CopyPathRecursive(src, dst, shouldCancel, onProgress);
+      const CopyBytesProgressFn onBytes = [&state](std::uintmax_t bytesDelta) {
+        state.bytesDone.fetch_add(bytesDelta);
+      };
+
+      const auto result = move ? MovePath(src, dst, shouldCancel, onProgress, onBytes)
+                               : CopyPathRecursive(src, dst, shouldCancel, onProgress, onBytes);
       if (state.cancelRequested.load() && !result.ok && result.message == "Canceled") break;
       if (!result.ok) {
         std::unique_lock<std::mutex> lock(state.mu);
@@ -613,11 +684,15 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
 
   wxProgressDialog progress(move ? "Moving" : "Copying",
                             "Preparing...",
-                            static_cast<int>(sources.size()),
+                            100,
                             this,
-                            wxPD_APP_MODAL | wxPD_CAN_ABORT | wxPD_AUTO_HIDE | wxPD_ELAPSED_TIME);
+                            wxPD_APP_MODAL | wxPD_CAN_ABORT | wxPD_AUTO_HIDE | wxPD_ELAPSED_TIME |
+                                wxPD_ESTIMATED_TIME | wxPD_REMAINING_TIME);
 
   int lastValue = -1;
+  bool progressConfigured = false;
+  int progressRange = 100;
+  std::uintmax_t bytesUnit = 1;
   for (;;) {
     // Handle any pending prompt from the worker.
     std::optional<AsyncFileOpPrompt> prompt;
@@ -658,15 +733,43 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
     }
 
     const auto done = state.done.load();
+    const auto bytesDone = state.bytesDone.load();
     wxString label;
+    bool scanDone = false;
+    std::uintmax_t totalBytes = 0;
     {
       std::lock_guard<std::mutex> lock(state.mu);
       label = wxString::FromUTF8(state.currentLabel);
+      scanDone = state.scanDone;
+      totalBytes = state.totalBytes;
     }
 
-    const int value = static_cast<int>(std::min(done, sources.size()));
-    const bool keepGoing = (value != lastValue) ? progress.Update(value, label) : progress.Pulse(label);
-    lastValue = value;
+    if (!progressConfigured && scanDone) {
+      if (totalBytes > 0) {
+        const std::uintmax_t maxInt = static_cast<std::uintmax_t>(std::numeric_limits<int>::max() - 1);
+        bytesUnit = std::max<std::uintmax_t>(1, (totalBytes / maxInt) + 1);
+        progressRange = static_cast<int>(std::max<std::uintmax_t>(1, totalBytes / bytesUnit));
+        progress.SetRange(progressRange);
+      } else {
+        progressRange = static_cast<int>(std::max<size_t>(1, sources.size()));
+        progress.SetRange(progressRange);
+      }
+      progressConfigured = true;
+      lastValue = -1;
+    }
+
+    bool keepGoing = true;
+    if (!progressConfigured) {
+      keepGoing = progress.Pulse(label.empty() ? "Scanning..." : label);
+    } else if (totalBytes > 0) {
+      const int value = static_cast<int>(std::min<std::uintmax_t>(progressRange, bytesDone / bytesUnit));
+      keepGoing = (value != lastValue) ? progress.Update(value, label) : progress.Pulse(label);
+      lastValue = value;
+    } else {
+      const int value = static_cast<int>(std::min(done, sources.size()));
+      keepGoing = (value != lastValue) ? progress.Update(value, label) : progress.Pulse(label);
+      lastValue = value;
+    }
 
     if (!keepGoing) {
       state.cancelRequested.store(true);

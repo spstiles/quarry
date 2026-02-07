@@ -21,7 +21,8 @@ bool IsCanceled(const CancelFn& shouldCancel) { return shouldCancel && shouldCan
 OpResult CopyRegularFileChunked(const fs::path& src,
                                 const fs::path& dst,
                                 const CancelFn& shouldCancel,
-                                const CopyProgressFn& onProgress) {
+                                const CopyProgressFn& onProgress,
+                                const CopyBytesProgressFn& onBytes) {
   if (IsCanceled(shouldCancel)) return CanceledResult();
   if (onProgress) onProgress(src);
 
@@ -61,6 +62,7 @@ OpResult CopyRegularFileChunked(const fs::path& src,
       return {.ok = false, .message = wxString::FromUTF8("Write failed.")};
     }
 
+    if (onBytes) onBytes(static_cast<std::uintmax_t>(got));
     chunks++;
     if (onProgress && (chunks % 32u) == 0u) onProgress(src);
   }
@@ -74,7 +76,8 @@ OpResult CopyRegularFileChunked(const fs::path& src,
 OpResult CopyPathRecursiveImpl(const fs::path& src,
                               const fs::path& dst,
                               const CancelFn& shouldCancel,
-                              const CopyProgressFn& onProgress) {
+                              const CopyProgressFn& onProgress,
+                              const CopyBytesProgressFn& onBytes) {
   std::error_code ec;
 
   // Avoid pathological case: copying a directory into itself/subdirectory.
@@ -147,7 +150,7 @@ OpResult CopyPathRecursiveImpl(const fs::path& src,
         fs::create_directories(out.parent_path(), ec);
         if (ec) return {.ok = false, .message = wxString::FromUTF8(ec.message())};
         if (IsCanceled(shouldCancel)) return CanceledResult();
-        const auto res = CopyRegularFileChunked(entry.path(), out, shouldCancel, onProgress);
+        const auto res = CopyRegularFileChunked(entry.path(), out, shouldCancel, onProgress, onBytes);
         if (!res.ok) return res;
         continue;
       }
@@ -178,7 +181,7 @@ OpResult CopyPathRecursiveImpl(const fs::path& src,
   if (IsCanceled(shouldCancel)) return CanceledResult();
 
   if (fs::is_regular_file(st)) {
-    return CopyRegularFileChunked(src, dst, shouldCancel, onProgress);
+    return CopyRegularFileChunked(src, dst, shouldCancel, onProgress, onBytes);
   }
 
   ec.clear();
@@ -236,30 +239,32 @@ bool ConfirmFileOp(wxWindow* parent,
 }
 
 OpResult CopyPathRecursive(const fs::path& src, const fs::path& dst) {
-  return CopyPathRecursiveImpl(src, dst, CancelFn{}, CopyProgressFn{});
+  return CopyPathRecursiveImpl(src, dst, CancelFn{}, CopyProgressFn{}, CopyBytesProgressFn{});
 }
 
 OpResult CopyPathRecursive(const fs::path& src,
                            const fs::path& dst,
                            const CancelFn& shouldCancel,
-                           const CopyProgressFn& onProgress) {
-  return CopyPathRecursiveImpl(src, dst, shouldCancel, onProgress);
+                           const CopyProgressFn& onProgress,
+                           const CopyBytesProgressFn& onBytes) {
+  return CopyPathRecursiveImpl(src, dst, shouldCancel, onProgress, onBytes);
 }
 
 OpResult MovePath(const fs::path& src, const fs::path& dst) {
-  return MovePath(src, dst, CancelFn{}, CopyProgressFn{});
+  return MovePath(src, dst, CancelFn{}, CopyProgressFn{}, CopyBytesProgressFn{});
 }
 
 OpResult MovePath(const fs::path& src,
                   const fs::path& dst,
                   const CancelFn& shouldCancel,
-                  const CopyProgressFn& onProgress) {
+                  const CopyProgressFn& onProgress,
+                  const CopyBytesProgressFn& onBytes) {
   std::error_code ec;
   fs::rename(src, dst, ec);
   if (!ec) return {.ok = true};
 
   // Cross-device moves can fail; fall back to copy+delete.
-  const auto copyRes = CopyPathRecursiveImpl(src, dst, shouldCancel, onProgress);
+  const auto copyRes = CopyPathRecursiveImpl(src, dst, shouldCancel, onProgress, onBytes);
   if (!copyRes.ok) return copyRes;
   if (IsCanceled(shouldCancel)) return CanceledResult();
 
