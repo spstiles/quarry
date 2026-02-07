@@ -60,7 +60,7 @@ enum class TreeIcon : int {
 
 class TreeNodeData final : public wxTreeItemData {
 public:
-  enum class Kind { Path, DevicesContainer, NetworkContainer, ActionConnectToServer };
+  enum class Kind { Path, DevicesContainer };
 
   explicit TreeNodeData(fs::path p, Kind k = Kind::Path) : path(std::move(p)), kind(k) {}
 
@@ -335,7 +335,10 @@ std::vector<FilePanel::Entry> ListGioLocation(const std::string& uri, std::strin
     }
 
     const std::string typeToken = cols[2];
-    const bool isDir = typeToken.find("directory") != std::string::npos;
+    // For GIO, entries like network shares often show up as "(special)" rather than "(directory)".
+    // Treat anything that isn't a regular file as directory-like so double-click navigates.
+    const bool isDir = (typeToken.find("directory") != std::string::npos) ||
+                       (typeToken.find("regular") == std::string::npos);
 
     std::string name;
     std::string modified;
@@ -869,19 +872,6 @@ void FilePanel::OnTreeSelectionChanged() {
   auto* data = dynamic_cast<TreeNodeData*>(tree_->GetItemData(item));
   if (!data) return;
   if (data->kind == TreeNodeData::Kind::DevicesContainer) return;
-  if (data->kind == TreeNodeData::Kind::NetworkContainer) return;
-  if (data->kind == TreeNodeData::Kind::ActionConnectToServer) {
-    wxTextEntryDialog dlg(this,
-                          "Enter a GIO location URI (examples: smb://server/share, sftp://host/path):",
-                          "Connect to Server");
-    const auto prefill = data->path.empty() ? std::string("smb://") : data->path.string();
-    dlg.SetValue(prefill);
-    if (dlg.ShowModal() != wxID_OK) return;
-    const auto uri = dlg.GetValue().ToStdString();
-    if (uri.empty()) return;
-    NavigateTo(fs::path(uri), /*recordHistory=*/true);
-    return;
-  }
   if (data->path.empty()) return;
   NavigateTo(data->path, /*recordHistory=*/true);
 }
@@ -897,10 +887,6 @@ void FilePanel::OnTreeItemExpanding(wxTreeEvent& event) {
   // Devices container refreshes its children on expand.
   if (data->kind == TreeNodeData::Kind::DevicesContainer) {
     PopulateDevices(item);
-    return;
-  }
-  if (data->kind == TreeNodeData::Kind::NetworkContainer) {
-    PopulateNetwork(item);
     return;
   }
 
@@ -1795,12 +1781,10 @@ void FilePanel::BuildComputerTree() {
   PopulateDevices(devicesRoot_);
 
   networkRoot_ = tree_->AppendItem(hiddenRoot_, "Network", static_cast<int>(TreeIcon::Drive),
-                                   -1, new TreeNodeData(fs::path(), TreeNodeData::Kind::NetworkContainer));
-  PopulateNetwork(networkRoot_);
+                                   -1, new TreeNodeData(fs::path("network://")));
 
   tree_->Expand(computerRoot_);
   tree_->Expand(devicesRoot_);
-  tree_->Expand(networkRoot_);
 
   tree_->Thaw();
 }
@@ -1863,29 +1847,6 @@ void FilePanel::PopulateDevices(const wxTreeItemId& devicesItem) {
   if (tree_->GetChildrenCount(devicesItem, false) == 0) {
     tree_->AppendItem(devicesItem, "(none)");
   }
-}
-
-void FilePanel::PopulateNetwork(const wxTreeItemId& networkItem) {
-  if (!tree_ || !networkItem.IsOk()) return;
-  tree_->DeleteChildren(networkItem);
-
-  tree_->AppendItem(networkItem,
-                    "Network",
-                    static_cast<int>(TreeIcon::Drive),
-                    -1,
-                    new TreeNodeData(fs::path("network://")));
-
-  tree_->AppendItem(networkItem,
-                    "Windows Shares\u2026",
-                    static_cast<int>(TreeIcon::Drive),
-                    -1,
-                    new TreeNodeData(fs::path("smb://"), TreeNodeData::Kind::ActionConnectToServer));
-
-  tree_->AppendItem(networkItem,
-                    "Connect to Server\u2026",
-                    static_cast<int>(TreeIcon::Drive),
-                    -1,
-                    new TreeNodeData(fs::path(), TreeNodeData::Kind::ActionConnectToServer));
 }
 
 void FilePanel::PopulateDirChildren(const wxTreeItemId& parent, const fs::path& dir) {
@@ -1984,23 +1945,9 @@ void FilePanel::SyncTreeToCurrentDir() {
 
   if (listingMode_ == ListingMode::Gio) {
     if (networkRoot_.IsOk()) {
-      wxTreeItemId best = networkRoot_;
-      const auto cur = currentDir_.string();
-
-      wxTreeItemIdValue ck;
-      auto c = tree_->GetFirstChild(networkRoot_, ck);
-      while (c.IsOk()) {
-        auto* data = dynamic_cast<TreeNodeData*>(tree_->GetItemData(c));
-        if (data && data->kind == TreeNodeData::Kind::Path && data->path.string() == cur) {
-          best = c;
-          break;
-        }
-        c = tree_->GetNextChild(networkRoot_, ck);
-      }
-
       ignoreTreeEvent_ = true;
-      tree_->SelectItem(best);
-      tree_->EnsureVisible(best);
+      tree_->SelectItem(networkRoot_);
+      tree_->EnsureVisible(networkRoot_);
       ignoreTreeEvent_ = false;
     }
     return;
