@@ -544,7 +544,7 @@ std::vector<FilePanel::Entry> ListGioLocation(const std::string& uri, std::strin
   GError* error = nullptr;
   GFileEnumerator* en = g_file_enumerate_children(
       file,
-      "standard::name,standard::type,standard::size,time::modified",
+      "standard::name,standard::type,standard::size,standard::target-uri,time::modified",
       G_FILE_QUERY_INFO_NONE,
       nullptr,
       &error);
@@ -572,8 +572,11 @@ std::vector<FilePanel::Entry> ListGioLocation(const std::string& uri, std::strin
 
     const char* name = g_file_info_get_name(info);
     const auto ftype = g_file_info_get_file_type(info);
+    // Treat only known navigable container-like types as directories.
+    // In particular, G_FILE_TYPE_SPECIAL is often not a directory and attempting to
+    // enumerate it yields "Not a directory".
     const bool isDir = ftype == G_FILE_TYPE_DIRECTORY || ftype == G_FILE_TYPE_MOUNTABLE ||
-                       ftype == G_FILE_TYPE_SHORTCUT || ftype == G_FILE_TYPE_SPECIAL;
+                       ftype == G_FILE_TYPE_SHORTCUT;
 
     std::uintmax_t size = 0;
     if (!isDir) size = static_cast<std::uintmax_t>(g_file_info_get_size(info));
@@ -585,16 +588,26 @@ std::vector<FilePanel::Entry> ListGioLocation(const std::string& uri, std::strin
       modified = FormatUnixSeconds(static_cast<long long>(unixSec));
     }
 
-    // Build child URI.
-    GFile* child = g_file_get_child(file, name ? name : "");
-    char* childUri = child ? g_file_get_uri(child) : nullptr;
+    std::string fullPath;
+    if (const char* target = g_file_info_get_attribute_string(info, G_FILE_ATTRIBUTE_STANDARD_TARGET_URI)) {
+      fullPath = target;
+    }
+
+    // Build child URI if we weren't given a target.
+    GFile* child = nullptr;
+    char* childUri = nullptr;
+    if (fullPath.empty()) {
+      child = g_file_get_child(file, name ? name : "");
+      childUri = child ? g_file_get_uri(child) : nullptr;
+      if (childUri) fullPath = childUri;
+    }
 
     entries.push_back(FilePanel::Entry{
         .name = name ? name : "",
         .isDir = isDir,
         .size = size,
         .modified = modified,
-        .fullPath = childUri ? childUri : "",
+        .fullPath = fullPath,
     });
 
     if (childUri) g_free(childUri);
