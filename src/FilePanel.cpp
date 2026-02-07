@@ -334,6 +334,37 @@ struct MountCreds {
   bool remember{false};
 };
 
+std::string CredsCacheKeyForUri(const std::string& uri) {
+  const auto scheme = UriScheme(uri);
+  const auto pos = uri.find("://");
+  if (pos == std::string::npos) return scheme;
+  size_t start = pos + 3;
+  while (start < uri.size() && uri[start] == '/') start++;
+
+  // Extract authority/host part.
+  const size_t firstSlash = uri.find('/', start);
+  const std::string host = (firstSlash == std::string::npos) ? uri.substr(start) : uri.substr(start, firstSlash - start);
+
+  if (scheme == "smb") {
+    // smb://HOST/SHARE/...
+    if (firstSlash == std::string::npos) return "smb://" + host;
+    size_t shareStart = firstSlash + 1;
+    while (shareStart < uri.size() && uri[shareStart] == '/') shareStart++;
+    const size_t shareEnd = uri.find('/', shareStart);
+    const std::string share = (shareStart >= uri.size())
+                                  ? std::string{}
+                                  : (shareEnd == std::string::npos ? uri.substr(shareStart)
+                                                                   : uri.substr(shareStart, shareEnd - shareStart));
+    if (share.empty()) return "smb://" + host;
+    return "smb://" + host + "/" + share;
+  }
+
+  if (!host.empty()) return scheme + "://" + host;
+  return scheme;
+}
+
+static std::unordered_map<std::string, MountCreds> g_sessionMountCreds;
+
 std::optional<MountCreds> PromptMountCreds(wxWindow* parent,
                                           const std::string& message,
                                           const std::string& defaultUser,
@@ -436,7 +467,10 @@ MountResult GioMountWithUi(wxWindow* parent, const std::string& uri) {
     wxWindow* parent{nullptr};
     GMainLoop* loop{nullptr};
     MountResult* out{nullptr};
+    std::string cacheKey{};
   } ctx{parent, nullptr, &result};
+
+  ctx.cacheKey = CredsCacheKeyForUri(uri);
 
   g_signal_connect(op,
                    "ask-password",
@@ -450,6 +484,26 @@ MountResult GioMountWithUi(wxWindow* parent, const std::string& uri) {
                      const std::string msg = message ? message : "Authentication required.";
                      const std::string du = defaultUser ? defaultUser : "";
                      const std::string dd = defaultDomain ? defaultDomain : "";
+
+                     // Session-only cache: if we already authenticated for this server/share in this run,
+                     // reuse it even if the user didn’t choose to save permanently.
+                     {
+                       const auto it = g_sessionMountCreds.find(c->cacheKey);
+                       if (it != g_sessionMountCreds.end()) {
+                         const auto& creds = it->second;
+                         if (creds.anonymous) {
+                           g_mount_operation_set_anonymous(mountOp, TRUE);
+                         } else {
+                           g_mount_operation_set_anonymous(mountOp, FALSE);
+                           g_mount_operation_set_username(mountOp, creds.username.c_str());
+                           g_mount_operation_set_password(mountOp, creds.password.c_str());
+                           g_mount_operation_set_domain(mountOp, creds.domain.c_str());
+                         }
+                         g_mount_operation_set_password_save(mountOp, G_PASSWORD_SAVE_NEVER);
+                         g_mount_operation_reply(mountOp, G_MOUNT_OPERATION_HANDLED);
+                         return;
+                       }
+                     }
 
                      const auto creds = PromptMountCreds(c->parent, msg, du, dd, flags);
                      if (!creds) {
@@ -467,6 +521,10 @@ MountResult GioMountWithUi(wxWindow* parent, const std::string& uri) {
                      g_mount_operation_set_password_save(
                          mountOp, creds->remember ? G_PASSWORD_SAVE_PERMANENTLY : G_PASSWORD_SAVE_NEVER);
                      g_mount_operation_reply(mountOp, G_MOUNT_OPERATION_HANDLED);
+
+                     // Always remember for this instance (session cache), even if not saved permanently.
+                     // This avoids repeated prompts when browsing multiple folders in the same share.
+                     g_sessionMountCreds[c->cacheKey] = *creds;
                    }),
                    &ctx);
 
@@ -508,6 +566,11 @@ MountResult GioMountWithUi(wxWindow* parent, const std::string& uri) {
   g_main_loop_unref(ctx.loop);
   g_object_unref(op);
   g_object_unref(file);
+
+  // If mount failed, clear any cached creds for this target so we prompt again next time.
+  if (!result.ok) {
+    g_sessionMountCreds.erase(CredsCacheKeyForUri(uri));
+  }
   return result;
 }
 
