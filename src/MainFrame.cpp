@@ -604,15 +604,9 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
     }
   }
 
-  // Modeless "floating" dialog: stays on top of the parent frame while still
-  // allowing interaction with the main window underneath.
-  fileOp_->dlg = new wxDialog(this,
-                              wxID_ANY,
-                              title,
-                              wxDefaultPosition,
-                              wxSize(600, 180),
-                              wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER | wxFRAME_FLOAT_ON_PARENT |
-                                  wxSTAY_ON_TOP);
+  // Modeless dialog.
+  fileOp_->dlg = new wxDialog(this, wxID_ANY, title, wxDefaultPosition, wxSize(600, 180),
+                              wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER);
   auto* root = new wxBoxSizer(wxVERTICAL);
   fileOp_->dlg->SetSizer(root);
 
@@ -639,9 +633,10 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
     fileOp_->state->cv.notify_all();
   });
 
+  // Closing the modeless dialog just hides it; the operation continues.
   fileOp_->dlg->Bind(wxEVT_CLOSE_WINDOW, [this](wxCloseEvent& e) {
+    if (fileOp_ && fileOp_->dlg) fileOp_->dlg->Hide();
     e.Veto();
-    if (fileOp_ && fileOp_->dlg) fileOp_->dlg->Raise();
   });
 
   const auto state = fileOp_->state;
