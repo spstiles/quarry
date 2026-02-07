@@ -1271,6 +1271,14 @@ void FilePanel::BindEvents() {
     FilePanel* panel{nullptr};
     explicit DropTarget(FilePanel* p) : panel(p) {}
 
+    wxDragResult OnDragOver(wxCoord x, wxCoord y, wxDragResult def) override {
+      (void)x;
+      (void)y;
+      (void)def;
+      // Safer default: copy. Hold Shift to move.
+      return wxGetKeyState(WXK_SHIFT) ? wxDragMove : wxDragCopy;
+    }
+
     bool OnDropFiles(wxCoord, wxCoord, const wxArrayString& filenames) override {
       if (!panel) return false;
       if (!panel->onDropFiles_) return false;
@@ -1286,7 +1294,8 @@ void FilePanel::BindEvents() {
       }
       if (paths.empty()) return false;
 
-      const bool move = !wxGetKeyState(WXK_CONTROL);
+      // Safer default: copy. Hold Shift to move.
+      const bool move = wxGetKeyState(WXK_SHIFT);
       panel->onDropFiles_(paths, move);
       return true;
     }
