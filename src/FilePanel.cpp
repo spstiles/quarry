@@ -1505,7 +1505,12 @@ void FilePanel::OnTreeSelectionChanged() {
   auto* data = dynamic_cast<TreeNodeData*>(tree_->GetItemData(item));
   if (!data) return;
   if (data->kind == TreeNodeData::Kind::DevicesContainer) return;
-  if (data->kind == TreeNodeData::Kind::NetworkContainer) return;
+  if (data->kind == TreeNodeData::Kind::NetworkContainer) {
+    // Selecting the group toggles expand/collapse only.
+    if (tree_->IsExpanded(item)) tree_->Collapse(item);
+    else tree_->Expand(item);
+    return;
+  }
   if (data->path.empty()) return;
   NavigateTo(data->path, /*recordHistory=*/true);
 }
@@ -2414,6 +2419,7 @@ void FilePanel::BuildComputerTree() {
   fsRoot_ = wxTreeItemId();
   devicesRoot_ = wxTreeItemId();
   networkRoot_ = wxTreeItemId();
+  browseNetworkRoot_ = wxTreeItemId();
   desktopRoot_ = wxTreeItemId();
   documentsRoot_ = wxTreeItemId();
   downloadsRoot_ = wxTreeItemId();
@@ -2564,11 +2570,11 @@ void FilePanel::PopulateNetwork(const wxTreeItemId& networkItem) {
   tree_->Freeze();
   tree_->DeleteChildren(networkItem);
 
-  tree_->AppendItem(networkItem,
-                    "Browse Network",
-                    static_cast<int>(TreeIcon::Drive),
-                    -1,
-                    new TreeNodeData(fs::path("network://")));
+  browseNetworkRoot_ = tree_->AppendItem(networkItem,
+                                        "Browse Network",
+                                        static_cast<int>(TreeIcon::Drive),
+                                        -1,
+                                        new TreeNodeData(fs::path("network://")));
 
   const auto shares = ReadRecentShares();
   for (const auto& uri : shares) {
@@ -2695,9 +2701,28 @@ void FilePanel::SyncTreeToCurrentDir() {
 
   if (listingMode_ == ListingMode::Gio) {
     if (networkRoot_.IsOk()) {
+      const auto uri = currentDir_.string();
+      wxTreeItemId best = networkRoot_;
+
+      if (uri.rfind("network://", 0) == 0 && browseNetworkRoot_.IsOk()) {
+        best = browseNetworkRoot_;
+      } else if (auto root = ShareRootForUri(uri)) {
+        wxTreeItemIdValue ck;
+        auto c = tree_->GetFirstChild(networkRoot_, ck);
+        while (c.IsOk()) {
+          if (auto* data = dynamic_cast<TreeNodeData*>(tree_->GetItemData(c))) {
+            if (data->kind == TreeNodeData::Kind::Path && data->path.string() == *root) {
+              best = c;
+              break;
+            }
+          }
+          c = tree_->GetNextChild(networkRoot_, ck);
+        }
+      }
+
       ignoreTreeEvent_ = true;
-      tree_->SelectItem(networkRoot_);
-      tree_->EnsureVisible(networkRoot_);
+      tree_->SelectItem(best);
+      tree_->EnsureVisible(best);
       ignoreTreeEvent_ = false;
     }
     return;

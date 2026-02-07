@@ -140,6 +140,7 @@ private:
   wxTreeItemId fsRoot_{};
   wxTreeItemId devicesRoot_{};
   wxTreeItemId networkRoot_{};
+  wxTreeItemId browseNetworkRoot_{};
   wxTreeItemId desktopRoot_{};
   wxTreeItemId documentsRoot_{};
   wxTreeItemId downloadsRoot_{};
