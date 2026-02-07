@@ -22,6 +22,7 @@ private:
 
   void OnQuit(wxCommandEvent& event);
   void OnRefresh(wxCommandEvent& event);
+  void OnConnectToServer(wxCommandEvent& event);
   void OnCopy(wxCommandEvent& event);
   void OnMove(wxCommandEvent& event);
   void OnDelete(wxCommandEvent& event);

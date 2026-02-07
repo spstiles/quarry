@@ -18,6 +18,7 @@
 namespace {
 enum MenuId : int {
   ID_Refresh = wxID_HIGHEST + 1,
+  ID_ConnectToServer,
   ID_Copy,
   ID_Move,
   ID_Trash,
@@ -66,6 +67,8 @@ MainFrame::MainFrame()
 
 void MainFrame::BuildMenu() {
   auto* fileMenu = new wxMenu();
+  fileMenu->Append(ID_ConnectToServer, "Connect to Server...\tCtrl+L");
+  fileMenu->AppendSeparator();
   fileMenu->Append(wxID_EXIT, "Quit\tCtrl+Q");
 
   auto* opsMenu = new wxMenu();
@@ -102,6 +105,7 @@ void MainFrame::BuildLayout() {
 void MainFrame::BindEvents() {
   Bind(wxEVT_MENU, &MainFrame::OnQuit, this, wxID_EXIT);
   Bind(wxEVT_MENU, &MainFrame::OnRefresh, this, ID_Refresh);
+  Bind(wxEVT_MENU, &MainFrame::OnConnectToServer, this, ID_ConnectToServer);
   Bind(wxEVT_MENU, &MainFrame::OnCopy, this, ID_Copy);
   Bind(wxEVT_MENU, &MainFrame::OnMove, this, ID_Move);
   Bind(wxEVT_MENU, &MainFrame::OnDelete, this, ID_Trash);
@@ -221,6 +225,22 @@ void MainFrame::OnQuit(wxCommandEvent&) { Close(true); }
 void MainFrame::OnRefresh(wxCommandEvent&) {
   top_->RefreshListing();
   bottom_->RefreshListing();
+}
+
+void MainFrame::OnConnectToServer(wxCommandEvent&) {
+  static std::string last = "smb://";
+
+  wxTextEntryDialog dlg(this,
+                        "Enter a server URI (examples: smb://server/share, sftp://host/path):",
+                        "Connect to Server",
+                        last);
+  if (dlg.ShowModal() != wxID_OK) return;
+  const auto uri = dlg.GetValue().ToStdString();
+  if (uri.empty()) return;
+  last = uri;
+
+  GetActivePanel()->SetDirectory(uri);
+  GetActivePanel()->FocusPrimary();
 }
 
 void MainFrame::OnCopy(wxCommandEvent&) {
