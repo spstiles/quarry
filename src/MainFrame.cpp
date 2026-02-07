@@ -617,6 +617,7 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
                             this,
                             wxPD_APP_MODAL | wxPD_CAN_ABORT | wxPD_AUTO_HIDE | wxPD_ELAPSED_TIME);
 
+  int lastValue = -1;
   for (;;) {
     // Handle any pending prompt from the worker.
     std::optional<AsyncFileOpPrompt> prompt;
@@ -663,7 +664,11 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
       label = wxString::FromUTF8(state.currentLabel);
     }
 
-    if (!progress.Update(static_cast<int>(std::min(done, sources.size())), label)) {
+    const int value = static_cast<int>(std::min(done, sources.size()));
+    const bool keepGoing = (value != lastValue) ? progress.Update(value, label) : progress.Pulse(label);
+    lastValue = value;
+
+    if (!keepGoing) {
       state.cancelRequested.store(true);
       {
         std::lock_guard<std::mutex> lock(state.mu);

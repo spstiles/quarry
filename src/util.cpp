@@ -4,6 +4,7 @@
 #include <ctime>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <system_error>
 
 #include <wx/msgdlg.h>
@@ -16,6 +17,59 @@ namespace {
 OpResult CanceledResult() { return {.ok = false, .message = "Canceled"}; }
 
 bool IsCanceled(const CancelFn& shouldCancel) { return shouldCancel && shouldCancel(); }
+
+OpResult CopyRegularFileChunked(const fs::path& src,
+                                const fs::path& dst,
+                                const CancelFn& shouldCancel,
+                                const CopyProgressFn& onProgress) {
+  if (IsCanceled(shouldCancel)) return CanceledResult();
+  if (onProgress) onProgress(src);
+
+  std::error_code ec;
+  fs::create_directories(dst.parent_path(), ec);
+  if (ec) return {.ok = false, .message = wxString::FromUTF8(ec.message())};
+
+  std::ifstream in(src, std::ios::binary);
+  if (!in.is_open()) {
+    return {.ok = false, .message = wxString::FromUTF8("Unable to open source file for reading.")};
+  }
+
+  std::ofstream out(dst, std::ios::binary | std::ios::trunc);
+  if (!out.is_open()) {
+    return {.ok = false, .message = wxString::FromUTF8("Unable to open destination file for writing.")};
+  }
+
+  static constexpr std::size_t kBufSize = 4 * 1024 * 1024;
+  std::string buf;
+  buf.resize(kBufSize);
+
+  std::uint64_t chunks = 0;
+  while (in) {
+    if (IsCanceled(shouldCancel)) {
+      out.close();
+      std::error_code rmEc;
+      fs::remove(dst, rmEc);
+      return CanceledResult();
+    }
+
+    in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+    const auto got = in.gcount();
+    if (got <= 0) break;
+
+    out.write(buf.data(), got);
+    if (!out) {
+      return {.ok = false, .message = wxString::FromUTF8("Write failed.")};
+    }
+
+    chunks++;
+    if (onProgress && (chunks % 32u) == 0u) onProgress(src);
+  }
+
+  out.flush();
+  if (!out) return {.ok = false, .message = wxString::FromUTF8("Write failed.")};
+  if (onProgress) onProgress(src);
+  return {.ok = true};
+}
 
 OpResult CopyPathRecursiveImpl(const fs::path& src,
                               const fs::path& dst,
@@ -57,7 +111,7 @@ OpResult CopyPathRecursiveImpl(const fs::path& src,
   auto progressSometimes = [&](const fs::path& p) {
     if (!onProgress) return;
     progressCounter++;
-    if ((progressCounter % 128u) == 0u) onProgress(p);
+    if ((progressCounter % 16u) == 0u) onProgress(p);
   };
 
   if (fs::is_directory(st)) {
@@ -93,9 +147,8 @@ OpResult CopyPathRecursiveImpl(const fs::path& src,
         fs::create_directories(out.parent_path(), ec);
         if (ec) return {.ok = false, .message = wxString::FromUTF8(ec.message())};
         if (IsCanceled(shouldCancel)) return CanceledResult();
-        ec.clear();
-        fs::copy_file(entry.path(), out, fs::copy_options::overwrite_existing, ec);
-        if (ec) return {.ok = false, .message = wxString::FromUTF8(ec.message())};
+        const auto res = CopyRegularFileChunked(entry.path(), out, shouldCancel, onProgress);
+        if (!res.ok) return res;
         continue;
       }
 
@@ -123,6 +176,10 @@ OpResult CopyPathRecursiveImpl(const fs::path& src,
   fs::create_directories(dst.parent_path(), ec);
   if (ec) return {.ok = false, .message = wxString::FromUTF8(ec.message())};
   if (IsCanceled(shouldCancel)) return CanceledResult();
+
+  if (fs::is_regular_file(st)) {
+    return CopyRegularFileChunked(src, dst, shouldCancel, onProgress);
+  }
 
   ec.clear();
   const auto options = fs::copy_options::overwrite_existing | fs::copy_options::copy_symlinks;
