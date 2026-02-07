@@ -194,17 +194,36 @@ std::string PrettyNetworkLabel(const std::string& uriOrName) {
   return PercentDecode(uriOrName);
 }
 
-static std::vector<std::string> g_recentHosts;
+struct RecentHostEntry {
+  std::string key;     // canonical key, e.g. smb://nas0002/
+  std::string display; // user-facing label, e.g. NAS0002 or NAS0002(AFP)
+};
 
-const std::vector<std::string>& GetRecentHosts() { return g_recentHosts; }
+static std::vector<RecentHostEntry> g_recentHosts;
+
+const std::vector<RecentHostEntry>& GetRecentHosts() { return g_recentHosts; }
+
+std::string LowerAscii(std::string s) {
+  for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return s;
+}
+
+int UppercaseCount(const std::string& s) {
+  int n = 0;
+  for (const auto c : s) {
+    if (c >= 'A' && c <= 'Z') n++;
+  }
+  return n;
+}
 
 std::optional<std::string> HostRootForUri(const std::string& uri) {
   if (!LooksLikeUri(uri)) return std::nullopt;
   const auto scheme = UriScheme(uri);
   if (scheme != "smb" && scheme != "afp") return std::nullopt;
 
-  const auto host = UriAuthorityHost(uri);
+  auto host = UriAuthorityHost(uri);
   if (host.empty()) return std::nullopt;
+  host = LowerAscii(host);
   return scheme + "://" + host + "/";
 }
 
@@ -212,8 +231,24 @@ bool AddRecentHost(const std::string& uri) {
   const auto root = HostRootForUri(uri);
   if (!root) return false;
 
-  g_recentHosts.erase(std::remove(g_recentHosts.begin(), g_recentHosts.end(), *root), g_recentHosts.end());
-  g_recentHosts.insert(g_recentHosts.begin(), *root);
+  const auto scheme = UriScheme(*root);
+  const auto hostDisplay = UriAuthorityHost(uri);
+  if (hostDisplay.empty()) return false;
+
+  std::string display = hostDisplay;
+  if (scheme == "afp") display = hostDisplay + "(AFP)";
+
+  // De-dupe by canonical key (case-insensitive host).
+  auto it = std::find_if(g_recentHosts.begin(), g_recentHosts.end(),
+                         [&](const RecentHostEntry& e) { return e.key == *root; });
+  if (it != g_recentHosts.end()) {
+    // Prefer the display with "more" uppercase characters (usually from network discovery).
+    if (UppercaseCount(display) > UppercaseCount(it->display)) it->display = display;
+    display = it->display;
+    g_recentHosts.erase(it);
+  }
+
+  g_recentHosts.insert(g_recentHosts.begin(), RecentHostEntry{.key = *root, .display = display});
   if (g_recentHosts.size() > 15) g_recentHosts.resize(15);
   return true;
 }
@@ -2494,13 +2529,13 @@ void FilePanel::PopulateNetwork(const wxTreeItemId& networkItem) {
                                         new TreeNodeData(fs::path("network://")));
 
   const auto& hosts = GetRecentHosts();
-  for (const auto& uri : hosts) {
-    if (uri.empty()) continue;
+  for (const auto& h : hosts) {
+    if (h.key.empty()) continue;
     tree_->AppendItem(networkItem,
-                      wxString::FromUTF8(PrettyNetworkLabel(uri)),
+                      wxString::FromUTF8(h.display),
                       static_cast<int>(TreeIcon::Drive),
                       -1,
-                      new TreeNodeData(fs::path(uri)));
+                      new TreeNodeData(fs::path(h.key)));
   }
 
   if (!selectedPath.empty()) {
