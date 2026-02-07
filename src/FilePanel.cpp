@@ -2706,6 +2706,10 @@ void FilePanel::SyncTreeToCurrentDir() {
 
       if (uri.rfind("network://", 0) == 0 && browseNetworkRoot_.IsOk()) {
         best = browseNetworkRoot_;
+      } else if ((UriScheme(uri) == "smb" || UriScheme(uri) == "afp") && browseNetworkRoot_.IsOk()) {
+        // Browsing a host (e.g. smb://HOST/) is conceptually still part of "Browse Network".
+        // Keep the Browse Network item selected unless we're inside a specific share.
+        if (!ShareRootForUri(uri)) best = browseNetworkRoot_;
       } else if (auto root = ShareRootForUri(uri)) {
         wxTreeItemIdValue ck;
         auto c = tree_->GetFirstChild(networkRoot_, ck);
