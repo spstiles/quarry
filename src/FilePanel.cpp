@@ -1159,6 +1159,12 @@ void FilePanel::BuildLayout() {
     if (auto* col = list_->GetColumn(i)) col->SetSortable(false);
   }
 
+#if wxUSE_DRAG_AND_DROP
+  // Enable internal DnD support for file-path payloads.
+  list_->EnableDragSource(wxDataFormat(wxDF_FILENAME));
+  list_->EnableDropTarget(wxDataFormat(wxDF_FILENAME));
+#endif
+
   statusText_ = new wxStaticText(listPane, wxID_ANY, "");
   listSizer->Add(list_, 1, wxEXPAND | wxLEFT | wxRIGHT, 8);
   listSizer->Add(statusText_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM | wxTOP, 8);
@@ -1253,55 +1259,55 @@ void FilePanel::BindEvents() {
     const auto paths = GetSelectedPaths();
     if (paths.empty()) return;
 
-    wxFileDataObject data;
+    auto* data = new wxFileDataObject();
     for (const auto& p : paths) {
       if (p.empty()) continue;
       if (LooksLikeUriPath(p)) return; // no remote drag for now
-      data.AddFile(wxString::FromUTF8(p.string()));
+      data->AddFile(wxString::FromUTF8(p.string()));
     }
-    if (data.GetFilenames().empty()) return;
+    if (data->GetFilenames().empty()) return;
 
-    wxDropSource source(list_);
-    source.SetData(data);
-    (void)source.DoDragDrop(wxDrag_AllowMove);
-    e.Skip();
+    // Let wxDataView handle DnD (especially important on GTK).
+    e.SetDataObject(data);
+    e.SetDragFlags(wxDrag_AllowMove);
+    e.SetDropEffect(wxDragCopy); // safer default
+    e.Allow();
   });
 
-  struct DropTarget final : public wxFileDropTarget {
-    FilePanel* panel{nullptr};
-    explicit DropTarget(FilePanel* p) : panel(p) {}
+  list_->Bind(wxEVT_DATAVIEW_ITEM_DROP_POSSIBLE, [this](wxDataViewEvent& e) {
+    if (!onDropFiles_) return;
+    if (listingMode_ != ListingMode::Directory) return;
+    if (currentDir_.empty()) return;
+    if (e.GetDataFormat().GetType() != wxDF_FILENAME) return;
 
-    wxDragResult OnDragOver(wxCoord x, wxCoord y, wxDragResult def) override {
-      (void)x;
-      (void)y;
-      (void)def;
-      // Safer default: copy. Hold Shift to move.
-      return wxGetKeyState(WXK_SHIFT) ? wxDragMove : wxDragCopy;
+    // Safer default: copy. Hold Shift to move.
+    e.SetDropEffect(wxGetKeyState(WXK_SHIFT) ? wxDragMove : wxDragCopy);
+    e.Allow();
+  });
+
+  list_->Bind(wxEVT_DATAVIEW_ITEM_DROP, [this](wxDataViewEvent& e) {
+    if (!onDropFiles_) return;
+    if (listingMode_ != ListingMode::Directory) return;
+    if (currentDir_.empty()) return;
+    if (e.GetDataFormat().GetType() != wxDF_FILENAME) return;
+
+    wxFileDataObject data;
+    if (!data.SetData(e.GetDataSize(), e.GetDataBuffer())) return;
+
+    std::vector<fs::path> paths;
+    paths.reserve(data.GetFilenames().size());
+    for (const auto& fn : data.GetFilenames()) {
+      const auto s = fn.ToStdString();
+      if (s.empty()) continue;
+      paths.emplace_back(s);
     }
+    if (paths.empty()) return;
 
-    bool OnDropFiles(wxCoord, wxCoord, const wxArrayString& filenames) override {
-      if (!panel) return false;
-      if (!panel->onDropFiles_) return false;
-      if (panel->listingMode_ != ListingMode::Directory) return false;
-      if (panel->currentDir_.empty()) return false;
-
-      std::vector<fs::path> paths;
-      paths.reserve(filenames.size());
-      for (const auto& fn : filenames) {
-        const auto s = fn.ToStdString();
-        if (s.empty()) continue;
-        paths.emplace_back(s);
-      }
-      if (paths.empty()) return false;
-
-      // Safer default: copy. Hold Shift to move.
-      const bool move = wxGetKeyState(WXK_SHIFT);
-      panel->onDropFiles_(paths, move);
-      return true;
-    }
-  };
-
-  list_->SetDropTarget(new DropTarget(this));
+    // Safer default: copy. Hold Shift to move.
+    const bool move = (e.GetDropEffect() == wxDragMove) || wxGetKeyState(WXK_SHIFT);
+    onDropFiles_(paths, move);
+    e.Allow();
+  });
 
   // Click behavior:
   // - Fast double click opens (handled by wxEVT_DATAVIEW_ITEM_ACTIVATED).
