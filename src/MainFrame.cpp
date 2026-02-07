@@ -169,6 +169,7 @@ struct MainFrame::FileOpSession final {
   wxGauge* gauge{nullptr};
   wxButton* cancelBtn{nullptr};
   wxTimer timer;
+  int timerId{wxID_ANY};
 
   std::shared_ptr<AsyncFileOpState> state;
   std::thread worker;
@@ -632,6 +633,11 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
   fileOp_->dlg->Layout();
   fileOp_->dlg->Show();
 
+  // wxTimer events are delivered to the timer owner (not the wxTimer object).
+  // Bind them on the dialog so updates continue even while the main window is used.
+  fileOp_->timerId = wxWindow::NewControlId();
+  fileOp_->timer.SetOwner(fileOp_->dlg, fileOp_->timerId);
+
   fileOp_->cancelBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
     if (!fileOp_ || !fileOp_->state) return;
     fileOp_->state->cancelRequested.store(true);
@@ -772,7 +778,7 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
     state->cv.notify_all();
   });
 
-  fileOp_->timer.Bind(wxEVT_TIMER, [this, title, sources](wxTimerEvent&) {
+  fileOp_->dlg->Bind(wxEVT_TIMER, [this, title, sources](wxTimerEvent&) {
     if (!fileOp_ || !fileOp_->state) return;
     const auto state = fileOp_->state;
 
@@ -891,7 +897,7 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
       if (fileOp_->dlg) fileOp_->dlg->Destroy();
       fileOp_.reset();
     }
-  });
+  }, fileOp_->timerId);
 
   fileOp_->timer.Start(100);
 }
