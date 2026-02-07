@@ -21,6 +21,7 @@
 #include <wx/dataview.h>
 #include <wx/bmpbuttn.h>
 #include <wx/checkbox.h>
+#include <wx/radiobox.h>
 #include <wx/filefn.h>
 #include <wx/filename.h>
 #include <wx/choicdlg.h>
@@ -327,11 +328,13 @@ bool GioMountLocation(const std::string& uri, std::string* err, wxWindow* parent
 
 #ifdef QUARRY_USE_GIO
 struct MountCreds {
+  enum class RememberMode { ForgetImmediately = 0, Session = 1, Forever = 2 };
+
   std::string username;
   std::string password;
   std::string domain;
   bool anonymous{false};
-  bool remember{false};
+  RememberMode rememberMode{RememberMode::Session};
 };
 
 std::string CredsCacheKeyForUri(const std::string& uri) {
@@ -364,6 +367,15 @@ std::string CredsCacheKeyForUri(const std::string& uri) {
 }
 
 static std::unordered_map<std::string, MountCreds> g_sessionMountCreds;
+
+GPasswordSave RememberModeToPasswordSave(MountCreds::RememberMode mode) {
+  switch (mode) {
+    case MountCreds::RememberMode::Forever: return G_PASSWORD_SAVE_PERMANENTLY;
+    case MountCreds::RememberMode::Session:
+    case MountCreds::RememberMode::ForgetImmediately:
+    default: return G_PASSWORD_SAVE_NEVER;
+  }
+}
 
 std::optional<MountCreds> PromptMountCreds(wxWindow* parent,
                                           const std::string& message,
@@ -398,12 +410,24 @@ std::optional<MountCreds> PromptMountCreds(wxWindow* parent,
   grid->Add(domainCtrl, 1, wxEXPAND);
 
   auto* anonymous = new wxCheckBox(&dlg, wxID_ANY, "Anonymous");
-  auto* remember = new wxCheckBox(&dlg, wxID_ANY, "Remember password");
+
+  wxArrayString rememberChoices;
+  rememberChoices.Add("Forget password immediately");
+  rememberChoices.Add("Remember until logout");
+  rememberChoices.Add("Remember forever");
+  auto* rememberMode = new wxRadioBox(&dlg,
+                                      wxID_ANY,
+                                      "Password",
+                                      wxDefaultPosition,
+                                      wxDefaultSize,
+                                      rememberChoices,
+                                      1,
+                                      wxRA_SPECIFY_ROWS);
   sizer->Add(anonymous, 0, wxLEFT | wxRIGHT | wxBOTTOM, 10);
-  sizer->Add(remember, 0, wxLEFT | wxRIGHT | wxBOTTOM, 10);
+  sizer->Add(rememberMode, 0, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 10);
 
   anonymous->SetValue(false);
-  remember->SetValue(false);
+  rememberMode->SetSelection(static_cast<int>(MountCreds::RememberMode::Session));
 
   // Honor requested fields.
   const bool needUser = (flags & G_ASK_PASSWORD_NEED_USERNAME) != 0;
@@ -419,9 +443,10 @@ std::optional<MountCreds> PromptMountCreds(wxWindow* parent,
   const bool allowAnon = (flags & G_ASK_PASSWORD_ANONYMOUS_SUPPORTED) != 0;
   anonymous->Show(allowAnon);
 
-  // Remember password support (we map to permanent keyring save when supported).
-  const bool allowSave = (flags & (G_ASK_PASSWORD_SAVING_SUPPORTED | G_ASK_PASSWORD_NEED_PASSWORD)) != 0;
-  remember->Show(allowSave);
+  // Remember forever requires saving support (keyring); session remembering is always available.
+  const bool allowForever = (flags & G_ASK_PASSWORD_SAVING_SUPPORTED) != 0;
+  rememberMode->Show(needPass);
+  rememberMode->Enable(2, allowForever);
 
   auto* btnSizer = dlg.CreateButtonSizer(wxOK | wxCANCEL);
   sizer->Add(btnSizer, 0, wxALL | wxEXPAND, 10);
@@ -434,7 +459,12 @@ std::optional<MountCreds> PromptMountCreds(wxWindow* parent,
 
   MountCreds out;
   out.anonymous = allowAnon && anonymous->GetValue();
-  out.remember = remember->IsShown() && remember->GetValue();
+  if (rememberMode->IsShown()) {
+    const int sel = rememberMode->GetSelection();
+    if (sel == 0) out.rememberMode = MountCreds::RememberMode::ForgetImmediately;
+    else if (sel == 2 && allowForever) out.rememberMode = MountCreds::RememberMode::Forever;
+    else out.rememberMode = MountCreds::RememberMode::Session;
+  }
   out.username = userCtrl->IsShown() ? userCtrl->GetValue().ToStdString() : "";
   out.password = passCtrl->IsShown() ? passCtrl->GetValue().ToStdString() : "";
   out.domain = domainCtrl->IsShown() ? domainCtrl->GetValue().ToStdString() : "";
@@ -487,23 +517,23 @@ MountResult GioMountWithUi(wxWindow* parent, const std::string& uri) {
 
                      // Session-only cache: if we already authenticated for this server/share in this run,
                      // reuse it even if the user didn’t choose to save permanently.
-                     {
-                       const auto it = g_sessionMountCreds.find(c->cacheKey);
-                       if (it != g_sessionMountCreds.end()) {
-                         const auto& creds = it->second;
-                         if (creds.anonymous) {
-                           g_mount_operation_set_anonymous(mountOp, TRUE);
-                         } else {
-                           g_mount_operation_set_anonymous(mountOp, FALSE);
-                           g_mount_operation_set_username(mountOp, creds.username.c_str());
-                           g_mount_operation_set_password(mountOp, creds.password.c_str());
-                           g_mount_operation_set_domain(mountOp, creds.domain.c_str());
-                         }
-                         g_mount_operation_set_password_save(mountOp, G_PASSWORD_SAVE_NEVER);
-                         g_mount_operation_reply(mountOp, G_MOUNT_OPERATION_HANDLED);
-                         return;
-                       }
-                     }
+	                     {
+	                       const auto it = g_sessionMountCreds.find(c->cacheKey);
+	                       if (it != g_sessionMountCreds.end()) {
+	                         const auto& creds = it->second;
+	                         if (creds.anonymous) {
+	                           g_mount_operation_set_anonymous(mountOp, TRUE);
+	                         } else {
+	                           g_mount_operation_set_anonymous(mountOp, FALSE);
+	                           g_mount_operation_set_username(mountOp, creds.username.c_str());
+	                           g_mount_operation_set_password(mountOp, creds.password.c_str());
+	                           g_mount_operation_set_domain(mountOp, creds.domain.c_str());
+	                         }
+	                         g_mount_operation_set_password_save(mountOp, RememberModeToPasswordSave(creds.rememberMode));
+	                         g_mount_operation_reply(mountOp, G_MOUNT_OPERATION_HANDLED);
+	                         return;
+	                       }
+	                     }
 
                      const auto creds = PromptMountCreds(c->parent, msg, du, dd, flags);
                      if (!creds) {
@@ -513,20 +543,20 @@ MountResult GioMountWithUi(wxWindow* parent, const std::string& uri) {
                      }
 
                      g_mount_operation_set_anonymous(mountOp, creds->anonymous);
-                     if (!creds->anonymous) {
-                       g_mount_operation_set_username(mountOp, creds->username.c_str());
-                       g_mount_operation_set_password(mountOp, creds->password.c_str());
-                       g_mount_operation_set_domain(mountOp, creds->domain.c_str());
-                     }
-                     g_mount_operation_set_password_save(
-                         mountOp, creds->remember ? G_PASSWORD_SAVE_PERMANENTLY : G_PASSWORD_SAVE_NEVER);
-                     g_mount_operation_reply(mountOp, G_MOUNT_OPERATION_HANDLED);
+	                     if (!creds->anonymous) {
+	                       g_mount_operation_set_username(mountOp, creds->username.c_str());
+	                       g_mount_operation_set_password(mountOp, creds->password.c_str());
+	                       g_mount_operation_set_domain(mountOp, creds->domain.c_str());
+	                     }
+	                     g_mount_operation_set_password_save(mountOp, RememberModeToPasswordSave(creds->rememberMode));
+	                     g_mount_operation_reply(mountOp, G_MOUNT_OPERATION_HANDLED);
 
-                     // Always remember for this instance (session cache), even if not saved permanently.
-                     // This avoids repeated prompts when browsing multiple folders in the same share.
-                     g_sessionMountCreds[c->cacheKey] = *creds;
-                   }),
-                   &ctx);
+	                     // Remember for this instance if requested (session or forever).
+	                     if (creds->rememberMode != MountCreds::RememberMode::ForgetImmediately) {
+	                       g_sessionMountCreds[c->cacheKey] = *creds;
+	                     }
+	                   }),
+	                   &ctx);
 
   struct AsyncState {
     GMainLoop* loop{nullptr};
