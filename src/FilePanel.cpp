@@ -4,7 +4,10 @@
 #include "util.h"
 
 #include <algorithm>
+#include <cctype>
 #include <filesystem>
+#include <fstream>
+#include <set>
 #include <unordered_map>
 #include <system_error>
 
@@ -27,7 +30,6 @@
 #include <wx/textdlg.h>
 #include <wx/time.h>
 #include <wx/treectrl.h>
-#include <wx/textfile.h>
 #include <wx/utils.h>
 
 namespace fs = std::filesystem;
@@ -37,23 +39,151 @@ constexpr int COL_NAME = 0;
 constexpr int COL_TYPE = 1;
 constexpr int COL_SIZE = 2;
 constexpr int COL_MOD = 3;
+constexpr int COL_FULLPATH = 4;
 
-constexpr int COL_PLACE_LABEL = 0;
-constexpr int COL_PLACE_PATH = 1;
-
-class TreeNodeData final : public wxTreeItemData {
-public:
-  explicit TreeNodeData(fs::path p) : path(std::move(p)) {}
-  fs::path path;
-};
+const fs::path kVirtualRecent{"recent://"};
 
 enum class TreeIcon : int {
   Folder = 0,
   Home,
   Drive,
-  Places,
-  Filesystem,
+  Computer,
 };
+
+class TreeNodeData final : public wxTreeItemData {
+public:
+  explicit TreeNodeData(fs::path p, bool isDevicesContainer = false)
+      : path(std::move(p)), devicesContainer(isDevicesContainer) {}
+  fs::path path;
+  bool devicesContainer{false};
+};
+
+std::string PercentDecode(std::string s) {
+  std::string out;
+  out.reserve(s.size());
+  auto hex = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+  };
+
+  for (size_t i = 0; i < s.size(); i++) {
+    if (s[i] == '%' && i + 2 < s.size()) {
+      const int hi = hex(s[i + 1]);
+      const int lo = hex(s[i + 2]);
+      if (hi >= 0 && lo >= 0) {
+        out.push_back(static_cast<char>((hi << 4) | lo));
+        i += 2;
+        continue;
+      }
+    }
+    out.push_back(s[i]);
+  }
+  return out;
+}
+
+std::optional<fs::path> UriToPath(const std::string& uri) {
+  // Handles file:// URIs from recently-used.xbel.
+  constexpr const char* kFile = "file://";
+  if (uri.rfind(kFile, 0) != 0) return std::nullopt;
+
+  std::string rest = uri.substr(std::char_traits<char>::length(kFile));
+  // file:///path...
+  // file://localhost/path...
+  if (rest.rfind("localhost/", 0) == 0) rest = rest.substr(std::char_traits<char>::length("localhost"));
+
+  // Keep leading slash for absolute paths.
+  const auto decoded = PercentDecode(rest);
+  if (decoded.empty()) return std::nullopt;
+  if (decoded[0] != '/') return std::nullopt;
+  return fs::path(decoded);
+}
+
+std::optional<fs::path> ReadXdgUserDir(const std::string& key) {
+  const auto home = wxGetHomeDir().ToStdString();
+  if (home.empty()) return std::nullopt;
+  const fs::path path = fs::path(home) / ".config" / "user-dirs.dirs";
+
+  std::error_code ec;
+  if (!fs::exists(path, ec)) return std::nullopt;
+
+  std::ifstream f(path);
+  if (!f.is_open()) return std::nullopt;
+
+  const std::string prefix = "XDG_" + key + "_DIR=";
+  std::string line;
+  while (std::getline(f, line)) {
+    if (line.rfind(prefix, 0) != 0) continue;
+    auto value = line.substr(prefix.size());
+    // Trim quotes.
+    if (!value.empty() && (value.front() == '"' || value.front() == '\'')) value.erase(value.begin());
+    if (!value.empty() && (value.back() == '"' || value.back() == '\'')) value.pop_back();
+
+    // Expand $HOME.
+    const std::string homeVar = "$HOME";
+    const auto pos = value.find(homeVar);
+    if (pos != std::string::npos) value.replace(pos, homeVar.size(), home);
+
+    if (value.empty()) return std::nullopt;
+    return fs::path(value);
+  }
+  return std::nullopt;
+}
+
+fs::path DefaultUserDir(const std::string& name) {
+  const auto home = wxGetHomeDir().ToStdString();
+  if (home.empty()) return {};
+  return fs::path(home) / name;
+}
+
+fs::path TrashFilesDir() {
+  const auto home = wxGetHomeDir().ToStdString();
+  if (home.empty()) return {};
+  return fs::path(home) / ".local" / "share" / "Trash" / "files";
+}
+
+std::vector<fs::path> ReadRecentPaths(size_t limit) {
+  std::vector<fs::path> paths;
+  paths.reserve(std::min<size_t>(limit, 200));
+
+  const auto home = wxGetHomeDir().ToStdString();
+  if (home.empty()) return paths;
+
+  const fs::path xbel = fs::path(home) / ".local" / "share" / "recently-used.xbel";
+  std::error_code ec;
+  if (!fs::exists(xbel, ec)) return paths;
+
+  std::ifstream f(xbel);
+  if (!f.is_open()) return paths;
+
+  std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+  if (content.empty()) return paths;
+
+  std::unordered_map<std::string, bool> seen;
+  const std::string needle = "href=\"file://";
+  size_t pos = 0;
+  while (paths.size() < limit) {
+    pos = content.find(needle, pos);
+    if (pos == std::string::npos) break;
+    pos += 6; // skip href="
+    const size_t end = content.find('"', pos);
+    if (end == std::string::npos) break;
+    const auto uri = content.substr(pos, end - pos);
+    pos = end + 1;
+
+    const auto p = UriToPath(uri);
+    if (!p) continue;
+    const auto key = p->string();
+    if (seen.find(key) != seen.end()) continue;
+    seen[key] = true;
+
+    if (!fs::exists(*p, ec) || ec) continue;
+    paths.push_back(*p);
+  }
+
+  return paths;
+}
 
 std::string GetRowName(wxDataViewListCtrl* list, unsigned int row) {
   wxVariant v;
@@ -116,45 +246,6 @@ struct AppClipboard {
 
 static std::optional<AppClipboard> g_clipboard;
 
-std::optional<fs::path> ReadXdgUserDir(const std::string& key) {
-  // Reads ~/.config/user-dirs.dirs (common on Linux desktops).
-  const auto home = wxGetHomeDir().ToStdString();
-  if (home.empty()) return std::nullopt;
-  const fs::path path = fs::path(home) / ".config" / "user-dirs.dirs";
-
-  std::error_code ec;
-  if (!fs::exists(path, ec)) return std::nullopt;
-
-  wxTextFile tf;
-  if (!tf.Open(path.string())) return std::nullopt;
-
-  const std::string prefix = "XDG_" + key + "_DIR=";
-  for (size_t i = 0; i < tf.GetLineCount(); i++) {
-    const auto line = tf.GetLine(i).ToStdString();
-    if (line.rfind(prefix, 0) != 0) continue;
-
-    auto value = line.substr(prefix.size());
-    // Trim quotes.
-    if (!value.empty() && (value.front() == '"' || value.front() == '\'')) value.erase(value.begin());
-    if (!value.empty() && (value.back() == '"' || value.back() == '\'')) value.pop_back();
-
-    // Expand $HOME.
-    const std::string homeVar = "$HOME";
-    const auto pos = value.find(homeVar);
-    if (pos != std::string::npos) value.replace(pos, homeVar.size(), home);
-
-    if (value.empty()) return std::nullopt;
-    return fs::path(value);
-  }
-  return std::nullopt;
-}
-
-fs::path DefaultUserDir(const std::string& name) {
-  const auto home = wxGetHomeDir().ToStdString();
-  if (home.empty()) return {};
-  return fs::path(home) / name;
-}
-
 std::vector<FilePanel::Entry> ListDir(const fs::path& dir, std::string* errorMessage) {
   std::vector<FilePanel::Entry> entries;
 
@@ -167,7 +258,7 @@ std::vector<FilePanel::Entry> ListDir(const fs::path& dir, std::string* errorMes
 
   for (const auto& de : it) {
     std::error_code statEc;
-    const auto status = de.symlink_status(statEc);
+    const auto status = de.status(statEc); // follows symlinks (treat symlink-to-dir as dir)
     if (statEc) continue;
 
     const bool isDir = fs::is_directory(status);
@@ -183,13 +274,9 @@ std::vector<FilePanel::Entry> ListDir(const fs::path& dir, std::string* errorMes
         .isDir = isDir,
         .size = size,
         .modified = FormatFileTime(de.last_write_time(ec)),
+        .fullPath = de.path().string(),
     });
   }
-
-  std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) {
-    if (a.isDir != b.isDir) return a.isDir > b.isDir;
-    return a.name < b.name;
-  });
 
   return entries;
 }
@@ -202,39 +289,11 @@ void FilePanel::BuildLayout() {
   split_->SetSashGravity(0.0);
   split_->SetMinimumPaneSize(160);
 
-  auto* sidebarPane = new wxPanel(split_, wxID_ANY);
-  auto* sidebarSizer = new wxBoxSizer(wxVERTICAL);
-  sidebarSplit_ = new wxSplitterWindow(sidebarPane, wxID_ANY);
-  sidebarSplit_->SetSashGravity(0.35);
-  sidebarSplit_->SetMinimumPaneSize(80);
-
-  auto* placesPane = new wxPanel(sidebarSplit_, wxID_ANY);
-  auto* placesSizer = new wxBoxSizer(wxVERTICAL);
-  placesSizer->Add(new wxStaticText(placesPane, wxID_ANY, "Places"), 0,
-                   wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 8);
-
-  places_ = new wxDataViewListCtrl(placesPane, wxID_ANY, wxDefaultPosition, wxDefaultSize,
-                                  wxDV_ROW_LINES);
-  places_->AppendIconTextColumn("Place", wxDATAVIEW_CELL_INERT, 160, wxALIGN_LEFT,
-                                wxDATAVIEW_COL_RESIZABLE);
-  places_->AppendTextColumn("Path", wxDATAVIEW_CELL_INERT, 0, wxALIGN_LEFT,
-                            wxDATAVIEW_COL_HIDDEN);
-  placesSizer->Add(places_, 1, wxEXPAND | wxALL, 8);
-  placesPane->SetSizer(placesSizer);
-
-  auto* foldersPane = new wxPanel(sidebarSplit_, wxID_ANY);
-  auto* foldersSizer = new wxBoxSizer(wxVERTICAL);
-  foldersSizer->Add(new wxStaticText(foldersPane, wxID_ANY, "Folders"), 0,
-                    wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 8);
-
-  folderTree_ = new wxTreeCtrl(foldersPane, wxID_ANY, wxDefaultPosition, wxDefaultSize,
-                               wxTR_HAS_BUTTONS | wxTR_HIDE_ROOT | wxTR_LINES_AT_ROOT);
-  foldersSizer->Add(folderTree_, 1, wxEXPAND | wxALL, 8);
-  foldersPane->SetSizer(foldersSizer);
-
-  sidebarSplit_->SplitHorizontally(placesPane, foldersPane, 220);
-  sidebarSizer->Add(sidebarSplit_, 1, wxEXPAND);
-  sidebarPane->SetSizer(sidebarSizer);
+  tree_ = new wxTreeCtrl(split_,
+                         wxID_ANY,
+                         wxDefaultPosition,
+                         wxDefaultSize,
+                         wxTR_HAS_BUTTONS | wxTR_LINES_AT_ROOT | wxTR_DEFAULT_STYLE);
 
   auto* listPane = new wxPanel(split_, wxID_ANY);
   auto* listSizer = new wxBoxSizer(wxVERTICAL);
@@ -283,13 +342,19 @@ void FilePanel::BuildLayout() {
   list_->AppendTextColumn("Type", wxDATAVIEW_CELL_INERT, 70, wxALIGN_LEFT);
   list_->AppendTextColumn("Size", wxDATAVIEW_CELL_INERT, 90, wxALIGN_RIGHT);
   list_->AppendTextColumn("Modified", wxDATAVIEW_CELL_INERT, 150, wxALIGN_LEFT);
+  list_->AppendTextColumn("FullPath", wxDATAVIEW_CELL_INERT, 0, wxALIGN_LEFT, wxDATAVIEW_COL_HIDDEN);
+  // Disable native wxDataViewListCtrl sorting; we manage sorting ourselves so we
+  // can enforce "folders first" regardless of the selected column.
+  for (unsigned int i = 0; i < list_->GetColumnCount(); i++) {
+    if (auto* col = list_->GetColumn(i)) col->SetSortable(false);
+  }
 
   statusText_ = new wxStaticText(listPane, wxID_ANY, "");
   listSizer->Add(list_, 1, wxEXPAND | wxLEFT | wxRIGHT, 8);
   listSizer->Add(statusText_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM | wxTOP, 8);
   listPane->SetSizer(listSizer);
 
-  split_->SplitVertically(sidebarPane, listPane, 300);
+  split_->SplitVertically(tree_, listPane, 320);
 
   auto* sizer = new wxBoxSizer(wxVERTICAL);
   sizer->Add(split_, 1, wxEXPAND);
@@ -299,9 +364,9 @@ void FilePanel::BuildLayout() {
   UpdateStatusText();
   UpdateNavButtons();
   UpdateNavIcons();
-  BuildPlaces();
-  BuildFolderTree();
-  SyncSidebarToCurrentDir();
+  UpdateSortIndicators();
+  BuildComputerTree();
+  SyncTreeToCurrentDir();
 }
 
 void FilePanel::BindEvents() {
@@ -314,6 +379,49 @@ void FilePanel::BindEvents() {
   pathCtrl_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent&) { NavigateToTextPath(); });
 
   list_->Bind(wxEVT_DATAVIEW_ITEM_ACTIVATED, [this](wxDataViewEvent& e) { OpenSelectedIfDir(e); });
+  list_->Bind(wxEVT_DATAVIEW_ITEM_START_EDITING, [this](wxDataViewEvent& e) {
+    if (!allowInlineEdit_) {
+      e.Veto();
+      return;
+    }
+    e.Skip();
+  });
+  list_->Bind(wxEVT_DATAVIEW_ITEM_EDITING_DONE, [this](wxDataViewEvent& e) {
+    allowInlineEdit_ = false;
+    e.Skip();
+  });
+  list_->Bind(wxEVT_DATAVIEW_COLUMN_HEADER_CLICK, [this](wxDataViewEvent& e) {
+    // Prevent wxWidgets native sorting. We keep our own sort order so we can
+    // enforce "folders first" regardless of the active sort column.
+    e.Veto();
+
+    auto* col = e.GetDataViewColumn();
+    if (!col) return;
+    const int modelCol = col->GetModelColumn();
+    if (modelCol == COL_FULLPATH) return;
+
+    SortColumn clicked;
+    switch (modelCol) {
+      case COL_NAME: clicked = SortColumn::Name; break;
+      case COL_TYPE: clicked = SortColumn::Type; break;
+      case COL_SIZE: clicked = SortColumn::Size; break;
+      case COL_MOD: clicked = SortColumn::Modified; break;
+      default: return;
+    }
+
+    if (sortColumn_ == clicked) {
+      sortAscending_ = !sortAscending_;
+    } else {
+      sortColumn_ = clicked;
+      sortAscending_ = true;
+    }
+    ResortListing();
+  });
+  list_->Bind(wxEVT_DATAVIEW_COLUMN_SORTED, [this](wxDataViewEvent& e) {
+    // Extra guard: some platforms may emit this even when we veto header click.
+    e.Veto();
+    ResortListing();
+  });
   list_->Bind(wxEVT_DATAVIEW_ITEM_VALUE_CHANGED, [this](wxDataViewEvent& e) { OnListValueChanged(e); });
   list_->Bind(wxEVT_DATAVIEW_SELECTION_CHANGED, [this](wxDataViewEvent&) {
     // When selection changes due to a click, arm rename for the selected item.
@@ -390,41 +498,9 @@ void FilePanel::BindEvents() {
     e.Skip();
   });
 
-  // Sidebar navigation.
-  if (places_) {
-    places_->Bind(wxEVT_DATAVIEW_ITEM_ACTIVATED, [this](wxDataViewEvent&) {
-      if (ignoreSidebarEvent_) return;
-      const int row = places_->GetSelectedRow();
-      if (row == wxNOT_FOUND) return;
-      wxVariant pathVar;
-      places_->GetValue(pathVar, static_cast<unsigned int>(row), COL_PLACE_PATH);
-      const auto p = pathVar.GetString().ToStdString();
-      if (!p.empty()) NavigateTo(fs::path(p), /*recordHistory=*/true);
-    });
-    places_->Bind(wxEVT_DATAVIEW_SELECTION_CHANGED, [this](wxDataViewEvent&) {
-      if (ignoreSidebarEvent_) return;
-      const int row = places_->GetSelectedRow();
-      if (row == wxNOT_FOUND) return;
-      wxVariant pathVar;
-      places_->GetValue(pathVar, static_cast<unsigned int>(row), COL_PLACE_PATH);
-      const auto p = pathVar.GetString().ToStdString();
-      if (!p.empty()) NavigateTo(fs::path(p), /*recordHistory=*/true);
-    });
-  }
-
-  if (folderTree_) {
-    folderTree_->Bind(wxEVT_TREE_SEL_CHANGED, [this](wxTreeEvent&) { OnTreeSelectionChanged(); });
-    folderTree_->Bind(wxEVT_TREE_ITEM_EXPANDING, [this](wxTreeEvent& e) {
-      if (ignoreSidebarEvent_) return;
-      const auto item = e.GetItem();
-      if (!item.IsOk()) return;
-      auto* data = dynamic_cast<TreeNodeData*>(folderTree_->GetItemData(item));
-      if (!data) return;
-
-      if (folderTree_->GetChildrenCount(item, false) == 0) {
-        PopulateFolderChildren(item, data->path);
-      }
-    });
+  if (tree_) {
+    tree_->Bind(wxEVT_TREE_SEL_CHANGED, [this](wxTreeEvent&) { OnTreeSelectionChanged(); });
+    tree_->Bind(wxEVT_TREE_ITEM_EXPANDING, [this](wxTreeEvent& e) { OnTreeItemExpanding(e); });
   }
 
   list_->Bind(wxEVT_SET_FOCUS, [this](wxFocusEvent& e) {
@@ -438,26 +514,13 @@ void FilePanel::BindEvents() {
     e.Skip();
   });
 
-  if (places_) {
-    places_->Bind(wxEVT_SET_FOCUS, [this](wxFocusEvent& e) {
+  if (tree_) {
+    tree_->Bind(wxEVT_SET_FOCUS, [this](wxFocusEvent& e) {
       lastFocus_ = LastFocus::Tree;
       if (onFocus_) onFocus_();
       e.Skip();
     });
-    places_->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& e) {
-      lastFocus_ = LastFocus::Tree;
-      if (onFocus_) onFocus_();
-      e.Skip();
-    });
-  }
-
-  if (folderTree_) {
-    folderTree_->Bind(wxEVT_SET_FOCUS, [this](wxFocusEvent& e) {
-      lastFocus_ = LastFocus::Tree;
-      if (onFocus_) onFocus_();
-      e.Skip();
-    });
-    folderTree_->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& e) {
+    tree_->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& e) {
       lastFocus_ = LastFocus::Tree;
       if (onFocus_) onFocus_();
       e.Skip();
@@ -508,17 +571,24 @@ void FilePanel::RefreshListing() {
 void FilePanel::RefreshAll() {
   // Avoid full tree rebuild during normal ops; it resets selection/scroll.
   RefreshListing();
-  SyncSidebarToCurrentDir();
+  SyncTreeToCurrentDir();
   UpdateStatusText();
 }
 
 void FilePanel::RefreshTree() {
   if (currentDir_.empty()) return;
-  RefreshTreeNode(currentDir_);
+  if (!tree_) return;
+  // Rebuild device list (mounts may have changed) and ensure current path is visible.
+  BuildComputerTree();
+  SyncTreeToCurrentDir();
 }
 
 void FilePanel::NavigateUp() {
   if (currentDir_.empty()) return;
+  if (listingMode_ != ListingMode::Directory) {
+    GoHome();
+    return;
+  }
   auto parent = currentDir_.parent_path();
   if (parent.empty()) parent = currentDir_; // likely at root
   NavigateTo(parent, /*recordHistory=*/true);
@@ -526,14 +596,7 @@ void FilePanel::NavigateUp() {
 
 void FilePanel::FocusPrimary() {
   if (lastFocus_ == LastFocus::Tree) {
-    if (folderTree_) {
-      folderTree_->SetFocus();
-      return;
-    }
-    if (places_) {
-      places_->SetFocus();
-      return;
-    }
+    if (tree_) tree_->SetFocus();
     return;
   }
   if (list_) list_->SetFocus();
@@ -591,19 +654,48 @@ void FilePanel::OpenSelectedIfDir(wxDataViewEvent& event) {
   list_->GetValue(typeVar, row, COL_TYPE);
   if (typeVar.GetString() != "Dir") return;
 
-  const auto next = currentDir_ / GetRowName(list_, static_cast<unsigned int>(row));
-  NavigateTo(next, /*recordHistory=*/true);
+  wxVariant pathVar;
+  list_->GetValue(pathVar, row, COL_FULLPATH);
+  const auto p = pathVar.GetString().ToStdString();
+  if (p.empty()) return;
+
+  NavigateTo(fs::path(p), /*recordHistory=*/true);
 }
 
 void FilePanel::OnTreeSelectionChanged() {
-  if (ignoreSidebarEvent_) return;
-  if (!folderTree_) return;
-  const auto item = folderTree_->GetSelection();
+  if (ignoreTreeEvent_) return;
+  if (!tree_) return;
+  const auto item = tree_->GetSelection();
   if (!item.IsOk()) return;
-  auto* data = dynamic_cast<TreeNodeData*>(folderTree_->GetItemData(item));
+  auto* data = dynamic_cast<TreeNodeData*>(tree_->GetItemData(item));
   if (!data) return;
+  if (data->devicesContainer) return;
   if (data->path.empty()) return;
   NavigateTo(data->path, /*recordHistory=*/true);
+}
+
+void FilePanel::OnTreeItemExpanding(wxTreeEvent& event) {
+  if (!tree_) return;
+  const auto item = event.GetItem();
+  if (!item.IsOk()) return;
+
+  auto* data = dynamic_cast<TreeNodeData*>(tree_->GetItemData(item));
+  if (!data) return;
+
+  // Devices container refreshes its children on expand.
+  if (data->devicesContainer) {
+    PopulateDevices(item);
+    return;
+  }
+
+  // Lazy-load directory children if we only have a dummy placeholder.
+  if (!data->path.empty()) {
+    wxTreeItemIdValue ck;
+    const auto firstChild = tree_->GetFirstChild(item, ck);
+    if (firstChild.IsOk() && tree_->GetItemData(firstChild) == nullptr) {
+      PopulateDirChildren(item, data->path);
+    }
+  }
 }
 
 void FilePanel::OpenSelection() {
@@ -617,10 +709,13 @@ void FilePanel::OpenSelection() {
 
   wxVariant typeVar;
   list_->GetValue(typeVar, row, COL_TYPE);
-  const auto name = GetRowName(list_, static_cast<unsigned int>(row));
-  if (name.empty()) return;
 
-  const auto path = currentDir_ / name;
+  wxVariant pathVar;
+  list_->GetValue(pathVar, row, COL_FULLPATH);
+  const auto p = pathVar.GetString().ToStdString();
+  if (p.empty()) return;
+
+  const auto path = fs::path(p);
   if (typeVar.GetString() == "Dir") {
     NavigateTo(path, /*recordHistory=*/true);
     return;
@@ -630,24 +725,68 @@ void FilePanel::OpenSelection() {
 }
 
 bool FilePanel::LoadDirectory(const fs::path& dir) {
-  std::vector<std::string> selectedNames;
-  std::optional<std::string> currentName;
+  // Virtual: Recent
+  if (dir == kVirtualRecent || dir.string() == "Recent") {
+    listingMode_ = ListingMode::Recent;
+    currentDir_ = kVirtualRecent;
+    if (pathCtrl_) pathCtrl_->ChangeValue("Recent");
+
+    std::vector<Entry> entries;
+    const auto recent = ReadRecentPaths(/*limit=*/200);
+    entries.reserve(recent.size());
+    for (const auto& p : recent) {
+      std::error_code ec;
+      const bool isDir = fs::is_directory(p, ec) && !ec;
+      std::uintmax_t size = 0;
+      if (!isDir) {
+        size = fs::file_size(p, ec);
+        if (ec) size = 0;
+      }
+      std::string modified;
+      ec.clear();
+      const auto ft = fs::last_write_time(p, ec);
+      if (!ec) modified = FormatFileTime(ft);
+      entries.push_back(Entry{
+          .name = p.filename().string(),
+          .isDir = isDir,
+          .size = size,
+          .modified = modified,
+          .fullPath = p.string(),
+      });
+    }
+
+    SortEntries(entries);
+    Populate(entries);
+    UpdateSortIndicators();
+    UpdateStatusText();
+    UpdateNavButtons();
+    return true;
+  }
+
+  listingMode_ = ListingMode::Directory;
+
+  std::vector<std::string> selectedKeys;
+  std::optional<std::string> currentKey;
   if (list_) {
     wxDataViewItemArray items;
     list_->GetSelections(items);
-    selectedNames.reserve(items.size());
+    selectedKeys.reserve(items.size());
     for (const auto& item : items) {
       const int row = list_->ItemToRow(item);
       if (row == wxNOT_FOUND) continue;
-      const auto name = GetRowName(list_, static_cast<unsigned int>(row));
-      if (!name.empty()) selectedNames.push_back(name);
+      wxVariant v;
+      list_->GetValue(v, static_cast<unsigned int>(row), COL_FULLPATH);
+      const auto key = v.GetString().ToStdString();
+      if (!key.empty()) selectedKeys.push_back(key);
     }
 
     const auto curItem = list_->GetCurrentItem();
     const int curRow = list_->ItemToRow(curItem);
     if (curRow != wxNOT_FOUND) {
-      const auto name = GetRowName(list_, static_cast<unsigned int>(curRow));
-      if (!name.empty()) currentName = name;
+      wxVariant v;
+      list_->GetValue(v, static_cast<unsigned int>(curRow), COL_FULLPATH);
+      const auto key = v.GetString().ToStdString();
+      if (!key.empty()) currentKey = key;
     }
   }
 
@@ -663,16 +802,18 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
 
   currentDir_ = resolved;
   if (pathCtrl_) pathCtrl_->ChangeValue(currentDir_.string());
-  SyncSidebarToCurrentDir();
+  SyncTreeToCurrentDir();
 
   std::string err;
-  const auto entries = ListDir(currentDir_, &err);
+  auto entries = ListDir(currentDir_, &err);
   if (!err.empty()) {
     wxMessageBox(wxString::Format("Unable to list directory:\n\n%s\n\n%s", currentDir_.string(), err),
                  "Quarry", wxOK | wxICON_ERROR, this);
   }
+  SortEntries(entries);
   Populate(entries);
-  ReselectAndReveal(selectedNames, currentName);
+  UpdateSortIndicators();
+  ReselectAndReveal(selectedKeys, currentKey);
   UpdateStatusText();
   UpdateNavButtons();
   return true;
@@ -758,6 +899,15 @@ void FilePanel::ShowProperties() {
 
 void FilePanel::OnListValueChanged(wxDataViewEvent& event) {
   if (event.GetColumn() != COL_NAME) return;
+  if (listingMode_ != ListingMode::Directory) {
+    // Disallow rename in virtual views.
+    const int row = list_->ItemToRow(event.GetItem());
+    if (row != wxNOT_FOUND && row >= 0 && static_cast<size_t>(row) < currentEntries_.size()) {
+      const auto& e = currentEntries_[static_cast<size_t>(row)];
+      SetRowName(list_, static_cast<unsigned int>(row), e.name, e.isDir);
+    }
+    return;
+  }
 
   const int row = list_->ItemToRow(event.GetItem());
   if (row == wxNOT_FOUND) return;
@@ -787,6 +937,129 @@ void FilePanel::OnListValueChanged(wxDataViewEvent& event) {
   RefreshAll();
   if (renamedDir) RefreshTree();
   NotifyDirContentsChanged(renamedDir);
+}
+
+void FilePanel::SortEntries(std::vector<Entry>& entries) const {
+  const auto icase = [](std::string s) -> std::string {
+    for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+  };
+
+  const auto isHidden = [](const Entry& e) -> bool {
+    return !e.name.empty() && e.name[0] == '.';
+  };
+
+  const auto groupRank = [&](const Entry& e) -> int {
+    // Desired order (ascending):
+    //   folders, hidden folders, files, hidden files
+    // Reversed order (descending) reverses the groups as well.
+    const bool hidden = isHidden(e);
+    int rank = 0;
+    if (e.isDir && !hidden) rank = 0;
+    else if (e.isDir && hidden) rank = 1;
+    else if (!e.isDir && !hidden) rank = 2;
+    else rank = 3; // hidden file
+
+    return sortAscending_ ? rank : (3 - rank);
+  };
+
+  const auto cmp = [&](const Entry& a, const Entry& b) -> bool {
+    const int ga = groupRank(a);
+    const int gb = groupRank(b);
+    if (ga != gb) return ga < gb;
+
+    int rel = 0;
+    switch (sortColumn_) {
+      case SortColumn::Name: {
+        const auto an = icase(a.name);
+        const auto bn = icase(b.name);
+        rel = (an < bn) ? -1 : (an > bn ? 1 : 0);
+        break;
+      }
+      case SortColumn::Type: {
+        const auto at = a.isDir ? "dir" : "file";
+        const auto bt = b.isDir ? "dir" : "file";
+        rel = (at < bt) ? -1 : (at > bt ? 1 : 0);
+        break;
+      }
+      case SortColumn::Size: {
+        if (a.size < b.size) rel = -1;
+        else if (a.size > b.size) rel = 1;
+        else rel = 0;
+        break;
+      }
+      case SortColumn::Modified: {
+        rel = (a.modified < b.modified) ? -1 : (a.modified > b.modified ? 1 : 0);
+        break;
+      }
+    }
+
+    // Within-group sort direction.
+    if (!sortAscending_) rel = -rel;
+    if (rel != 0) return rel < 0;
+    // tie-breaker
+    return icase(a.name) < icase(b.name);
+  };
+
+  std::stable_sort(entries.begin(), entries.end(), cmp);
+}
+
+void FilePanel::UpdateSortIndicators() {
+  if (!list_) return;
+
+  const auto setCol = [&](int pos, bool on) {
+    wxDataViewColumn* col = list_->GetColumn(static_cast<unsigned int>(pos));
+    if (!col) return;
+    if (!on) {
+      col->UnsetAsSortKey();
+      return;
+    }
+    col->SetSortOrder(sortAscending_);
+  };
+
+  setCol(COL_NAME, sortColumn_ == SortColumn::Name);
+  setCol(COL_TYPE, sortColumn_ == SortColumn::Type);
+  setCol(COL_SIZE, sortColumn_ == SortColumn::Size);
+  setCol(COL_MOD, sortColumn_ == SortColumn::Modified);
+}
+
+void FilePanel::ResortListing() {
+  if (!list_) return;
+  if (currentEntries_.empty()) {
+    UpdateSortIndicators();
+    return;
+  }
+
+  std::vector<std::string> selectedKeys;
+  std::optional<std::string> currentKey;
+
+  wxDataViewItemArray items;
+  list_->GetSelections(items);
+  selectedKeys.reserve(items.size());
+  for (const auto& item : items) {
+    const int row = list_->ItemToRow(item);
+    if (row == wxNOT_FOUND) continue;
+    wxVariant v;
+    list_->GetValue(v, static_cast<unsigned int>(row), COL_FULLPATH);
+    const auto key = v.GetString().ToStdString();
+    if (!key.empty()) selectedKeys.push_back(key);
+  }
+
+  const auto curItem = list_->GetCurrentItem();
+  const int curRow = list_->ItemToRow(curItem);
+  if (curRow != wxNOT_FOUND) {
+    wxVariant v;
+    list_->GetValue(v, static_cast<unsigned int>(curRow), COL_FULLPATH);
+    const auto key = v.GetString().ToStdString();
+    if (!key.empty()) currentKey = key;
+  }
+
+  auto entries = currentEntries_;
+  SortEntries(entries);
+  Populate(entries);
+  UpdateSortIndicators();
+  ReselectAndReveal(selectedKeys, currentKey);
+  UpdateStatusText();
 }
 
 void FilePanel::UpdateStatusText() {
@@ -823,7 +1096,7 @@ void FilePanel::UpdateStatusText() {
 
   const auto selectedFiles = selectedCount - selectedDirs;
   std::string freeText = "n/a";
-  if (!currentDir_.empty()) {
+  if (listingMode_ == ListingMode::Directory && !currentDir_.empty()) {
     std::error_code ec;
     const auto space = fs::space(currentDir_, ec);
     if (!ec) {
@@ -832,7 +1105,8 @@ void FilePanel::UpdateStatusText() {
   }
 
   const auto label = wxString::Format(
-      "Items: %zu (%zu dirs, %zu files)   Selected: %zu (%zu dirs, %zu files)   Selected size: %s   Free: %s",
+      "%s   Items: %zu (%zu dirs, %zu files)   Selected: %zu (%zu dirs, %zu files)   Selected size: %s   Free: %s",
+      listingMode_ == ListingMode::Recent ? "Recent" : "Folder",
       total, totalDirs, totalFiles,
       selectedCount, selectedDirs, selectedFiles,
       HumanSize(selectedBytes),
@@ -861,20 +1135,25 @@ void FilePanel::Populate(const std::vector<Entry>& entries) {
     cols.push_back(wxVariant(e.isDir ? "Dir" : "File"));
     cols.push_back(wxVariant(e.isDir ? "" : HumanSize(e.size)));
     cols.push_back(wxVariant(e.modified));
+    const auto full = !e.fullPath.empty() ? e.fullPath : (currentDir_ / e.name).string();
+    cols.push_back(wxVariant(full));
     list_->AppendItem(cols);
   }
   list_->Thaw();
 }
 
-void FilePanel::ReselectAndReveal(const std::vector<std::string>& selectedNames,
-                                  const std::optional<std::string>& currentName) {
+void FilePanel::ReselectAndReveal(const std::vector<std::string>& selectedKeys,
+                                 const std::optional<std::string>& currentKey) {
   if (!list_) return;
   if (currentEntries_.empty()) return;
 
-  std::unordered_map<std::string, int> nameToRow;
-  nameToRow.reserve(currentEntries_.size());
+  std::unordered_map<std::string, int> keyToRow;
+  keyToRow.reserve(currentEntries_.size());
   for (size_t i = 0; i < currentEntries_.size(); i++) {
-    nameToRow.emplace(currentEntries_[i].name, static_cast<int>(i));
+    const auto full = !currentEntries_[i].fullPath.empty()
+                          ? currentEntries_[i].fullPath
+                          : (currentDir_ / currentEntries_[i].name).string();
+    keyToRow.emplace(full, static_cast<int>(i));
   }
 
   list_->Freeze();
@@ -882,20 +1161,18 @@ void FilePanel::ReselectAndReveal(const std::vector<std::string>& selectedNames,
 
   wxDataViewItem revealItem;
 
-  for (const auto& name : selectedNames) {
-    const auto it = nameToRow.find(name);
-    if (it == nameToRow.end()) continue;
+  for (const auto& key : selectedKeys) {
+    const auto it = keyToRow.find(key);
+    if (it == keyToRow.end()) continue;
     const auto item = list_->RowToItem(it->second);
     if (!item.IsOk()) continue;
     list_->Select(item);
     if (!revealItem.IsOk()) revealItem = item;
   }
 
-  if (!revealItem.IsOk() && currentName) {
-    const auto it = nameToRow.find(*currentName);
-    if (it != nameToRow.end()) {
-      revealItem = list_->RowToItem(it->second);
-    }
+  if (!revealItem.IsOk() && currentKey) {
+    const auto it = keyToRow.find(*currentKey);
+    if (it != keyToRow.end()) revealItem = list_->RowToItem(it->second);
   }
 
   if (revealItem.IsOk()) {
@@ -910,9 +1187,11 @@ std::optional<fs::path> FilePanel::GetSelectedPath() const {
   const int row = list_->GetSelectedRow();
   if (row == wxNOT_FOUND) return std::nullopt;
 
-  const auto child = GetRowName(list_, static_cast<unsigned int>(row));
-  if (child.empty()) return std::nullopt;
-  return currentDir_ / child;
+  wxVariant pathVar;
+  list_->GetValue(pathVar, static_cast<unsigned int>(row), COL_FULLPATH);
+  const auto p = pathVar.GetString().ToStdString();
+  if (p.empty()) return std::nullopt;
+  return fs::path(p);
 }
 
 std::vector<fs::path> FilePanel::GetSelectedPaths() const {
@@ -925,9 +1204,11 @@ std::vector<fs::path> FilePanel::GetSelectedPaths() const {
   for (const auto& item : items) {
     const int row = list_->ItemToRow(item);
     if (row == wxNOT_FOUND) continue;
-    const auto name = GetRowName(list_, static_cast<unsigned int>(row));
-    if (name.empty()) continue;
-    rows.emplace_back(row, currentDir_ / name);
+    wxVariant pathVar;
+    list_->GetValue(pathVar, static_cast<unsigned int>(row), COL_FULLPATH);
+    const auto p = pathVar.GetString().ToStdString();
+    if (p.empty()) continue;
+    rows.emplace_back(row, fs::path(p));
   }
 
   std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
@@ -939,13 +1220,19 @@ std::vector<fs::path> FilePanel::GetSelectedPaths() const {
 }
 
 void FilePanel::BeginInlineRename() {
+  if (listingMode_ != ListingMode::Directory) return;
   wxDataViewItemArray items;
   list_->GetSelections(items);
   if (items.size() != 1) return;
+  allowInlineEdit_ = true;
   list_->EditItem(items[0], list_->GetColumn(COL_NAME));
 }
 
 void FilePanel::CreateFolder() {
+  if (listingMode_ != ListingMode::Directory) {
+    wxMessageBox("Create Folder is not available here.", "Quarry", wxOK | wxICON_INFORMATION, this);
+    return;
+  }
   const auto name = wxGetTextFromUser("Folder name:", "Create Folder", "", this).ToStdString();
   if (name.empty()) return;
   if (name.find('/') != std::string::npos) {
@@ -979,6 +1266,10 @@ void FilePanel::CutSelection() {
 
 void FilePanel::PasteIntoCurrentDir() {
   if (!g_clipboard || g_clipboard->paths.empty()) return;
+  if (listingMode_ != ListingMode::Directory) {
+    wxMessageBox("Paste is not available here.", "Quarry", wxOK | wxICON_INFORMATION, this);
+    return;
+  }
   if (currentDir_.empty()) return;
 
   const bool isMove = g_clipboard->mode == AppClipboard::Mode::Cut;
@@ -1125,161 +1416,277 @@ void FilePanel::NotifyDirContentsChanged(bool treeChanged) {
   if (onDirContentsChanged_) onDirContentsChanged_(currentDir_, treeChanged);
 }
 
-void FilePanel::RefreshTreeNode(const fs::path& dir) {
-  if (dir.empty()) return;
-  BuildPlaces();
-  BuildFolderTree();
-  SyncSidebarToCurrentDir();
-}
+void FilePanel::BuildComputerTree() {
+  if (!tree_) return;
 
-void FilePanel::BuildPlaces() {
-  if (!places_) return;
-  places_->Freeze();
-  places_->DeleteAllItems();
-
-  const auto addPlace = [&](const wxString& label, const fs::path& path, const wxBitmapBundle& icon) {
-    std::error_code ec;
-    if (path.empty() || !fs::exists(path, ec)) return;
-    wxVector<wxVariant> cols;
-    wxDataViewIconText it(label, icon);
-    wxVariant v0;
-    v0 << it;
-    cols.push_back(v0);
-    cols.push_back(wxVariant(path.string()));
-    places_->AppendItem(cols);
-  };
-
-  const auto home = wxGetHomeDir().ToStdString();
-  if (!home.empty()) {
-    addPlace("Home", fs::path(home),
-             wxArtProvider::GetBitmapBundle(wxART_GO_HOME, wxART_OTHER, wxSize(16, 16)));
-  }
-
-  const struct Place { const char* label; const char* key; const char* fallback; } placeList[] = {
-      {"Desktop", "DESKTOP", "Desktop"},
-      {"Documents", "DOCUMENTS", "Documents"},
-      {"Downloads", "DOWNLOAD", "Downloads"},
-      {"Music", "MUSIC", "Music"},
-      {"Pictures", "PICTURES", "Pictures"},
-      {"Videos", "VIDEOS", "Videos"},
-  };
-
-  for (const auto& p : placeList) {
-    fs::path dirPath;
-    if (const auto xdg = ReadXdgUserDir(p.key)) dirPath = *xdg;
-    else dirPath = DefaultUserDir(p.fallback);
-    addPlace(p.label, dirPath,
-             wxArtProvider::GetBitmapBundle(wxART_FOLDER, wxART_OTHER, wxSize(16, 16)));
-  }
-
-  places_->Thaw();
-}
-
-void FilePanel::BuildFolderTree() {
-  if (!folderTree_) return;
-  folderTree_->Freeze();
-  folderTree_->DeleteAllItems();
-  folderRoot_ = wxTreeItemId();
+  tree_->Freeze();
+  tree_->DeleteAllItems();
+  computerRoot_ = wxTreeItemId();
+  homeRoot_ = wxTreeItemId();
+  fsRoot_ = wxTreeItemId();
+  devicesRoot_ = wxTreeItemId();
+  desktopRoot_ = wxTreeItemId();
+  documentsRoot_ = wxTreeItemId();
+  downloadsRoot_ = wxTreeItemId();
+  musicRoot_ = wxTreeItemId();
+  picturesRoot_ = wxTreeItemId();
+  videosRoot_ = wxTreeItemId();
+  recentRoot_ = wxTreeItemId();
+  trashRoot_ = wxTreeItemId();
 
   auto* images = new wxImageList(16, 16, true);
-  images->Add(wxArtProvider::GetBitmap(wxART_FOLDER, wxART_OTHER, wxSize(16, 16)));         // Folder
-  images->Add(wxArtProvider::GetBitmap(wxART_GO_HOME, wxART_OTHER, wxSize(16, 16)));       // Home
-  images->Add(wxArtProvider::GetBitmap(wxART_HARDDISK, wxART_OTHER, wxSize(16, 16)));      // Drive
-  folderTree_->AssignImageList(images);
+  images->Add(wxArtProvider::GetBitmap(wxART_FOLDER, wxART_OTHER, wxSize(16, 16)));    // Folder
+  images->Add(wxArtProvider::GetBitmap(wxART_GO_HOME, wxART_OTHER, wxSize(16, 16)));  // Home
+  images->Add(wxArtProvider::GetBitmap(wxART_HARDDISK, wxART_OTHER, wxSize(16, 16))); // Drive
+  images->Add(wxArtProvider::GetBitmap(wxART_HARDDISK, wxART_OTHER, wxSize(16, 16))); // Computer
+  tree_->AssignImageList(images);
 
-  const auto root = folderTree_->AddRoot("root");
-  folderRoot_ = folderTree_->AppendItem(root, "/", static_cast<int>(TreeIcon::Drive));
-  folderTree_->SetItemData(folderRoot_, new TreeNodeData(fs::path("/")));
-  folderTree_->Expand(folderRoot_);
-  PopulateFolderChildren(folderRoot_, fs::path("/"));
+  computerRoot_ = tree_->AddRoot("My Computer", static_cast<int>(TreeIcon::Computer));
 
-  folderTree_->Thaw();
+  const fs::path homePath = wxGetHomeDir().ToStdString();
+  homeRoot_ = tree_->AppendItem(computerRoot_, "Home", static_cast<int>(TreeIcon::Home),
+                                -1, new TreeNodeData(homePath));
+
+  const auto resolve = [](const char* key, const char* fallback) -> fs::path {
+    if (const auto xdg = ReadXdgUserDir(key)) return *xdg;
+    return DefaultUserDir(fallback);
+  };
+
+  desktopRoot_ = tree_->AppendItem(computerRoot_, "Desktop", static_cast<int>(TreeIcon::Folder),
+                                   -1, new TreeNodeData(resolve("DESKTOP", "Desktop")));
+
+  documentsRoot_ = tree_->AppendItem(computerRoot_, "Documents", static_cast<int>(TreeIcon::Folder),
+                                     -1, new TreeNodeData(resolve("DOCUMENTS", "Documents")));
+
+  musicRoot_ = tree_->AppendItem(computerRoot_, "Music", static_cast<int>(TreeIcon::Folder),
+                                 -1, new TreeNodeData(resolve("MUSIC", "Music")));
+
+  picturesRoot_ = tree_->AppendItem(computerRoot_, "Pictures", static_cast<int>(TreeIcon::Folder),
+                                    -1, new TreeNodeData(resolve("PICTURES", "Pictures")));
+
+  videosRoot_ = tree_->AppendItem(computerRoot_, "Videos", static_cast<int>(TreeIcon::Folder),
+                                  -1, new TreeNodeData(resolve("VIDEOS", "Videos")));
+
+  downloadsRoot_ = tree_->AppendItem(computerRoot_, "Downloads", static_cast<int>(TreeIcon::Folder),
+                                     -1, new TreeNodeData(resolve("DOWNLOAD", "Downloads")));
+
+  recentRoot_ = tree_->AppendItem(computerRoot_, "Recent", static_cast<int>(TreeIcon::Drive),
+                                  -1, new TreeNodeData(kVirtualRecent));
+
+  fsRoot_ = tree_->AppendItem(computerRoot_, "File System", static_cast<int>(TreeIcon::Drive),
+                              -1, new TreeNodeData(fs::path("/")));
+
+  const auto trashPath = TrashFilesDir();
+  if (!trashPath.empty()) {
+    std::error_code ec;
+    fs::create_directories(trashPath, ec);
+  }
+  trashRoot_ = tree_->AppendItem(computerRoot_, "Trash", static_cast<int>(TreeIcon::Drive),
+                                 -1, new TreeNodeData(trashPath));
+
+  tree_->Expand(computerRoot_);
+
+  tree_->Thaw();
 }
 
-void FilePanel::PopulateFolderChildren(const wxTreeItemId& parent, const fs::path& dir) {
-  if (!folderTree_) return;
+static std::string UnescapeProcMountsField(std::string s) {
+  // /proc/mounts escapes spaces and tabs using octal sequences (e.g. \040).
+  std::string out;
+  out.reserve(s.size());
+  for (size_t i = 0; i < s.size(); i++) {
+    if (s[i] == '\\' && i + 3 < s.size() && std::isdigit(static_cast<unsigned char>(s[i + 1])) &&
+        std::isdigit(static_cast<unsigned char>(s[i + 2])) &&
+        std::isdigit(static_cast<unsigned char>(s[i + 3]))) {
+      const int v = (s[i + 1] - '0') * 64 + (s[i + 2] - '0') * 8 + (s[i + 3] - '0');
+      out.push_back(static_cast<char>(v));
+      i += 3;
+      continue;
+    }
+    out.push_back(s[i]);
+  }
+  return out;
+}
+
+void FilePanel::PopulateDevices(const wxTreeItemId& devicesItem) {
+  if (!tree_ || !devicesItem.IsOk()) return;
+  tree_->DeleteChildren(devicesItem);
+
+  std::ifstream f("/proc/mounts");
+  if (!f.is_open()) return;
+
+  std::set<std::string> mountpoints;
+  std::string dev, mnt, type, opts;
+  while (f >> dev >> mnt >> type >> opts) {
+    std::string rest;
+    std::getline(f, rest);
+    const auto mp = UnescapeProcMountsField(mnt);
+    if (mp.empty()) continue;
+    mountpoints.insert(mp);
+  }
+
+  const auto isInteresting = [](const std::string& mp) -> bool {
+    if (mp == "/") return false; // already represented by File System
+    if (mp.rfind("/run/media/", 0) == 0) return true;
+    if (mp.rfind("/media/", 0) == 0) return true;
+    if (mp.rfind("/mnt/", 0) == 0) return true;
+    return false;
+  };
+
+  for (const auto& mp : mountpoints) {
+    if (!isInteresting(mp)) continue;
+    fs::path p(mp);
+    auto label = p.filename().string();
+    if (label.empty()) label = mp;
+    const auto item = tree_->AppendItem(devicesItem,
+                                        wxString::FromUTF8(label),
+                                        static_cast<int>(TreeIcon::Drive),
+                                        -1,
+                                        new TreeNodeData(p));
+    tree_->AppendItem(item, " "); // dummy
+  }
+}
+
+void FilePanel::PopulateDirChildren(const wxTreeItemId& parent, const fs::path& dir) {
+  if (!tree_) return;
   std::error_code ec;
   if (!fs::exists(dir, ec) || !fs::is_directory(dir, ec)) return;
 
-  folderTree_->DeleteChildren(parent);
+  tree_->DeleteChildren(parent);
 
-  size_t added = 0;
+  std::vector<fs::path> childDirs;
   for (const auto& de : fs::directory_iterator(dir, fs::directory_options::skip_permission_denied, ec)) {
     if (ec) break;
     std::error_code sec;
     if (!de.is_directory(sec) || sec) continue;
-    const auto name = de.path().filename().string();
+    childDirs.push_back(de.path());
+    if (childDirs.size() >= 600) break;
+  }
+
+  std::sort(childDirs.begin(), childDirs.end(), [](const auto& a, const auto& b) {
+    return a.filename().string() < b.filename().string();
+  });
+
+  for (const auto& p : childDirs) {
+    const auto name = p.filename().string();
     if (name.empty()) continue;
-    const auto item = folderTree_->AppendItem(parent, name, static_cast<int>(TreeIcon::Folder));
-    folderTree_->SetItemData(item, new TreeNodeData(de.path()));
-    added++;
-    if (added >= 400) break;
+    const auto item = tree_->AppendItem(parent,
+                                        wxString::FromUTF8(name),
+                                        static_cast<int>(TreeIcon::Folder),
+                                        -1,
+                                        new TreeNodeData(p));
+    tree_->AppendItem(item, " "); // dummy
   }
 }
 
-wxTreeItemId FilePanel::EnsureFolderPathSelected(const fs::path& dir) {
-  if (!folderTree_ || !folderRoot_.IsOk()) return wxTreeItemId();
-  if (dir.empty()) return wxTreeItemId();
+wxTreeItemId FilePanel::EnsurePathSelected(const wxTreeItemId& baseItem,
+                                          const fs::path& basePath,
+                                          const fs::path& targetDir) {
+  if (!tree_) return wxTreeItemId();
+  if (!baseItem.IsOk()) return wxTreeItemId();
+  if (targetDir.empty()) return baseItem;
 
-  fs::path current = "/";
-  wxTreeItemId currentItem = folderRoot_;
-  folderTree_->Expand(currentItem);
-
-  for (const auto& part : dir.lexically_relative("/")) {
-    if (part.empty()) continue;
-    current /= part;
-
-    if (folderTree_->GetChildrenCount(currentItem, false) == 0) {
-      auto* data = dynamic_cast<TreeNodeData*>(folderTree_->GetItemData(currentItem));
-      if (data && !data->path.empty()) PopulateFolderChildren(currentItem, data->path);
+  auto ensurePopulated = [&](const wxTreeItemId& item, const fs::path& dir) {
+    wxTreeItemIdValue ck;
+    const auto firstChild = tree_->GetFirstChild(item, ck);
+    if (firstChild.IsOk() && tree_->GetItemData(firstChild) == nullptr) {
+      PopulateDirChildren(item, dir);
     }
+  };
+
+  fs::path currentPath = basePath;
+  wxTreeItemId currentItem = baseItem;
+  tree_->Expand(currentItem);
+  ensurePopulated(currentItem, currentPath);
+
+  const fs::path rel = targetDir.lexically_relative(basePath);
+  for (const auto& part : rel) {
+    if (part.empty()) continue;
+    currentPath /= part;
+
+    ensurePopulated(currentItem, currentPath.parent_path());
 
     wxTreeItemIdValue ck;
     wxTreeItemId found;
-    auto c = folderTree_->GetFirstChild(currentItem, ck);
+    auto c = tree_->GetFirstChild(currentItem, ck);
     while (c.IsOk()) {
-      auto* data = dynamic_cast<TreeNodeData*>(folderTree_->GetItemData(c));
-      if (data && data->path == current) {
+      auto* data = dynamic_cast<TreeNodeData*>(tree_->GetItemData(c));
+      if (data && !data->devicesContainer && data->path == currentPath) {
         found = c;
         break;
       }
-      c = folderTree_->GetNextChild(currentItem, ck);
+      c = tree_->GetNextChild(currentItem, ck);
     }
     if (!found.IsOk()) break;
     currentItem = found;
-    folderTree_->Expand(currentItem);
+    tree_->Expand(currentItem);
   }
 
-  folderTree_->SelectItem(currentItem);
-  folderTree_->EnsureVisible(currentItem);
   return currentItem;
 }
 
-void FilePanel::SyncSidebarToCurrentDir() {
+void FilePanel::SyncTreeToCurrentDir() {
+  if (!tree_) return;
   if (currentDir_.empty()) return;
-  ignoreSidebarEvent_ = true;
+  if (!computerRoot_.IsOk()) return;
 
-  if (places_) {
-    bool selected = false;
-    const auto count = places_->GetItemCount();
-    for (unsigned int r = 0; r < count; r++) {
-      wxVariant pathVar;
-      places_->GetValue(pathVar, r, COL_PLACE_PATH);
-      const auto p = pathVar.GetString().ToStdString();
-      if (!p.empty() && fs::path(p) == currentDir_) {
-        places_->SelectRow(r);
-        selected = true;
-        break;
-      }
+  // Virtual views.
+  if (currentDir_ == kVirtualRecent) {
+    if (recentRoot_.IsOk()) {
+      ignoreTreeEvent_ = true;
+      tree_->SelectItem(recentRoot_);
+      tree_->EnsureVisible(recentRoot_);
+      ignoreTreeEvent_ = false;
     }
-    if (!selected) places_->UnselectAll();
+    return;
   }
 
-  if (folderTree_ && folderRoot_.IsOk()) {
-    EnsureFolderPathSelected(currentDir_);
-  }
+  const auto isUnder = [](const fs::path& base, const fs::path& target) -> bool {
+    if (base.empty() || target.empty()) return false;
+    const auto b = base.lexically_normal().string();
+    const auto t = target.lexically_normal().string();
+    if (t == b) return true;
+    if (t.size() > b.size() && t.rfind(b, 0) == 0 && t[b.size()] == '/') return true;
+    return false;
+  };
 
-  ignoreSidebarEvent_ = false;
+  const auto selectShortcutIfUnder = [&](const wxTreeItemId& shortcutItem) -> bool {
+    if (!shortcutItem.IsOk()) return false;
+    auto* data = dynamic_cast<TreeNodeData*>(tree_->GetItemData(shortcutItem));
+    if (!data || data->path.empty()) return false;
+    if (!isUnder(data->path, currentDir_)) return false;
+    tree_->SelectItem(shortcutItem);
+    tree_->EnsureVisible(shortcutItem);
+    return true;
+  };
+
+  ignoreTreeEvent_ = true;
+  if (selectShortcutIfUnder(desktopRoot_) ||
+      selectShortcutIfUnder(documentsRoot_) ||
+      selectShortcutIfUnder(downloadsRoot_) ||
+      selectShortcutIfUnder(musicRoot_) ||
+      selectShortcutIfUnder(picturesRoot_) ||
+      selectShortcutIfUnder(videosRoot_) ||
+      selectShortcutIfUnder(trashRoot_)) {
+    ignoreTreeEvent_ = false;
+    return;
+  }
+  ignoreTreeEvent_ = false;
+
+  const fs::path homePath = wxGetHomeDir().ToStdString();
+  const auto dirStr = currentDir_.string();
+  const auto homeStr = homePath.string();
+  const bool inHome = !homeStr.empty() && (dirStr == homeStr ||
+                                          (dirStr.rfind(homeStr, 0) == 0 &&
+                                           (dirStr.size() == homeStr.size() ||
+                                            dirStr[homeStr.size()] == '/')));
+
+  ignoreTreeEvent_ = true;
+  const auto item = inHome ? homeRoot_ : fsRoot_;
+  if (item.IsOk()) {
+    tree_->SelectItem(item);
+    tree_->EnsureVisible(item);
+  }
+  ignoreTreeEvent_ = false;
 }
 
 void FilePanel::ShowListContextMenu(wxDataViewEvent& event) {
@@ -1312,10 +1719,11 @@ void FilePanel::ShowListContextMenu(wxDataViewEvent& event) {
   menu.Enable(ID_CTX_OPEN, hasSelection);
   menu.Enable(ID_CTX_COPY, hasSelection);
   menu.Enable(ID_CTX_CUT, hasSelection);
-  menu.Enable(ID_CTX_RENAME, selected.size() == 1);
+  menu.Enable(ID_CTX_RENAME, listingMode_ == ListingMode::Directory && selected.size() == 1);
+  menu.Enable(ID_CTX_NEW_FOLDER, listingMode_ == ListingMode::Directory);
   menu.Enable(ID_CTX_TRASH, hasSelection);
   menu.Enable(ID_CTX_DELETE_PERM, hasSelection);
-  menu.Enable(ID_CTX_PASTE, g_clipboard && !g_clipboard->paths.empty());
+  menu.Enable(ID_CTX_PASTE, listingMode_ == ListingMode::Directory && g_clipboard && !g_clipboard->paths.empty());
 
   menu.Bind(wxEVT_MENU, [this](wxCommandEvent&) { OpenSelection(); }, ID_CTX_OPEN);
   menu.Bind(wxEVT_MENU, [this](wxCommandEvent&) { CopySelection(); }, ID_CTX_COPY);

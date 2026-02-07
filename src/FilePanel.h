@@ -26,6 +26,7 @@ public:
     bool isDir{false};
     std::uintmax_t size{0};
     std::string modified;
+    std::string fullPath;
   };
 
   explicit FilePanel(wxWindow* parent);
@@ -59,18 +60,24 @@ public:
       std::function<void(const std::filesystem::path& dir, bool treeChanged)> onChanged);
 
 private:
+  enum class ListingMode { Directory, Recent };
+  enum class SortColumn { Name, Type, Size, Modified };
+
   void BuildLayout();
   void BindEvents();
   void NavigateToTextPath();
   void OpenSelectedIfDir(wxDataViewEvent& event);
   void OnTreeSelectionChanged();
+  void OnTreeItemExpanding(wxTreeEvent& event);
   void OnListValueChanged(wxDataViewEvent& event);
+  void ResortListing();
+  void SortEntries(std::vector<Entry>& entries) const;
+  void UpdateSortIndicators();
   void UpdateStatusText();
   void UpdateActiveVisuals();
   void NotifyDirContentsChanged(bool treeChanged);
-  void RefreshTreeNode(const std::filesystem::path& dir);
-  void ReselectAndReveal(const std::vector<std::string>& selectedNames,
-                         const std::optional<std::string>& currentName);
+  void ReselectAndReveal(const std::vector<std::string>& selectedKeys,
+                         const std::optional<std::string>& currentKey);
   void ShowListContextMenu(wxDataViewEvent& event);
   bool AnySelectedDirs() const;
   bool LoadDirectory(const std::filesystem::path& dir);
@@ -82,11 +89,13 @@ private:
   void GoHome();
   void UpdateNavButtons();
   void UpdateNavIcons();
-  void BuildPlaces();
-  void BuildFolderTree();
-  void SyncSidebarToCurrentDir();
-  void PopulateFolderChildren(const wxTreeItemId& parent, const std::filesystem::path& dir);
-  wxTreeItemId EnsureFolderPathSelected(const std::filesystem::path& dir);
+  void BuildComputerTree();
+  void PopulateDirChildren(const wxTreeItemId& parent, const std::filesystem::path& dir);
+  void PopulateDevices(const wxTreeItemId& devicesItem);
+  wxTreeItemId EnsurePathSelected(const wxTreeItemId& baseItem,
+                                 const std::filesystem::path& basePath,
+                                 const std::filesystem::path& targetDir);
+  void SyncTreeToCurrentDir();
 
   void SetStatus(const wxString& message);
   void Populate(const std::vector<Entry>& entries);
@@ -99,17 +108,19 @@ private:
   wxBitmapButton* homeBtn_{nullptr};
   wxButton* goBtn_{nullptr};
   wxSplitterWindow* split_{nullptr};
-  wxSplitterWindow* sidebarSplit_{nullptr};
-  wxDataViewListCtrl* places_{nullptr};
-  wxTreeCtrl* folderTree_{nullptr};
+  wxTreeCtrl* tree_{nullptr};
   wxDataViewListCtrl* list_{nullptr};
   wxStaticText* statusText_{nullptr};
 
   std::filesystem::path currentDir_;
+  ListingMode listingMode_{ListingMode::Directory};
   std::vector<Entry> currentEntries_{};
   std::function<void()> onFocus_{};
   std::function<void(const std::filesystem::path&, bool)> onDirContentsChanged_{};
-  bool ignoreSidebarEvent_{false};
+  bool ignoreTreeEvent_{false};
+
+  SortColumn sortColumn_{SortColumn::Name};
+  bool sortAscending_{true};
 
   enum class LastFocus { Tree, List };
   LastFocus lastFocus_{LastFocus::List};
@@ -120,6 +131,18 @@ private:
 
   wxDataViewItem renameArmedItem_{};
   long long renameArmedAtMs_{0};
+  bool allowInlineEdit_{false};
 
-  wxTreeItemId folderRoot_{};
+  wxTreeItemId computerRoot_{};
+  wxTreeItemId homeRoot_{};
+  wxTreeItemId fsRoot_{};
+  wxTreeItemId devicesRoot_{};
+  wxTreeItemId desktopRoot_{};
+  wxTreeItemId documentsRoot_{};
+  wxTreeItemId downloadsRoot_{};
+  wxTreeItemId musicRoot_{};
+  wxTreeItemId picturesRoot_{};
+  wxTreeItemId videosRoot_{};
+  wxTreeItemId recentRoot_{};
+  wxTreeItemId trashRoot_{};
 };
