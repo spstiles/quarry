@@ -68,6 +68,8 @@ public:
   Kind kind{Kind::Path};
 };
 
+std::string PercentDecode(std::string s);
+
 bool LooksLikeUri(const std::string& s) {
   const auto pos = s.find("://");
   return pos != std::string::npos && pos > 0;
@@ -77,6 +79,20 @@ std::string UriScheme(const std::string& s) {
   const auto pos = s.find("://");
   if (pos == std::string::npos) return {};
   return s.substr(0, pos);
+}
+
+std::string UriLastSegment(const std::string& s) {
+  const auto pos = s.find("://");
+  if (pos == std::string::npos) return {};
+  size_t start = pos + 3;
+  // Skip any extra slashes.
+  while (start < s.size() && s[start] == '/') start++;
+  if (start >= s.size()) return {};
+  size_t end = s.size();
+  while (end > start && s[end - 1] == '/') end--;
+  const auto lastSlash = s.rfind('/', end - 1);
+  if (lastSlash == std::string::npos || lastSlash < start) return PercentDecode(s.substr(start, end - start));
+  return PercentDecode(s.substr(lastSlash + 1, end - (lastSlash + 1)));
 }
 
 bool IsBareSchemeUri(const std::string& s) {
@@ -994,6 +1010,20 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
         const auto p = UriToPath(dirStr);
         if (p) return LoadDirectory(*p);
       } else if (IsGioLocationUri(dirStr)) {
+        // network:// hosts sometimes appear as network:///HOST but aren't listable directly on all systems.
+        // If that happens, fall back to smb://HOST/ which is what users usually want when double-clicking a server.
+        std::string effectiveUri = dirStr;
+        if (scheme == "network" && dirStr != "network://") {
+          std::string probeErr;
+          (void)ListGioLocation(dirStr, &probeErr);
+          if (!probeErr.empty() &&
+              (probeErr.find("File doesn’t exist") != std::string::npos ||
+               probeErr.find("File doesn't exist") != std::string::npos)) {
+            const auto host = UriLastSegment(dirStr);
+            if (!host.empty()) effectiveUri = "smb://" + host + "/";
+          }
+        }
+
         if (scheme == "smb" && IsBareSchemeUri(dirStr)) {
           wxTextEntryDialog dlg(this,
                                 "Enter an SMB URI (example: smb://server/share):",
@@ -1006,8 +1036,8 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
         }
 
         listingMode_ = ListingMode::Gio;
-        currentDir_ = dir;
-        if (pathCtrl_) pathCtrl_->ChangeValue(dirStr);
+        currentDir_ = fs::path(effectiveUri);
+        if (pathCtrl_) pathCtrl_->ChangeValue(currentDir_.string());
 
         // Best-effort tree sync: highlight Network group.
         SyncTreeToCurrentDir();
@@ -1038,7 +1068,7 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
         }
 
         std::string err;
-        auto entries = ListGioLocation(dirStr, &err);
+        auto entries = ListGioLocation(effectiveUri, &err);
         if (!err.empty()) {
           const bool maybeNeedsMount =
               scheme == "network" || scheme == "smb" ||
@@ -1047,9 +1077,9 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
 
           if (maybeNeedsMount) {
             std::string mountErr;
-            if (GioMountLocation(dirStr, &mountErr)) {
+            if (GioMountLocation(effectiveUri, &mountErr)) {
               err.clear();
-              entries = ListGioLocation(dirStr, &err);
+              entries = ListGioLocation(effectiveUri, &err);
             } else if (!mountErr.empty()) {
               err = err.empty() ? mountErr : (err + "\n\nMount attempt: " + mountErr);
             }
@@ -1063,7 +1093,7 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
           } else if (err.find("not mounted") != std::string::npos) {
             help = "\n\nTry a full URI like smb://server/share (not just smb://).";
           }
-          const wxString dirWx = wxString::FromUTF8(dirStr);
+          const wxString dirWx = wxString::FromUTF8(effectiveUri);
           const wxString errWx = wxString::FromUTF8(err);
           wxMessageBox(wxString::Format("Unable to list location:\n\n%s\n\n%s%s",
                                         dirWx.c_str(),
