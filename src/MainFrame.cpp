@@ -570,7 +570,20 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
         continue;
       }
 
-      const auto result = move ? MovePath(src, dst) : CopyPathRecursive(src, dst);
+      const CancelFn shouldCancel = [&state]() { return state.cancelRequested.load(); };
+      const CopyProgressFn onProgress = [&state, src](const std::filesystem::path& current) {
+        const auto rel = current.lexically_relative(src);
+        std::string label;
+        if (!rel.empty() && rel != current) label = rel.string();
+        if (label.empty()) label = current.filename().string();
+        if (label.empty()) label = current.string();
+        std::lock_guard<std::mutex> lock(state.mu);
+        state.currentLabel = std::move(label);
+      };
+
+      const auto result = move ? MovePath(src, dst, shouldCancel, onProgress)
+                               : CopyPathRecursive(src, dst, shouldCancel, onProgress);
+      if (state.cancelRequested.load() && !result.ok && result.message == "Canceled") break;
       if (!result.ok) {
         std::unique_lock<std::mutex> lock(state.mu);
         state.prompt = AsyncFileOpPrompt{.kind = AsyncFileOpPrompt::Kind::Error,

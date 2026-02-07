@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <filesystem>
 #include <string>
 
@@ -18,7 +19,18 @@ bool ConfirmFileOp(wxWindow* parent,
                    const std::filesystem::path& src,
                    const std::filesystem::path& dst);
 
+using CancelFn = std::function<bool()>;
+using CopyProgressFn = std::function<void(const std::filesystem::path& current)>;
+
 OpResult CopyPathRecursive(const std::filesystem::path& src, const std::filesystem::path& dst);
+OpResult CopyPathRecursive(const std::filesystem::path& src,
+                           const std::filesystem::path& dst,
+                           const CancelFn& shouldCancel,
+                           const CopyProgressFn& onProgress);
 OpResult MovePath(const std::filesystem::path& src, const std::filesystem::path& dst);
+OpResult MovePath(const std::filesystem::path& src,
+                  const std::filesystem::path& dst,
+                  const CancelFn& shouldCancel,
+                  const CopyProgressFn& onProgress);
 OpResult DeletePath(const std::filesystem::path& src);
 OpResult TrashPath(const std::filesystem::path& src);
