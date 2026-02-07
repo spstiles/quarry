@@ -194,91 +194,9 @@ std::string PrettyNetworkLabel(const std::string& uriOrName) {
   return PercentDecode(uriOrName);
 }
 
-fs::path RecentHostsFile() {
-  const auto home = wxGetHomeDir().ToStdString();
-  if (home.empty()) return {};
-  return fs::path(home) / ".config" / "quarry" / "recent-hosts.txt";
-}
+static std::vector<std::string> g_recentHosts;
 
-fs::path LegacyRecentSharesFile() {
-  const auto home = wxGetHomeDir().ToStdString();
-  if (home.empty()) return {};
-  return fs::path(home) / ".config" / "quarry" / "recent-shares.txt";
-}
-
-std::vector<std::string> ReadLinesUnique(const fs::path& path, size_t limit) {
-  std::vector<std::string> out;
-  if (path.empty()) return out;
-
-  std::error_code ec;
-  if (!fs::exists(path, ec)) return out;
-
-  std::ifstream f(path);
-  if (!f.is_open()) return out;
-
-  std::string line;
-  std::unordered_map<std::string, bool> seen;
-  while (std::getline(f, line)) {
-    line = TrimRight(line);
-    if (line.empty()) continue;
-    if (seen.find(line) != seen.end()) continue;
-    seen[line] = true;
-    out.push_back(line);
-    if (out.size() >= limit) break;
-  }
-  return out;
-}
-
-std::vector<std::string> ReadRecentHosts() {
-  auto out = ReadLinesUnique(RecentHostsFile(), 30);
-  if (!out.empty()) return out;
-
-  // One-time migration from legacy per-share list.
-  const auto legacy = LegacyRecentSharesFile();
-  if (legacy.empty()) return out;
-
-  const auto legacyLines = ReadLinesUnique(legacy, 100);
-  std::unordered_map<std::string, bool> seen;
-  for (const auto& uri : legacyLines) {
-    if (!LooksLikeUri(uri)) continue;
-    const auto scheme = UriScheme(uri);
-    if (scheme != "smb" && scheme != "afp") continue;
-    const auto host = UriAuthorityHost(uri);
-    if (host.empty()) continue;
-    const auto key = scheme + "://" + host + "/";
-    if (seen.find(key) != seen.end()) continue;
-    seen[key] = true;
-    out.push_back(key);
-    if (out.size() >= 30) break;
-  }
-
-  if (!out.empty()) {
-    // Persist migrated format and keep legacy file around.
-    std::error_code ec;
-    fs::create_directories(RecentHostsFile().parent_path(), ec);
-    std::ofstream f(RecentHostsFile(), std::ios::trunc);
-    if (f.is_open()) {
-      for (const auto& s : out) f << s << "\n";
-    }
-  }
-
-  return out;
-}
-
-void WriteRecentHosts(const std::vector<std::string>& hosts) {
-  const auto path = RecentHostsFile();
-  if (path.empty()) return;
-
-  std::error_code ec;
-  fs::create_directories(path.parent_path(), ec);
-
-  std::ofstream f(path, std::ios::trunc);
-  if (!f.is_open()) return;
-  for (const auto& s : hosts) {
-    if (s.empty()) continue;
-    f << s << "\n";
-  }
-}
+const std::vector<std::string>& GetRecentHosts() { return g_recentHosts; }
 
 std::optional<std::string> HostRootForUri(const std::string& uri) {
   if (!LooksLikeUri(uri)) return std::nullopt;
@@ -294,11 +212,9 @@ bool AddRecentHost(const std::string& uri) {
   const auto root = HostRootForUri(uri);
   if (!root) return false;
 
-  auto hosts = ReadRecentHosts();
-  hosts.erase(std::remove(hosts.begin(), hosts.end(), *root), hosts.end());
-  hosts.insert(hosts.begin(), *root);
-  if (hosts.size() > 15) hosts.resize(15);
-  WriteRecentHosts(hosts);
+  g_recentHosts.erase(std::remove(g_recentHosts.begin(), g_recentHosts.end(), *root), g_recentHosts.end());
+  g_recentHosts.insert(g_recentHosts.begin(), *root);
+  if (g_recentHosts.size() > 15) g_recentHosts.resize(15);
   return true;
 }
 
@@ -2577,7 +2493,7 @@ void FilePanel::PopulateNetwork(const wxTreeItemId& networkItem) {
                                         -1,
                                         new TreeNodeData(fs::path("network://")));
 
-  const auto hosts = ReadRecentHosts();
+  const auto& hosts = GetRecentHosts();
   for (const auto& uri : hosts) {
     if (uri.empty()) continue;
     tree_->AppendItem(networkItem,
