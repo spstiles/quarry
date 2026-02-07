@@ -373,6 +373,24 @@ std::vector<FilePanel::Entry> ListGioLocation(const std::string& uri, std::strin
   return entries;
 }
 
+bool GioMountLocation(const std::string& uri, std::string* err) {
+  if (err) err->clear();
+  const wxString cmd0 = "gio";
+  const wxString cmd1 = "mount";
+  const wxString cmd2 = wxString::FromUTF8(uri);
+  const wxChar* const argv[] = {cmd0.wc_str(), cmd1.wc_str(), cmd2.wc_str(), nullptr};
+  const long rc = wxExecute(argv, wxEXEC_SYNC);
+  if (rc == -1) {
+    if (err) *err = "Unable to run gio (is it installed?)";
+    return false;
+  }
+  if (rc != 0) {
+    if (err) *err = "gio mount failed (exit code " + std::to_string(rc) + ").";
+    return false;
+  }
+  return true;
+}
+
 std::string GetRowName(wxDataViewListCtrl* list, unsigned int row) {
   wxVariant v;
   list->GetValue(v, row, COL_NAME);
@@ -413,8 +431,9 @@ ExistsChoice PromptExists(wxWindow* parent, const fs::path& dst) {
   choices.Add("Skip");
   choices.Add("Rename");
   choices.Add("Cancel");
+  const wxString dstWx = wxString::FromUTF8(dst.string());
   wxSingleChoiceDialog dlg(parent,
-                           wxString::Format("Destination already exists:\n\n%s", dst.string()),
+                           wxString::Format("Destination already exists:\n\n%s", dstWx.c_str()),
                            "File exists",
                            choices);
   if (dlg.ShowModal() != wxID_OK) return ExistsChoice::Cancel;
@@ -1021,13 +1040,35 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
         std::string err;
         auto entries = ListGioLocation(dirStr, &err);
         if (!err.empty()) {
+          const bool maybeNeedsMount =
+              scheme == "network" || scheme == "smb" ||
+              err.find("not mounted") != std::string::npos ||
+              TrimRight(err).empty();
+
+          if (maybeNeedsMount) {
+            std::string mountErr;
+            if (GioMountLocation(dirStr, &mountErr)) {
+              err.clear();
+              entries = ListGioLocation(dirStr, &err);
+            } else if (!mountErr.empty()) {
+              err = err.empty() ? mountErr : (err + "\n\nMount attempt: " + mountErr);
+            }
+          }
+        }
+
+        if (!err.empty()) {
           wxString help;
           if (err.find("Operation not supported") != std::string::npos) {
             help = "\n\nThis usually means the GIO/GVfs backend for this scheme isn't available on your system.";
           } else if (err.find("not mounted") != std::string::npos) {
             help = "\n\nTry a full URI like smb://server/share (not just smb://).";
           }
-          wxMessageBox(wxString::Format("Unable to list location:\n\n%s\n\n%s%s", dirStr, err, help),
+          const wxString dirWx = wxString::FromUTF8(dirStr);
+          const wxString errWx = wxString::FromUTF8(err);
+          wxMessageBox(wxString::Format("Unable to list location:\n\n%s\n\n%s%s",
+                                        dirWx.c_str(),
+                                        errWx.c_str(),
+                                        help.c_str()),
                        "Quarry", wxOK | wxICON_ERROR, this);
           return false;
         }
@@ -1075,7 +1116,8 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
   const auto resolved = ec ? dir : canonical;
 
   if (!fs::exists(resolved, ec) || !fs::is_directory(resolved, ec)) {
-    wxMessageBox(wxString::Format("Not a directory:\n\n%s", resolved.string()), "Quarry",
+    const wxString resolvedWx = wxString::FromUTF8(resolved.string());
+    wxMessageBox(wxString::Format("Not a directory:\n\n%s", resolvedWx.c_str()), "Quarry",
                  wxOK | wxICON_WARNING, this);
     return false;
   }
@@ -1087,7 +1129,11 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
   std::string err;
   auto entries = ListDir(currentDir_, &err);
   if (!err.empty()) {
-    wxMessageBox(wxString::Format("Unable to list directory:\n\n%s\n\n%s", currentDir_.string(), err),
+    const wxString dirWx = wxString::FromUTF8(currentDir_.string());
+    const wxString errWx = wxString::FromUTF8(err);
+    wxMessageBox(wxString::Format("Unable to list directory:\n\n%s\n\n%s",
+                                  dirWx.c_str(),
+                                  errWx.c_str()),
                  "Quarry", wxOK | wxICON_ERROR, this);
   }
   SortEntries(entries);
@@ -1208,7 +1254,8 @@ void FilePanel::OnListValueChanged(wxDataViewEvent& event) {
   std::error_code ec;
   fs::rename(currentDir_ / oldName, currentDir_ / newName, ec);
   if (ec) {
-    wxMessageBox(wxString::Format("Rename failed:\n\n%s", ec.message()), "Rename",
+    const wxString errWx = wxString::FromUTF8(ec.message());
+    wxMessageBox(wxString::Format("Rename failed:\n\n%s", errWx.c_str()), "Rename",
                  wxOK | wxICON_ERROR, this);
     SetRowName(list_, static_cast<unsigned int>(row), oldName, renamedDir);
     return;
@@ -1392,13 +1439,15 @@ void FilePanel::UpdateStatusText() {
     modeLabel = s.rfind("network://", 0) == 0 ? "Network" : "Remote";
   }
 
+  const wxString selectedSizeWx = wxString::FromUTF8(HumanSize(selectedBytes));
+  const wxString freeWx = wxString::FromUTF8(freeText);
   const auto label = wxString::Format(
       "%s   Items: %zu (%zu dirs, %zu files)   Selected: %zu (%zu dirs, %zu files)   Selected size: %s   Free: %s",
-      modeLabel,
+      modeLabel.c_str(),
       total, totalDirs, totalFiles,
       selectedCount, selectedDirs, selectedFiles,
-      HumanSize(selectedBytes),
-      freeText);
+      selectedSizeWx.c_str(),
+      freeWx.c_str());
   statusText_->SetLabel(label);
 }
 
@@ -1531,7 +1580,8 @@ void FilePanel::CreateFolder() {
   std::error_code ec;
   fs::create_directory(currentDir_ / name, ec);
   if (ec) {
-    wxMessageBox(wxString::Format("Create folder failed:\n\n%s", ec.message()), "Create Folder",
+    const wxString errWx = wxString::FromUTF8(ec.message());
+    wxMessageBox(wxString::Format("Create folder failed:\n\n%s", errWx.c_str()), "Create Folder",
                  wxOK | wxICON_ERROR, this);
     return;
   }
@@ -1608,9 +1658,11 @@ void FilePanel::PasteIntoCurrentDir() {
 
     const auto result = isMove ? MovePath(src, dst) : CopyPathRecursive(src, dst);
     if (!result.ok) {
+      const wxString action = isMove ? "Move" : "Copy";
       wxMessageDialog dlg(this,
                           wxString::Format("%s failed:\n\n%s\n\nContinue?",
-                                           isMove ? "Move" : "Copy", result.message),
+                                           action.c_str(),
+                                           result.message.c_str()),
                           title,
                           wxYES_NO | wxNO_DEFAULT | wxICON_ERROR);
       dlg.SetYesNoLabels("Continue", "Cancel");
@@ -1649,7 +1701,7 @@ void FilePanel::TrashSelection() {
     const auto result = TrashPath(src);
     if (!result.ok) {
       wxMessageDialog dlg(this,
-                          wxString::Format("Trash failed:\n\n%s\n\nContinue?", result.message),
+                          wxString::Format("Trash failed:\n\n%s\n\nContinue?", result.message.c_str()),
                           "Trash failed",
                           wxYES_NO | wxNO_DEFAULT | wxICON_ERROR);
       dlg.SetYesNoLabels("Continue", "Cancel");
@@ -1686,7 +1738,7 @@ void FilePanel::DeleteSelectionPermanent() {
     const auto result = DeletePath(src);
     if (!result.ok) {
       wxMessageDialog dlg(this,
-                          wxString::Format("Delete failed:\n\n%s\n\nContinue?", result.message),
+                          wxString::Format("Delete failed:\n\n%s\n\nContinue?", result.message.c_str()),
                           "Delete failed",
                           wxYES_NO | wxNO_DEFAULT | wxICON_ERROR);
       dlg.SetYesNoLabels("Continue", "Cancel");
