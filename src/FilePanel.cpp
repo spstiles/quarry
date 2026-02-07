@@ -2565,7 +2565,7 @@ void FilePanel::PopulateNetwork(const wxTreeItemId& networkItem) {
   tree_->DeleteChildren(networkItem);
 
   tree_->AppendItem(networkItem,
-                    "Network",
+                    "Browse Network",
                     static_cast<int>(TreeIcon::Drive),
                     -1,
                     new TreeNodeData(fs::path("network://")));
