@@ -79,6 +79,15 @@ std::string UriScheme(const std::string& s) {
   return s.substr(0, pos);
 }
 
+bool IsBareSchemeUri(const std::string& s) {
+  const auto pos = s.find("://");
+  if (pos == std::string::npos) return false;
+  const auto rest = s.substr(pos + 3);
+  if (rest.empty()) return true;
+  if (rest == "/") return true;
+  return false;
+}
+
 bool IsGioLocationUri(const std::string& s) {
   if (!LooksLikeUri(s)) return false;
   const auto scheme = UriScheme(s);
@@ -865,7 +874,8 @@ void FilePanel::OnTreeSelectionChanged() {
     wxTextEntryDialog dlg(this,
                           "Enter a GIO location URI (examples: smb://server/share, sftp://host/path):",
                           "Connect to Server");
-    dlg.SetValue("smb://");
+    const auto prefill = data->path.empty() ? std::string("smb://") : data->path.string();
+    dlg.SetValue(prefill);
     if (dlg.ShowModal() != wxID_OK) return;
     const auto uri = dlg.GetValue().ToStdString();
     if (uri.empty()) return;
@@ -979,6 +989,17 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
         const auto p = UriToPath(dirStr);
         if (p) return LoadDirectory(*p);
       } else if (IsGioLocationUri(dirStr)) {
+        if (scheme == "smb" && IsBareSchemeUri(dirStr)) {
+          wxTextEntryDialog dlg(this,
+                                "Enter an SMB URI (example: smb://server/share):",
+                                "Connect to Windows Share");
+          dlg.SetValue("smb://");
+          if (dlg.ShowModal() != wxID_OK) return false;
+          const auto uri = dlg.GetValue().ToStdString();
+          if (uri.empty() || uri == dirStr) return false;
+          return LoadDirectory(fs::path(uri));
+        }
+
         listingMode_ = ListingMode::Gio;
         currentDir_ = dir;
         if (pathCtrl_) pathCtrl_->ChangeValue(dirStr);
@@ -1014,7 +1035,13 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
         std::string err;
         auto entries = ListGioLocation(dirStr, &err);
         if (!err.empty()) {
-          wxMessageBox(wxString::Format("Unable to list location:\n\n%s\n\n%s", dirStr, err),
+          wxString help;
+          if (err.find("Operation not supported") != std::string::npos) {
+            help = "\n\nThis usually means the GIO/GVfs backend for this scheme isn't available on your system.";
+          } else if (err.find("not mounted") != std::string::npos) {
+            help = "\n\nTry a full URI like smb://server/share (not just smb://).";
+          }
+          wxMessageBox(wxString::Format("Unable to list location:\n\n%s\n\n%s%s", dirStr, err, help),
                        "Quarry", wxOK | wxICON_ERROR, this);
           return false;
         }
@@ -1849,10 +1876,10 @@ void FilePanel::PopulateNetwork(const wxTreeItemId& networkItem) {
                     new TreeNodeData(fs::path("network://")));
 
   tree_->AppendItem(networkItem,
-                    "Windows Shares",
+                    "Windows Shares\u2026",
                     static_cast<int>(TreeIcon::Drive),
                     -1,
-                    new TreeNodeData(fs::path("smb://")));
+                    new TreeNodeData(fs::path("smb://"), TreeNodeData::Kind::ActionConnectToServer));
 
   tree_->AppendItem(networkItem,
                     "Connect to Server\u2026",
