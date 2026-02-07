@@ -158,6 +158,31 @@ std::optional<ConnectParams> ShowConnectDialog(wxWindow* parent) {
   grid->Add(new wxStaticText(&dlg, wxID_ANY, "Folder:"), 0, wxALIGN_CENTER_VERTICAL);
   grid->Add(folderCtrl, 1, wxEXPAND);
 
+  // Default port helpers.
+  auto defaultPortForSelection = [](int sel) -> int {
+    switch (sel) {
+      case 1: return 22;  // SFTP
+      case 2: return 21;  // FTP
+      case 3: return 80;  // WebDAV
+      case 4: return 443; // WebDAVS
+      default: return 0;  // SMB/AFP
+    }
+  };
+
+  bool portTouched = false;
+  portCtrl->Bind(wxEVT_SPINCTRL, [&portTouched](wxSpinEvent&) { portTouched = true; });
+  portCtrl->Bind(wxEVT_TEXT, [&portTouched](wxCommandEvent&) { portTouched = true; });
+
+  typeCtrl->Bind(wxEVT_CHOICE, [&](wxCommandEvent&) {
+    const int sel = typeCtrl->GetSelection();
+    const int def = defaultPortForSelection(sel);
+    // Only auto-fill if the user hasn't edited the port yet, or it's currently 0.
+    if (!portTouched || portCtrl->GetValue() == 0) {
+      portCtrl->SetValue(def);
+      portTouched = false;
+    }
+  });
+
   // User details
   auto* userBox = new wxStaticBoxSizer(wxVERTICAL, &dlg, "User Details");
   root->Add(userBox, 0, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 10);
