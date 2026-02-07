@@ -101,22 +101,96 @@ std::string UriLastSegment(const std::string& s) {
   return PercentDecode(s.substr(lastSlash + 1, end - (lastSlash + 1)));
 }
 
-std::string ExtractSmbHostFromDnssd(std::string s) {
-  // Common network:// entry names look like:
+bool ParseDnssdService(std::string s, std::string* hostOut, std::string* protoOut) {
+  // Examples:
   //   dnssd-server-NAS0002._smb._tcp
-  // We want:
-  //   NAS0002
-  const std::string suffix = "._smb._tcp";
-  const auto sufPos = s.find(suffix);
-  if (sufPos == std::string::npos) return {};
+  //   NAS0002._afp._tcp
+  // We want: host=NAS0002, proto=smb/afp
+  if (hostOut) hostOut->clear();
+  if (protoOut) protoOut->clear();
 
-  s = s.substr(0, sufPos);
+  s = PercentDecode(s);
 
   const std::string prefix = "dnssd-server-";
   if (s.rfind(prefix, 0) == 0) s = s.substr(prefix.size());
 
-  if (s.empty()) return {};
+  const auto sep = s.rfind("._");
+  if (sep == std::string::npos) return false;
+  if (s.size() < 6) return false;
+
+  const auto tcpPos = s.find("._tcp", sep);
+  if (tcpPos == std::string::npos) return false;
+
+  const std::string host = s.substr(0, sep);
+  if (host.empty()) return false;
+
+  // s[sep..] looks like "._proto._tcp"
+  const size_t protoStart = sep + 2;
+  const size_t protoEnd = s.find("._", protoStart);
+  if (protoEnd == std::string::npos || protoEnd <= protoStart) return false;
+  const std::string proto = s.substr(protoStart, protoEnd - protoStart);
+  if (proto.empty()) return false;
+
+  if (hostOut) *hostOut = host;
+  if (protoOut) *protoOut = proto;
+  return true;
+}
+
+std::string UpperAscii(std::string s) {
+  for (auto& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
   return s;
+}
+
+std::string UriAuthorityHost(const std::string& uri) {
+  const auto pos = uri.find("://");
+  if (pos == std::string::npos) return {};
+  size_t i = pos + 3;
+  while (i < uri.size() && uri[i] == '/') i++;
+  if (i >= uri.size()) return {};
+
+  size_t end = uri.find('/', i);
+  if (end == std::string::npos) end = uri.size();
+  std::string auth = uri.substr(i, end - i);
+
+  // Strip userinfo.
+  const auto at = auth.rfind('@');
+  if (at != std::string::npos) auth = auth.substr(at + 1);
+
+  // IPv6 [::1]:port
+  if (!auth.empty() && auth.front() == '[') {
+    const auto rb = auth.find(']');
+    if (rb != std::string::npos) return auth.substr(1, rb - 1);
+    return auth;
+  }
+
+  // Strip port.
+  const auto colon = auth.find(':');
+  if (colon != std::string::npos) auth = auth.substr(0, colon);
+  return PercentDecode(auth);
+}
+
+std::string PrettyNetworkLabel(const std::string& uriOrName) {
+  // Prefer uri parsing when available.
+  if (LooksLikeUri(uriOrName)) {
+    const auto scheme = UriScheme(uriOrName);
+    if (scheme == "smb" || scheme == "afp" || scheme == "sftp" || scheme == "ftp" || scheme == "dav" ||
+        scheme == "davs") {
+      const auto host = UriAuthorityHost(uriOrName);
+      if (host.empty()) return uriOrName;
+      if (scheme == "smb") return host;
+      return host + "(" + UpperAscii(scheme) + ")";
+    }
+  }
+
+  // Otherwise try DNS-SD service name.
+  std::string host, proto;
+  if (ParseDnssdService(uriOrName, &host, &proto)) {
+    if (proto == "smb") return host;
+    if (proto == "afpovertcp") return host + "(AFP)";
+    return host + "(" + UpperAscii(proto) + ")";
+  }
+
+  return PercentDecode(uriOrName);
 }
 
 bool IsBareSchemeUri(const std::string& s) {
@@ -1429,11 +1503,16 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
         // listable/browsable URI is smb://HOST/ instead, so we fall back.
         std::string effectiveUri = dirStr;
         if (scheme == "network" && dirStr != "network://") {
-          const auto host = UriLastSegment(dirStr);
-          if (!host.empty()) {
-            // If the host is a DNS-SD service name, extract the underlying hostname.
-            const auto dnssdHost = ExtractSmbHostFromDnssd(host);
-            effectiveUri = "smb://" + (!dnssdHost.empty() ? dnssdHost : host) + "/";
+          const auto last = UriLastSegment(dirStr);
+          if (!last.empty()) {
+            std::string host, proto;
+            if (ParseDnssdService(last, &host, &proto)) {
+              std::string mappedScheme = proto;
+              if (proto == "afpovertcp") mappedScheme = "afp";
+              effectiveUri = mappedScheme + "://" + host + "/";
+            } else {
+              effectiveUri = "smb://" + last + "/";
+            }
           }
         }
 
@@ -1514,6 +1593,13 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
                                         help.c_str()),
                        "Quarry", wxOK | wxICON_ERROR, this);
           return false;
+        }
+
+        if (UriScheme(effectiveUri) == "network") {
+          for (auto& e : entries) {
+            const auto src = !e.fullPath.empty() ? e.fullPath : e.name;
+            e.name = PrettyNetworkLabel(src);
+          }
         }
 
         SortEntries(entries);
