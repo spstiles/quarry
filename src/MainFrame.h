@@ -34,6 +34,11 @@ private:
                             const std::vector<std::filesystem::path>& sources,
                             bool move);
 
+  void CopyMoveWithProgress(const wxString& title,
+                            const std::vector<std::filesystem::path>& sources,
+                            const std::filesystem::path& dstDir,
+                            bool move);
+
   void SetActivePane(ActivePane pane);
   void RefreshPanelsShowing(const std::filesystem::path& dir, bool treeChanged);
 

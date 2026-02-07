@@ -7,6 +7,7 @@
 #include <system_error>
 
 #include <wx/msgdlg.h>
+#include <wx/thread.h>
 #include <wx/utils.h>
 
 namespace fs = std::filesystem;
@@ -81,7 +82,8 @@ OpResult CopyPathRecursive(const fs::path& src, const fs::path& dst) {
 
   auto yieldSometimes = [](std::uint64_t& counter) {
     counter++;
-    if ((counter % 256u) == 0u) wxYieldIfNeeded();
+    // Copy operations may run on a worker thread; never yield from there.
+    if ((counter % 256u) == 0u && wxIsMainThread()) wxYieldIfNeeded();
   };
 
   std::uint64_t yieldCounter = 0;

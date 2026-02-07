@@ -3,6 +3,11 @@
 #include "util.h"
 
 #include <filesystem>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <optional>
+#include <thread>
 
 #include <wx/accel.h>
 #include <wx/choicdlg.h>
@@ -52,6 +57,42 @@ ExistsChoice PromptExists(wxWindow* parent, const std::filesystem::path& dst) {
     case 2: return ExistsChoice::Rename;
     default: return ExistsChoice::Cancel;
   }
+}
+
+struct AsyncFileOpPrompt {
+  enum class Kind { Exists, Error };
+  Kind kind{Kind::Exists};
+  std::filesystem::path dst{};
+  std::string errorMessage{};
+};
+
+struct AsyncFileOpReply {
+  // For Kind::Exists
+  ExistsChoice existsChoice{ExistsChoice::Cancel};
+  std::optional<std::string> renameTo{};
+
+  // For Kind::Error
+  bool continueAfterError{false};
+};
+
+struct AsyncFileOpState {
+  std::mutex mu{};
+  std::condition_variable cv{};
+
+  std::atomic<bool> cancelRequested{false};
+  std::atomic<size_t> done{0};
+
+  bool finished{false};
+  bool hasDir{false};
+  std::string currentLabel{};
+
+  std::optional<AsyncFileOpPrompt> prompt{};
+  std::optional<AsyncFileOpReply> reply{};
+};
+
+bool LooksLikeUriPath(const std::filesystem::path& p) {
+  const auto s = p.string();
+  return s.find("://") != std::string::npos;
 }
 
 std::string PercentEncode(std::string s) {
@@ -412,10 +453,38 @@ void MainFrame::TransferDroppedPaths(FilePanel* target,
     }
   }
 
-  const bool isMove = move;
-  const wxString title = isMove ? "Move" : "Copy";
-  const wxString dstDirWx = wxString::FromUTF8(dstDir.string());
+  CopyMoveWithProgress(move ? "Move" : "Copy", sources, dstDir, move);
+}
 
+void MainFrame::CopyMoveWithProgress(const wxString& title,
+                                     const std::vector<std::filesystem::path>& sources,
+                                     const std::filesystem::path& dstDir,
+                                     bool move) {
+  if (sources.empty()) return;
+
+  if (LooksLikeUriPath(dstDir)) {
+    wxMessageBox("Copy/Move to remote locations is not supported yet.", "Quarry",
+                 wxOK | wxICON_INFORMATION, this);
+    return;
+  }
+
+  // Validate sources are local filesystem paths.
+  for (const auto& p : sources) {
+    if (p.empty()) return;
+    if (LooksLikeUriPath(p)) {
+      wxMessageBox("Copy/Move from remote locations is not supported yet.", "Quarry",
+                   wxOK | wxICON_INFORMATION, this);
+      return;
+    }
+  }
+
+  std::error_code ec;
+  if (dstDir.empty() || !std::filesystem::exists(dstDir, ec) || !std::filesystem::is_directory(dstDir, ec)) {
+    wxMessageBox("Destination is not a local directory.", "Quarry", wxOK | wxICON_WARNING, this);
+    return;
+  }
+
+  const wxString dstDirWx = wxString::FromUTF8(dstDir.string());
   const wxString confirmMsg = wxString::Format("%s %zu item(s) to:\n\n%s\n\nExisting files may be overwritten.",
                                                title.c_str(),
                                                sources.size(),
@@ -424,74 +493,189 @@ void MainFrame::TransferDroppedPaths(FilePanel* target,
     return;
   }
 
-  wxProgressDialog progress(isMove ? "Moving" : "Copying",
+  AsyncFileOpState state;
+  {
+    std::error_code isDirEc;
+    for (const auto& p : sources) {
+      if (std::filesystem::is_directory(p, isDirEc) && !isDirEc) {
+        state.hasDir = true;
+        break;
+      }
+      isDirEc.clear();
+    }
+  }
+
+  std::thread worker([&state, sources, dstDir, move]() {
+    std::error_code workerEc;
+    for (const auto& src : sources) {
+      if (state.cancelRequested.load()) break;
+      if (src.empty()) {
+        state.done.fetch_add(1);
+        continue;
+      }
+
+      workerEc.clear();
+      if (!std::filesystem::exists(src, workerEc)) {
+        state.done.fetch_add(1);
+        continue;
+      }
+
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        state.currentLabel = src.filename().string();
+      }
+
+      auto dst = dstDir / src.filename();
+
+      // Conflict handling (delegated to UI thread).
+      bool skipItem = false;
+      for (;;) {
+        if (state.cancelRequested.load()) break;
+        std::error_code existsEc;
+        if (!std::filesystem::exists(dst, existsEc)) break;
+
+        std::unique_lock<std::mutex> lock(state.mu);
+        state.prompt = AsyncFileOpPrompt{.kind = AsyncFileOpPrompt::Kind::Exists, .dst = dst};
+        state.reply.reset();
+        state.cv.notify_all();
+        state.cv.wait(lock, [&state]() { return state.reply.has_value() || state.cancelRequested.load(); });
+        if (state.cancelRequested.load()) break;
+
+        const auto reply = *state.reply;
+        state.prompt.reset();
+        state.reply.reset();
+
+        if (reply.existsChoice == ExistsChoice::Skip) {
+          skipItem = true;
+          break;
+        }
+        if (reply.existsChoice == ExistsChoice::Cancel) {
+          state.cancelRequested.store(true);
+          break;
+        }
+        if (reply.existsChoice == ExistsChoice::Rename) {
+          if (!reply.renameTo) {
+            state.cancelRequested.store(true);
+            break;
+          }
+          dst = dstDir / *reply.renameTo;
+          continue;
+        }
+        break;  // Overwrite
+      }
+
+      if (state.cancelRequested.load()) break;
+      if (skipItem) {
+        state.done.fetch_add(1);
+        continue;
+      }
+
+      const auto result = move ? MovePath(src, dst) : CopyPathRecursive(src, dst);
+      if (!result.ok) {
+        std::unique_lock<std::mutex> lock(state.mu);
+        state.prompt = AsyncFileOpPrompt{.kind = AsyncFileOpPrompt::Kind::Error,
+                                         .dst = dst,
+                                         .errorMessage = result.message.ToStdString()};
+        state.reply.reset();
+        state.cv.notify_all();
+        state.cv.wait(lock, [&state]() { return state.reply.has_value() || state.cancelRequested.load(); });
+        if (state.cancelRequested.load()) break;
+
+        const auto reply = *state.reply;
+        state.prompt.reset();
+        state.reply.reset();
+        if (!reply.continueAfterError) {
+          state.cancelRequested.store(true);
+          break;
+        }
+      }
+
+      state.done.fetch_add(1);
+    }
+
+    std::lock_guard<std::mutex> lock(state.mu);
+    state.finished = true;
+    state.cv.notify_all();
+  });
+
+  wxProgressDialog progress(move ? "Moving" : "Copying",
                             "Preparing...",
                             static_cast<int>(sources.size()),
                             this,
                             wxPD_APP_MODAL | wxPD_CAN_ABORT | wxPD_AUTO_HIDE | wxPD_ELAPSED_TIME);
 
-  bool cancelAll = false;
-  bool hasDir = false;
-
-  for (size_t i = 0; i < sources.size(); i++) {
-    const auto& src = sources[i];
-    if (!std::filesystem::exists(src, ec)) continue;
-    if (!progress.Update(static_cast<int>(i), src.filename().string())) break;
-
-    if (!hasDir) {
-      ec.clear();
-      if (std::filesystem::is_directory(src, ec) && !ec) hasDir = true;
+  for (;;) {
+    // Handle any pending prompt from the worker.
+    std::optional<AsyncFileOpPrompt> prompt;
+    {
+      std::lock_guard<std::mutex> lock(state.mu);
+      prompt = state.prompt;
     }
 
-    auto dst = dstDir / src.filename();
-
-    // Conflict handling.
-    bool skipItem = false;
-    for (;;) {
-      std::error_code existsEc;
-      if (!std::filesystem::exists(dst, existsEc)) break;
-
-      const auto choice = PromptExists(this, dst);
-      if (choice == ExistsChoice::Skip) {
-        skipItem = true;
-        break;
-      }
-      if (choice == ExistsChoice::Cancel) {
-        cancelAll = true;
-        break;
-      }
-      if (choice == ExistsChoice::Rename) {
-        wxTextEntryDialog nameDlg(this, "New name:", "Rename", dst.filename().string());
-        if (nameDlg.ShowModal() != wxID_OK) {
-          cancelAll = true;
-          break;
+    if (prompt) {
+      AsyncFileOpReply reply;
+      if (prompt->kind == AsyncFileOpPrompt::Kind::Exists) {
+        const auto choice = PromptExists(this, prompt->dst);
+        reply.existsChoice = choice;
+        if (choice == ExistsChoice::Rename) {
+          wxTextEntryDialog nameDlg(this, "New name:", "Rename", prompt->dst.filename().string());
+          if (nameDlg.ShowModal() != wxID_OK) {
+            reply.existsChoice = ExistsChoice::Cancel;
+          } else {
+            reply.renameTo = nameDlg.GetValue().ToStdString();
+          }
         }
-        dst = dstDir / nameDlg.GetValue().ToStdString();
-        continue;
+      } else {
+        wxMessageDialog dlg(this,
+                            wxString::Format("%s failed:\n\n%s\n\nContinue?",
+                                             title.c_str(),
+                                             wxString::FromUTF8(prompt->errorMessage).c_str()),
+                            title,
+                            wxYES_NO | wxNO_DEFAULT | wxICON_ERROR);
+        dlg.SetYesNoLabels("Continue", "Cancel");
+        reply.continueAfterError = (dlg.ShowModal() == wxID_YES);
       }
-      break; // Overwrite
+
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        state.reply = reply;
+        state.cv.notify_all();
+      }
     }
 
-    if (cancelAll) break;
-    if (skipItem) continue;
-
-    const auto result = isMove ? MovePath(src, dst) : CopyPathRecursive(src, dst);
-    if (!result.ok) {
-      wxMessageDialog dlg(this,
-                          wxString::Format("%s failed:\n\n%s\n\nContinue?",
-                                           title.c_str(),
-                                           result.message.c_str()),
-                          title,
-                          wxYES_NO | wxNO_DEFAULT | wxICON_ERROR);
-      dlg.SetYesNoLabels("Continue", "Cancel");
-      if (dlg.ShowModal() != wxID_YES) break;
+    const auto done = state.done.load();
+    wxString label;
+    {
+      std::lock_guard<std::mutex> lock(state.mu);
+      label = wxString::FromUTF8(state.currentLabel);
     }
+
+    if (!progress.Update(static_cast<int>(std::min(done, sources.size())), label)) {
+      state.cancelRequested.store(true);
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        state.cv.notify_all();
+      }
+      break;
+    }
+
+    bool finished = false;
+    {
+      std::lock_guard<std::mutex> lock(state.mu);
+      finished = state.finished;
+    }
+    if (finished) break;
+
+    wxMilliSleep(30);
+    wxYieldIfNeeded();
   }
+
+  if (worker.joinable()) worker.join();
 
   // Refresh both panes; simplest/robust for now.
   if (top_) top_->RefreshAll();
   if (bottom_) bottom_->RefreshAll();
-  if (hasDir) {
+  if (state.hasDir) {
     if (top_) top_->RefreshTree();
     if (bottom_) bottom_->RefreshTree();
   }
@@ -556,75 +740,7 @@ void MainFrame::OnCopy(wxCommandEvent&) {
   if (sources.empty()) return;
 
   const auto dstDir = to->GetDirectoryPath();
-  bool hasDir = false;
-  for (const auto& p : sources) {
-    std::error_code ec;
-    if (std::filesystem::is_directory(p, ec) && !ec) {
-      hasDir = true;
-      break;
-    }
-  }
-  const auto confirmMsg = wxString::Format(
-      "Copy %zu item(s) to:\n\n%s\n\nExisting files may be overwritten.",
-      sources.size(), wxString::FromUTF8(dstDir.string()).c_str());
-  if (wxMessageBox(confirmMsg, "Copy", wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION, this) != wxYES) {
-    return;
-  }
-
-  wxProgressDialog progress("Copying",
-                            "Preparing...",
-                            static_cast<int>(sources.size()),
-                            this,
-                            wxPD_APP_MODAL | wxPD_CAN_ABORT | wxPD_AUTO_HIDE | wxPD_ELAPSED_TIME);
-
-  bool cancelAll = false;
-  for (size_t i = 0; i < sources.size(); i++) {
-    const auto& src = sources[i];
-    auto dst = dstDir / src.filename();
-
-    if (!progress.Update(static_cast<int>(i), src.filename().string())) break;
-
-    // Conflict handling.
-    bool skipItem = false;
-    for (;;) {
-      std::error_code existsEc;
-      if (!std::filesystem::exists(dst, existsEc)) break;
-
-      const auto choice = PromptExists(this, dst);
-      if (choice == ExistsChoice::Skip) {
-        skipItem = true;
-        break;
-      }
-      if (choice == ExistsChoice::Cancel) {
-        cancelAll = true;
-        break;
-      }
-      if (choice == ExistsChoice::Rename) {
-        wxTextEntryDialog nameDlg(this, "New name:", "Rename", dst.filename().string());
-        if (nameDlg.ShowModal() != wxID_OK) {
-          cancelAll = true;
-          break;
-        }
-        dst = dstDir / nameDlg.GetValue().ToStdString();
-        continue;
-      }
-      break; // Overwrite
-    }
-
-    if (cancelAll) break;
-    if (skipItem) continue;
-
-    const auto result = CopyPathRecursive(src, dst);
-    if (!result.ok) {
-      wxMessageDialog dlg(this,
-                          wxString::Format("Copy failed:\n\n%s\n\nContinue?", result.message.c_str()),
-                          "Copy failed",
-                          wxYES_NO | wxNO_DEFAULT | wxICON_ERROR);
-      dlg.SetYesNoLabels("Continue", "Cancel");
-      if (dlg.ShowModal() != wxID_YES) break;
-    }
-  }
-  RefreshPanelsShowing(dstDir, /*treeChanged=*/hasDir);
+  CopyMoveWithProgress("Copy", sources, dstDir, /*move=*/false);
 }
 
 void MainFrame::OnMove(wxCommandEvent&) {
@@ -634,78 +750,8 @@ void MainFrame::OnMove(wxCommandEvent&) {
   const auto sources = from->GetSelectedPaths();
   if (sources.empty()) return;
 
-  const auto srcDir = from->GetDirectoryPath();
   const auto dstDir = to->GetDirectoryPath();
-  bool hasDir = false;
-  for (const auto& p : sources) {
-    std::error_code ec;
-    if (std::filesystem::is_directory(p, ec) && !ec) {
-      hasDir = true;
-      break;
-    }
-  }
-  const auto confirmMsg = wxString::Format(
-      "Move %zu item(s) to:\n\n%s\n\nExisting files may be overwritten.",
-      sources.size(), wxString::FromUTF8(dstDir.string()).c_str());
-  if (wxMessageBox(confirmMsg, "Move", wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION, this) != wxYES) {
-    return;
-  }
-
-  wxProgressDialog progress("Moving",
-                            "Preparing...",
-                            static_cast<int>(sources.size()),
-                            this,
-                            wxPD_APP_MODAL | wxPD_CAN_ABORT | wxPD_AUTO_HIDE | wxPD_ELAPSED_TIME);
-
-  bool cancelAll = false;
-  for (size_t i = 0; i < sources.size(); i++) {
-    const auto& src = sources[i];
-    auto dst = dstDir / src.filename();
-
-    if (!progress.Update(static_cast<int>(i), src.filename().string())) break;
-
-    // Conflict handling.
-    bool skipItem = false;
-    for (;;) {
-      std::error_code existsEc;
-      if (!std::filesystem::exists(dst, existsEc)) break;
-
-      const auto choice = PromptExists(this, dst);
-      if (choice == ExistsChoice::Skip) {
-        skipItem = true;
-        break;
-      }
-      if (choice == ExistsChoice::Cancel) {
-        cancelAll = true;
-        break;
-      }
-      if (choice == ExistsChoice::Rename) {
-        wxTextEntryDialog nameDlg(this, "New name:", "Rename", dst.filename().string());
-        if (nameDlg.ShowModal() != wxID_OK) {
-          cancelAll = true;
-          break;
-        }
-        dst = dstDir / nameDlg.GetValue().ToStdString();
-        continue;
-      }
-      break; // Overwrite
-    }
-
-    if (cancelAll) break;
-    if (skipItem) continue;
-
-    const auto result = MovePath(src, dst);
-    if (!result.ok) {
-      wxMessageDialog dlg(this,
-                          wxString::Format("Move failed:\n\n%s\n\nContinue?", result.message.c_str()),
-                          "Move failed",
-                          wxYES_NO | wxNO_DEFAULT | wxICON_ERROR);
-      dlg.SetYesNoLabels("Continue", "Cancel");
-      if (dlg.ShowModal() != wxID_YES) break;
-    }
-  }
-  RefreshPanelsShowing(srcDir, /*treeChanged=*/hasDir);
-  RefreshPanelsShowing(dstDir, /*treeChanged=*/hasDir);
+  CopyMoveWithProgress("Move", sources, dstDir, /*move=*/true);
 }
 
 void MainFrame::OnDelete(wxCommandEvent&) {
