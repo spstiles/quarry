@@ -55,6 +55,13 @@ public:
   void TrashSelection();
   void DeleteSelectionPermanent();
 
+  // Seeds credentials for a location for this application instance.
+  // This avoids extra auth prompts and can optionally persist via the OS keyring when supported.
+  void SeedMountCredentials(const std::string& uri,
+                            const std::string& username,
+                            const std::string& password,
+                            bool rememberForever);
+
   void BindFocusEvents(std::function<void()> onFocus);
   void BindDirContentsChanged(
       std::function<void(const std::filesystem::path& dir, bool treeChanged)> onChanged);

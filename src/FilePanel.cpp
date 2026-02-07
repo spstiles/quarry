@@ -1054,6 +1054,31 @@ std::vector<FilePanel::Entry> ListDir(const fs::path& dir, std::string* errorMes
 }
 } // namespace
 
+void FilePanel::SeedMountCredentials(const std::string& uri,
+                                     const std::string& username,
+                                     const std::string& password,
+                                     bool rememberForever) {
+#ifdef QUARRY_USE_GIO
+  const auto cacheKey = CredsCacheKeyForUri(uri);
+  if (cacheKey.empty()) return;
+
+  MountCreds creds;
+  creds.anonymous = false;
+  creds.username = username;
+  creds.password = password;
+  creds.domain.clear();
+  creds.rememberMode =
+      rememberForever ? MountCreds::RememberMode::Forever : MountCreds::RememberMode::Session;
+
+  g_sessionMountCreds[cacheKey] = std::move(creds);
+#else
+  (void)uri;
+  (void)username;
+  (void)password;
+  (void)rememberForever;
+#endif
+}
+
 FilePanel::FilePanel(wxWindow* parent) : wxPanel(parent, wxID_ANY) { BuildLayout(); }
 
 void FilePanel::BuildLayout() {

@@ -14,6 +14,11 @@
 #include <wx/splitter.h>
 #include <wx/textdlg.h>
 #include <wx/textctrl.h>
+#include <wx/choice.h>
+#include <wx/checkbox.h>
+#include <wx/spinctrl.h>
+#include <wx/statbox.h>
+#include <wx/stattext.h>
 
 namespace {
 enum MenuId : int {
@@ -47,6 +52,163 @@ ExistsChoice PromptExists(wxWindow* parent, const std::filesystem::path& dst) {
     case 2: return ExistsChoice::Rename;
     default: return ExistsChoice::Cancel;
   }
+}
+
+std::string PercentEncode(std::string s) {
+  auto isUnreserved = [](unsigned char c) -> bool {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+           c == '-' || c == '.' || c == '_' || c == '~';
+  };
+  std::string out;
+  out.reserve(s.size());
+  const char* hex = "0123456789ABCDEF";
+  for (unsigned char c : s) {
+    if (isUnreserved(c) || c == '/' ) {
+      out.push_back(static_cast<char>(c));
+    } else {
+      out.push_back('%');
+      out.push_back(hex[(c >> 4) & 0xF]);
+      out.push_back(hex[c & 0xF]);
+    }
+  }
+  return out;
+}
+
+enum class ServerType { SMB, SFTP, FTP, WebDAV, WebDAVS, AFP };
+
+struct ConnectParams {
+  ServerType type{ServerType::SMB};
+  std::string server;
+  int port{0};
+  std::string folder;
+  std::string username;
+  std::string password;
+  bool rememberPassword{false};
+};
+
+std::string BuildConnectUri(const ConnectParams& p) {
+  auto schemeForType = [](ServerType t) -> std::string {
+    switch (t) {
+      case ServerType::SMB: return "smb";
+      case ServerType::SFTP: return "sftp";
+      case ServerType::FTP: return "ftp";
+      case ServerType::WebDAV: return "dav";
+      case ServerType::WebDAVS: return "davs";
+      case ServerType::AFP: return "afp";
+      default: return "smb";
+    }
+  };
+
+  const auto scheme = schemeForType(p.type);
+  std::string uri = scheme + "://";
+  uri += p.server;
+
+  const bool portAllowed = (scheme == "sftp" || scheme == "ftp" || scheme == "dav" || scheme == "davs");
+  if (portAllowed && p.port > 0) {
+    uri += ":" + std::to_string(p.port);
+  }
+
+  std::string path = p.folder;
+  if (path.empty()) {
+    path = (scheme == "smb" || scheme == "afp") ? "" : "/";
+  }
+  if (!path.empty() && path.front() != '/') path.insert(path.begin(), '/');
+  uri += PercentEncode(path);
+  return uri;
+}
+
+std::optional<ConnectParams> ShowConnectDialog(wxWindow* parent) {
+  wxDialog dlg(parent, wxID_ANY, "Connect to Server", wxDefaultPosition, wxDefaultSize,
+               wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER);
+
+  auto* root = new wxBoxSizer(wxVERTICAL);
+  dlg.SetSizer(root);
+
+  // Server details
+  auto* serverBox = new wxStaticBoxSizer(wxVERTICAL, &dlg, "Server Details");
+  root->Add(serverBox, 0, wxALL | wxEXPAND, 10);
+
+  auto* grid = new wxFlexGridSizer(2, 8, 8);
+  grid->AddGrowableCol(1, 1);
+  serverBox->Add(grid, 0, wxEXPAND | wxALL, 10);
+
+  auto* serverCtrl = new wxTextCtrl(&dlg, wxID_ANY, "");
+  auto* portCtrl = new wxSpinCtrl(&dlg, wxID_ANY);
+  portCtrl->SetRange(0, 65535);
+  portCtrl->SetValue(0);
+
+  wxArrayString types;
+  types.Add("SMB (Windows Share)");
+  types.Add("SFTP");
+  types.Add("FTP");
+  types.Add("WebDAV");
+  types.Add("WebDAV (HTTPS)");
+  types.Add("AFP");
+  auto* typeCtrl = new wxChoice(&dlg, wxID_ANY, wxDefaultPosition, wxDefaultSize, types);
+  typeCtrl->SetSelection(0);
+
+  auto* folderCtrl = new wxTextCtrl(&dlg, wxID_ANY, "");
+
+  grid->Add(new wxStaticText(&dlg, wxID_ANY, "Server:"), 0, wxALIGN_CENTER_VERTICAL);
+  grid->Add(serverCtrl, 1, wxEXPAND);
+  grid->Add(new wxStaticText(&dlg, wxID_ANY, "Port:"), 0, wxALIGN_CENTER_VERTICAL);
+  grid->Add(portCtrl, 1, wxEXPAND);
+  grid->Add(new wxStaticText(&dlg, wxID_ANY, "Type:"), 0, wxALIGN_CENTER_VERTICAL);
+  grid->Add(typeCtrl, 1, wxEXPAND);
+  grid->Add(new wxStaticText(&dlg, wxID_ANY, "Folder:"), 0, wxALIGN_CENTER_VERTICAL);
+  grid->Add(folderCtrl, 1, wxEXPAND);
+
+  // User details
+  auto* userBox = new wxStaticBoxSizer(wxVERTICAL, &dlg, "User Details");
+  root->Add(userBox, 0, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 10);
+
+  auto* ugrid = new wxFlexGridSizer(2, 8, 8);
+  ugrid->AddGrowableCol(1, 1);
+  userBox->Add(ugrid, 0, wxEXPAND | wxALL, 10);
+
+  auto* userCtrl = new wxTextCtrl(&dlg, wxID_ANY, "");
+  auto* passCtrl = new wxTextCtrl(&dlg, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, wxTE_PASSWORD);
+  auto* rememberCtrl = new wxCheckBox(&dlg, wxID_ANY, "Remember this password");
+  rememberCtrl->SetValue(false);
+
+  ugrid->Add(new wxStaticText(&dlg, wxID_ANY, "User name:"), 0, wxALIGN_CENTER_VERTICAL);
+  ugrid->Add(userCtrl, 1, wxEXPAND);
+  ugrid->Add(new wxStaticText(&dlg, wxID_ANY, "Password:"), 0, wxALIGN_CENTER_VERTICAL);
+  ugrid->Add(passCtrl, 1, wxEXPAND);
+
+  userBox->Add(rememberCtrl, 0, wxLEFT | wxRIGHT | wxBOTTOM, 10);
+
+  // Buttons
+  auto* btnSizer = dlg.CreateButtonSizer(wxOK | wxCANCEL);
+  root->Add(btnSizer, 0, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 10);
+
+  dlg.Fit();
+  dlg.Layout();
+  dlg.CentreOnParent();
+
+  if (dlg.ShowModal() != wxID_OK) return std::nullopt;
+
+  ConnectParams out;
+  out.server = serverCtrl->GetValue().ToStdString();
+  out.port = portCtrl->GetValue();
+  out.folder = folderCtrl->GetValue().ToStdString();
+  out.username = userCtrl->GetValue().ToStdString();
+  out.password = passCtrl->GetValue().ToStdString();
+  out.rememberPassword = rememberCtrl->GetValue();
+
+  switch (typeCtrl->GetSelection()) {
+    case 0: out.type = ServerType::SMB; break;
+    case 1: out.type = ServerType::SFTP; break;
+    case 2: out.type = ServerType::FTP; break;
+    case 3: out.type = ServerType::WebDAV; break;
+    case 4: out.type = ServerType::WebDAVS; break;
+    case 5: out.type = ServerType::AFP; break;
+    default: out.type = ServerType::SMB; break;
+  }
+
+  // Basic validation.
+  if (out.server.empty()) return std::nullopt;
+  return out;
 }
 } // namespace
 
@@ -228,16 +390,18 @@ void MainFrame::OnRefresh(wxCommandEvent&) {
 }
 
 void MainFrame::OnConnectToServer(wxCommandEvent&) {
-  static std::string last = "smb://";
+  const auto params = ShowConnectDialog(this);
+  if (!params) return;
 
-  wxTextEntryDialog dlg(this,
-                        "Enter a server URI (examples: smb://server/share, sftp://host/path):",
-                        "Connect to Server",
-                        last);
-  if (dlg.ShowModal() != wxID_OK) return;
-  const auto uri = dlg.GetValue().ToStdString();
-  if (uri.empty()) return;
-  last = uri;
+  const auto uri = BuildConnectUri(*params);
+
+  // Seed creds for this instance so mount/list can proceed without extra prompts.
+  if (!params->username.empty() || !params->password.empty()) {
+    GetActivePanel()->SeedMountCredentials(uri,
+                                          params->username,
+                                          params->password,
+                                          /*rememberForever=*/params->rememberPassword);
+  }
 
   GetActivePanel()->SetDirectory(uri);
   GetActivePanel()->FocusPrimary();
