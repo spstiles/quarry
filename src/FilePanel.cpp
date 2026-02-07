@@ -1668,6 +1668,8 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
         if ((UriScheme(effectiveUri) == "smb" || UriScheme(effectiveUri) == "afp") && AddRecentHost(effectiveUri) &&
             networkRoot_.IsOk()) {
           PopulateNetwork(networkRoot_);
+          // Now that the host exists in the sidebar, sync selection to it (instead of the group header).
+          SyncTreeToCurrentDir();
         }
 
         if (UriScheme(effectiveUri) == "network") {
