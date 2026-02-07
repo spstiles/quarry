@@ -4,6 +4,8 @@
 
 #include <wx/frame.h>
 
+#include <memory>
+
 class wxSplitterWindow;
 
 class MainFrame final : public wxFrame {
@@ -41,6 +43,9 @@ private:
 
   void SetActivePane(ActivePane pane);
   void RefreshPanelsShowing(const std::filesystem::path& dir, bool treeChanged);
+
+  struct FileOpSession;
+  std::unique_ptr<FileOpSession> fileOp_{};
 
   wxSplitterWindow* splitter_{nullptr};
   FilePanel* top_{nullptr};

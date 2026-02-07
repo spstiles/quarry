@@ -9,6 +9,8 @@
 #include <optional>
 #include <thread>
 #include <limits>
+#include <chrono>
+#include <memory>
 
 #include <wx/accel.h>
 #include <wx/choicdlg.h>
@@ -25,6 +27,9 @@
 #include <wx/spinctrl.h>
 #include <wx/statbox.h>
 #include <wx/stattext.h>
+#include <wx/timer.h>
+#include <wx/gauge.h>
+#include <wx/button.h>
 
 namespace {
 enum MenuId : int {
@@ -60,6 +65,8 @@ ExistsChoice PromptExists(wxWindow* parent, const std::filesystem::path& dst) {
   }
 }
 
+}  // namespace
+
 struct AsyncFileOpPrompt {
   enum class Kind { Exists, Error };
   Kind kind{Kind::Exists};
@@ -94,14 +101,14 @@ struct AsyncFileOpState {
   std::optional<AsyncFileOpReply> reply{};
 };
 
-bool LooksLikeUriPath(const std::filesystem::path& p) {
+static bool LooksLikeUriPath(const std::filesystem::path& p) {
   const auto s = p.string();
   return s.find("://") != std::string::npos;
 }
 
-std::uintmax_t EstimateTotalBytes(const std::vector<std::filesystem::path>& sources,
-                                 const CancelFn& shouldCancel,
-                                 const CopyProgressFn& onProgress) {
+static std::uintmax_t EstimateTotalBytes(const std::vector<std::filesystem::path>& sources,
+                                         const CancelFn& shouldCancel,
+                                         const CopyProgressFn& onProgress) {
   namespace fs = std::filesystem;
   std::uintmax_t total = 0;
   std::error_code ec;
@@ -144,6 +151,38 @@ std::uintmax_t EstimateTotalBytes(const std::vector<std::filesystem::path>& sour
 
   return total;
 }
+
+static wxString FormatHMS(std::chrono::seconds s) {
+  const auto total = s.count();
+  if (total < 0) return "--:--";
+  const auto h = total / 3600;
+  const auto m = (total % 3600) / 60;
+  const auto sec = total % 60;
+  if (h > 99) return "99:59:59";
+  return wxString::Format("%02lld:%02lld:%02lld", (long long)h, (long long)m, (long long)sec);
+}
+
+struct MainFrame::FileOpSession final {
+  wxDialog* dlg{nullptr};
+  wxStaticText* titleText{nullptr};
+  wxStaticText* detailText{nullptr};
+  wxGauge* gauge{nullptr};
+  wxButton* cancelBtn{nullptr};
+  wxTimer timer;
+
+  std::shared_ptr<AsyncFileOpState> state;
+  std::thread worker;
+
+  std::chrono::steady_clock::time_point start{std::chrono::steady_clock::now()};
+  std::uintmax_t bytesUnit{1};
+  int range{100};
+  bool configured{false};
+  bool promptActive{false};
+
+  explicit FileOpSession(wxEvtHandler* owner) : timer(owner) {}
+};
+
+namespace {
 
 std::string PercentEncode(std::string s) {
   auto isUnreserved = [](unsigned char c) -> bool {
@@ -512,6 +551,14 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
                                      bool move) {
   if (sources.empty()) return;
 
+  if (fileOp_) {
+    wxMessageBox("An operation is already running. Please wait for it to finish or cancel it.",
+                 "Quarry",
+                 wxOK | wxICON_INFORMATION,
+                 this);
+    return;
+  }
+
   if (LooksLikeUriPath(dstDir)) {
     wxMessageBox("Copy/Move to remote locations is not supported yet.", "Quarry",
                  wxOK | wxICON_INFORMATION, this);
@@ -543,54 +590,92 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
     return;
   }
 
-  AsyncFileOpState state;
+  fileOp_ = std::make_unique<FileOpSession>(this);
+  fileOp_->state = std::make_shared<AsyncFileOpState>();
+
   {
     std::error_code isDirEc;
     for (const auto& p : sources) {
       if (std::filesystem::is_directory(p, isDirEc) && !isDirEc) {
-        state.hasDir = true;
+        fileOp_->state->hasDir = true;
         break;
       }
       isDirEc.clear();
     }
   }
 
-  std::thread worker([&state, sources, dstDir, move]() {
-    std::error_code workerEc;
+  // Modeless dialog.
+  fileOp_->dlg = new wxDialog(this, wxID_ANY, title, wxDefaultPosition, wxSize(600, 180),
+                              wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER);
+  auto* root = new wxBoxSizer(wxVERTICAL);
+  fileOp_->dlg->SetSizer(root);
 
-    const CancelFn shouldCancel = [&state]() { return state.cancelRequested.load(); };
-    const CopyProgressFn scanProgress = [&state](const std::filesystem::path& current) {
+  fileOp_->titleText = new wxStaticText(fileOp_->dlg, wxID_ANY, move ? "Moving..." : "Copying...");
+  fileOp_->detailText = new wxStaticText(fileOp_->dlg, wxID_ANY, "Preparing...");
+  fileOp_->gauge = new wxGauge(fileOp_->dlg, wxID_ANY, fileOp_->range);
+  fileOp_->cancelBtn = new wxButton(fileOp_->dlg, wxID_CANCEL, "Cancel");
+
+  root->Add(fileOp_->titleText, 0, wxEXPAND | wxALL, 10);
+  root->Add(fileOp_->detailText, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+  root->Add(fileOp_->gauge, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+  auto* btns = new wxBoxSizer(wxHORIZONTAL);
+  btns->AddStretchSpacer(1);
+  btns->Add(fileOp_->cancelBtn, 0);
+  root->Add(btns, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+  fileOp_->dlg->Layout();
+  fileOp_->dlg->Show();
+
+  fileOp_->cancelBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+    if (!fileOp_ || !fileOp_->state) return;
+    fileOp_->state->cancelRequested.store(true);
+    fileOp_->cancelBtn->Disable();
+    std::lock_guard<std::mutex> lock(fileOp_->state->mu);
+    fileOp_->state->cv.notify_all();
+  });
+
+  // Closing the modeless dialog just hides it; the operation continues.
+  fileOp_->dlg->Bind(wxEVT_CLOSE_WINDOW, [this](wxCloseEvent& e) {
+    if (fileOp_ && fileOp_->dlg) fileOp_->dlg->Hide();
+    e.Veto();
+  });
+
+  const auto state = fileOp_->state;
+  fileOp_->worker = std::thread([state, sources, dstDir, move]() {
+    std::error_code workerEc;
+    const CancelFn shouldCancel = [state]() { return state->cancelRequested.load(); };
+
+    const CopyProgressFn scanProgress = [state](const std::filesystem::path& current) {
       std::string label = current.filename().string();
       if (label.empty()) label = current.string();
-      std::lock_guard<std::mutex> lock(state.mu);
-      state.currentLabel = "Scanning: " + label;
+      std::lock_guard<std::mutex> lock(state->mu);
+      state->currentLabel = "Scanning: " + label;
     };
 
     const auto total = EstimateTotalBytes(sources, shouldCancel, scanProgress);
     {
-      std::lock_guard<std::mutex> lock(state.mu);
-      state.totalBytes = total;
-      state.scanDone = true;
-      if (state.currentLabel.rfind("Scanning:", 0) == 0) state.currentLabel = "Preparing...";
+      std::lock_guard<std::mutex> lock(state->mu);
+      state->totalBytes = total;
+      state->scanDone = true;
+      if (state->currentLabel.rfind("Scanning:", 0) == 0) state->currentLabel = "Preparing...";
     }
-    state.cv.notify_all();
+    state->cv.notify_all();
 
     for (const auto& src : sources) {
-      if (state.cancelRequested.load()) break;
+      if (state->cancelRequested.load()) break;
       if (src.empty()) {
-        state.done.fetch_add(1);
+        state->done.fetch_add(1);
         continue;
       }
 
       workerEc.clear();
       if (!std::filesystem::exists(src, workerEc)) {
-        state.done.fetch_add(1);
+        state->done.fetch_add(1);
         continue;
       }
 
       {
-        std::lock_guard<std::mutex> lock(state.mu);
-        state.currentLabel = src.filename().string();
+        std::lock_guard<std::mutex> lock(state->mu);
+        state->currentLabel = src.filename().string();
       }
 
       auto dst = dstDir / src.filename();
@@ -598,32 +683,32 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
       // Conflict handling (delegated to UI thread).
       bool skipItem = false;
       for (;;) {
-        if (state.cancelRequested.load()) break;
+        if (state->cancelRequested.load()) break;
         std::error_code existsEc;
         if (!std::filesystem::exists(dst, existsEc)) break;
 
-        std::unique_lock<std::mutex> lock(state.mu);
-        state.prompt = AsyncFileOpPrompt{.kind = AsyncFileOpPrompt::Kind::Exists, .dst = dst};
-        state.reply.reset();
-        state.cv.notify_all();
-        state.cv.wait(lock, [&state]() { return state.reply.has_value() || state.cancelRequested.load(); });
-        if (state.cancelRequested.load()) break;
+        std::unique_lock<std::mutex> lock(state->mu);
+        state->prompt = AsyncFileOpPrompt{.kind = AsyncFileOpPrompt::Kind::Exists, .dst = dst};
+        state->reply.reset();
+        state->cv.notify_all();
+        state->cv.wait(lock, [state]() { return state->reply.has_value() || state->cancelRequested.load(); });
+        if (state->cancelRequested.load()) break;
 
-        const auto reply = *state.reply;
-        state.prompt.reset();
-        state.reply.reset();
+        const auto reply = *state->reply;
+        state->prompt.reset();
+        state->reply.reset();
 
         if (reply.existsChoice == ExistsChoice::Skip) {
           skipItem = true;
           break;
         }
         if (reply.existsChoice == ExistsChoice::Cancel) {
-          state.cancelRequested.store(true);
+          state->cancelRequested.store(true);
           break;
         }
         if (reply.existsChoice == ExistsChoice::Rename) {
           if (!reply.renameTo) {
-            state.cancelRequested.store(true);
+            state->cancelRequested.store(true);
             break;
           }
           dst = dstDir / *reply.renameTo;
@@ -632,76 +717,68 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
         break;  // Overwrite
       }
 
-      if (state.cancelRequested.load()) break;
+      if (state->cancelRequested.load()) break;
       if (skipItem) {
-        state.done.fetch_add(1);
+        state->done.fetch_add(1);
         continue;
       }
 
-      const CopyProgressFn onProgress = [&state, src](const std::filesystem::path& current) {
+      const CopyProgressFn onProgress = [state, src](const std::filesystem::path& current) {
         const auto rel = current.lexically_relative(src);
         std::string label;
         if (!rel.empty() && rel != current) label = rel.string();
         if (label.empty()) label = current.filename().string();
         if (label.empty()) label = current.string();
-        std::lock_guard<std::mutex> lock(state.mu);
-        state.currentLabel = std::move(label);
+        std::lock_guard<std::mutex> lock(state->mu);
+        state->currentLabel = std::move(label);
       };
 
-      const CopyBytesProgressFn onBytes = [&state](std::uintmax_t bytesDelta) {
-        state.bytesDone.fetch_add(bytesDelta);
+      const CopyBytesProgressFn onBytes = [state](std::uintmax_t bytesDelta) {
+        state->bytesDone.fetch_add(bytesDelta);
       };
 
       const auto result = move ? MovePath(src, dst, shouldCancel, onProgress, onBytes)
                                : CopyPathRecursive(src, dst, shouldCancel, onProgress, onBytes);
-      if (state.cancelRequested.load() && !result.ok && result.message == "Canceled") break;
+      if (state->cancelRequested.load() && !result.ok && result.message == "Canceled") break;
       if (!result.ok) {
-        std::unique_lock<std::mutex> lock(state.mu);
-        state.prompt = AsyncFileOpPrompt{.kind = AsyncFileOpPrompt::Kind::Error,
-                                         .dst = dst,
-                                         .errorMessage = result.message.ToStdString()};
-        state.reply.reset();
-        state.cv.notify_all();
-        state.cv.wait(lock, [&state]() { return state.reply.has_value() || state.cancelRequested.load(); });
-        if (state.cancelRequested.load()) break;
+        std::unique_lock<std::mutex> lock(state->mu);
+        state->prompt = AsyncFileOpPrompt{.kind = AsyncFileOpPrompt::Kind::Error,
+                                          .dst = dst,
+                                          .errorMessage = result.message.ToStdString()};
+        state->reply.reset();
+        state->cv.notify_all();
+        state->cv.wait(lock, [state]() { return state->reply.has_value() || state->cancelRequested.load(); });
+        if (state->cancelRequested.load()) break;
 
-        const auto reply = *state.reply;
-        state.prompt.reset();
-        state.reply.reset();
+        const auto reply = *state->reply;
+        state->prompt.reset();
+        state->reply.reset();
         if (!reply.continueAfterError) {
-          state.cancelRequested.store(true);
+          state->cancelRequested.store(true);
           break;
         }
       }
 
-      state.done.fetch_add(1);
+      state->done.fetch_add(1);
     }
 
-    std::lock_guard<std::mutex> lock(state.mu);
-    state.finished = true;
-    state.cv.notify_all();
+    std::lock_guard<std::mutex> lock(state->mu);
+    state->finished = true;
+    state->cv.notify_all();
   });
 
-  wxProgressDialog progress(move ? "Moving" : "Copying",
-                            "Preparing...",
-                            100,
-                            this,
-                            wxPD_APP_MODAL | wxPD_CAN_ABORT | wxPD_AUTO_HIDE | wxPD_ELAPSED_TIME |
-                                wxPD_ESTIMATED_TIME | wxPD_REMAINING_TIME);
+  fileOp_->timer.Bind(wxEVT_TIMER, [this, title, sources](wxTimerEvent&) {
+    if (!fileOp_ || !fileOp_->state) return;
+    const auto state = fileOp_->state;
 
-  int lastValue = -1;
-  bool progressConfigured = false;
-  int progressRange = 100;
-  std::uintmax_t bytesUnit = 1;
-  for (;;) {
     // Handle any pending prompt from the worker.
     std::optional<AsyncFileOpPrompt> prompt;
     {
-      std::lock_guard<std::mutex> lock(state.mu);
-      prompt = state.prompt;
+      std::lock_guard<std::mutex> lock(state->mu);
+      prompt = state->prompt;
     }
-
-    if (prompt) {
+    if (prompt && !fileOp_->promptActive) {
+      fileOp_->promptActive = true;
       AsyncFileOpReply reply;
       if (prompt->kind == AsyncFileOpPrompt::Kind::Exists) {
         const auto choice = PromptExists(this, prompt->dst);
@@ -726,80 +803,92 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
       }
 
       {
-        std::lock_guard<std::mutex> lock(state.mu);
-        state.reply = reply;
-        state.cv.notify_all();
+        std::lock_guard<std::mutex> lock(state->mu);
+        state->reply = reply;
+        state->cv.notify_all();
       }
+      fileOp_->promptActive = false;
     }
 
-    const auto done = state.done.load();
-    const auto bytesDone = state.bytesDone.load();
+    const auto bytesDone = state->bytesDone.load();
+    const auto done = state->done.load();
+
     wxString label;
     bool scanDone = false;
     std::uintmax_t totalBytes = 0;
+    bool finished = false;
+    bool canceling = state->cancelRequested.load();
     {
-      std::lock_guard<std::mutex> lock(state.mu);
-      label = wxString::FromUTF8(state.currentLabel);
-      scanDone = state.scanDone;
-      totalBytes = state.totalBytes;
+      std::lock_guard<std::mutex> lock(state->mu);
+      label = wxString::FromUTF8(state->currentLabel);
+      scanDone = state->scanDone;
+      totalBytes = state->totalBytes;
+      finished = state->finished;
     }
 
-    if (!progressConfigured && scanDone) {
+    if (!fileOp_->configured && scanDone) {
       if (totalBytes > 0) {
         const std::uintmax_t maxInt = static_cast<std::uintmax_t>(std::numeric_limits<int>::max() - 1);
-        bytesUnit = std::max<std::uintmax_t>(1, (totalBytes / maxInt) + 1);
-        progressRange = static_cast<int>(std::max<std::uintmax_t>(1, totalBytes / bytesUnit));
-        progress.SetRange(progressRange);
+        fileOp_->bytesUnit = std::max<std::uintmax_t>(1, (totalBytes / maxInt) + 1);
+        fileOp_->range = static_cast<int>(std::max<std::uintmax_t>(1, totalBytes / fileOp_->bytesUnit));
       } else {
-        progressRange = static_cast<int>(std::max<size_t>(1, sources.size()));
-        progress.SetRange(progressRange);
+        fileOp_->range = static_cast<int>(std::max<size_t>(1, sources.size()));
       }
-      progressConfigured = true;
-      lastValue = -1;
+      fileOp_->gauge->SetRange(fileOp_->range);
+      fileOp_->start = std::chrono::steady_clock::now();
+      fileOp_->configured = true;
     }
 
-    bool keepGoing = true;
-    if (!progressConfigured) {
-      keepGoing = progress.Pulse(label.empty() ? "Scanning..." : label);
+    if (!fileOp_->configured) {
+      fileOp_->gauge->Pulse();
     } else if (totalBytes > 0) {
-      const int value = static_cast<int>(std::min<std::uintmax_t>(progressRange, bytesDone / bytesUnit));
-      keepGoing = (value != lastValue) ? progress.Update(value, label) : progress.Pulse(label);
-      lastValue = value;
+      const int v = static_cast<int>(std::min<std::uintmax_t>(fileOp_->range, bytesDone / fileOp_->bytesUnit));
+      fileOp_->gauge->SetValue(v);
     } else {
-      const int value = static_cast<int>(std::min(done, sources.size()));
-      keepGoing = (value != lastValue) ? progress.Update(value, label) : progress.Pulse(label);
-      lastValue = value;
+      const int v = static_cast<int>(std::min(done, sources.size()));
+      fileOp_->gauge->SetValue(v);
     }
 
-    if (!keepGoing) {
-      state.cancelRequested.store(true);
-      {
-        std::lock_guard<std::mutex> lock(state.mu);
-        state.cv.notify_all();
+    wxString remaining = "Remaining: --:--:--";
+    if (fileOp_->configured && totalBytes > 0 && bytesDone > 0) {
+      const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+          std::chrono::steady_clock::now() - fileOp_->start);
+      const auto elapsedSec = std::max<long long>(1, elapsed.count());
+      const double rate = static_cast<double>(bytesDone) / static_cast<double>(elapsedSec);
+      if (rate > 1.0) {
+        const auto left = static_cast<double>(totalBytes > bytesDone ? (totalBytes - bytesDone) : 0);
+        const auto remSec = static_cast<long long>(left / rate);
+        remaining = "Remaining: " + FormatHMS(std::chrono::seconds(remSec));
       }
-      break;
     }
 
-    bool finished = false;
-    {
-      std::lock_guard<std::mutex> lock(state.mu);
-      finished = state.finished;
+    if (canceling) {
+      fileOp_->titleText->SetLabel("Canceling...");
     }
-    if (finished) break;
+    if (!label.empty()) fileOp_->detailText->SetLabel(label + "\n" + remaining);
+    else fileOp_->detailText->SetLabel(remaining);
 
-    wxMilliSleep(30);
-    wxYieldIfNeeded();
-  }
+    if (fileOp_->dlg) {
+      fileOp_->dlg->Layout();
+    }
 
-  if (worker.joinable()) worker.join();
+    if (finished) {
+      fileOp_->timer.Stop();
+      if (fileOp_->worker.joinable()) fileOp_->worker.join();
 
-  // Refresh both panes; simplest/robust for now.
-  if (top_) top_->RefreshAll();
-  if (bottom_) bottom_->RefreshAll();
-  if (state.hasDir) {
-    if (top_) top_->RefreshTree();
-    if (bottom_) bottom_->RefreshTree();
-  }
+      if (top_) top_->RefreshAll();
+      if (bottom_) bottom_->RefreshAll();
+      if (state->hasDir) {
+        if (top_) top_->RefreshTree();
+        if (bottom_) bottom_->RefreshTree();
+      }
+
+      if (fileOp_->dlg) fileOp_->dlg->Destroy();
+      fileOp_.reset();
+    }
+  });
+
+  fileOp_->timer.Start(100);
 }
 
 void MainFrame::SetActivePane(ActivePane pane) {
