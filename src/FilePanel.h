@@ -60,7 +60,7 @@ public:
       std::function<void(const std::filesystem::path& dir, bool treeChanged)> onChanged);
 
 private:
-  enum class ListingMode { Directory, Recent };
+  enum class ListingMode { Directory, Recent, Gio };
   enum class SortColumn { Name, Type, Size, Modified };
 
   void BuildLayout();
@@ -92,6 +92,7 @@ private:
   void BuildComputerTree();
   void PopulateDirChildren(const wxTreeItemId& parent, const std::filesystem::path& dir);
   void PopulateDevices(const wxTreeItemId& devicesItem);
+  void PopulateNetwork(const wxTreeItemId& networkItem);
   wxTreeItemId EnsurePathSelected(const wxTreeItemId& baseItem,
                                  const std::filesystem::path& basePath,
                                  const std::filesystem::path& targetDir);
@@ -133,10 +134,12 @@ private:
   long long renameArmedAtMs_{0};
   bool allowInlineEdit_{false};
 
+  wxTreeItemId hiddenRoot_{};
   wxTreeItemId computerRoot_{};
   wxTreeItemId homeRoot_{};
   wxTreeItemId fsRoot_{};
   wxTreeItemId devicesRoot_{};
+  wxTreeItemId networkRoot_{};
   wxTreeItemId desktopRoot_{};
   wxTreeItemId documentsRoot_{};
   wxTreeItemId downloadsRoot_{};
