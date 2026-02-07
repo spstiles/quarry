@@ -30,6 +30,10 @@ private:
   void OnRename(wxCommandEvent& event);
   void OnMkDir(wxCommandEvent& event);
 
+  void TransferDroppedPaths(FilePanel* target,
+                            const std::vector<std::filesystem::path>& sources,
+                            bool move);
+
   void SetActivePane(ActivePane pane);
   void RefreshPanelsShowing(const std::filesystem::path& dir, bool treeChanged);
 

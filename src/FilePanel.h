@@ -65,6 +65,7 @@ public:
   void BindFocusEvents(std::function<void()> onFocus);
   void BindDirContentsChanged(
       std::function<void(const std::filesystem::path& dir, bool treeChanged)> onChanged);
+  void BindDropFiles(std::function<void(const std::vector<std::filesystem::path>& paths, bool move)> onDrop);
 
 private:
   enum class ListingMode { Directory, Recent, Gio };
@@ -125,6 +126,7 @@ private:
   std::vector<Entry> currentEntries_{};
   std::function<void()> onFocus_{};
   std::function<void(const std::filesystem::path&, bool)> onDirContentsChanged_{};
+  std::function<void(const std::vector<std::filesystem::path>&, bool)> onDropFiles_{};
   bool ignoreTreeEvent_{false};
 
   SortColumn sortColumn_{SortColumn::Name};

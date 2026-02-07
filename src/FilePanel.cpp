@@ -26,6 +26,8 @@
 #include <wx/filename.h>
 #include <wx/choicdlg.h>
 #include <wx/artprov.h>
+#include <wx/dnd.h>
+#include <wx/dataobj.h>
 #include <wx/imaglist.h>
 #include <wx/menu.h>
 #include <wx/msgdlg.h>
@@ -252,6 +254,11 @@ bool AddRecentHost(const std::string& uri) {
   g_recentHosts.insert(g_recentHosts.begin(), RecentHostEntry{.key = *root, .display = display});
   if (g_recentHosts.size() > 15) g_recentHosts.resize(15);
   return true;
+}
+
+bool LooksLikeUriPath(const fs::path& p) {
+  const auto s = p.string();
+  return LooksLikeUri(s);
 }
 
 bool IsBareSchemeUri(const std::string& s) {
@@ -1082,6 +1089,11 @@ void FilePanel::SeedMountCredentials(const std::string& uri,
 
 FilePanel::FilePanel(wxWindow* parent) : wxPanel(parent, wxID_ANY) { BuildLayout(); }
 
+void FilePanel::BindDropFiles(
+    std::function<void(const std::vector<std::filesystem::path>& paths, bool move)> onDrop) {
+  onDropFiles_ = std::move(onDrop);
+}
+
 void FilePanel::BuildLayout() {
   split_ = new wxSplitterWindow(this, wxID_ANY);
   split_->SetSashGravity(0.0);
@@ -1235,6 +1247,52 @@ void FilePanel::BindEvents() {
     UpdateStatusText();
   });
   list_->Bind(wxEVT_DATAVIEW_ITEM_CONTEXT_MENU, [this](wxDataViewEvent& e) { ShowListContextMenu(e); });
+
+  list_->Bind(wxEVT_DATAVIEW_ITEM_BEGIN_DRAG, [this](wxDataViewEvent& e) {
+    if (listingMode_ != ListingMode::Directory) return;
+    const auto paths = GetSelectedPaths();
+    if (paths.empty()) return;
+
+    wxFileDataObject data;
+    for (const auto& p : paths) {
+      if (p.empty()) continue;
+      if (LooksLikeUriPath(p)) return; // no remote drag for now
+      data.AddFile(wxString::FromUTF8(p.string()));
+    }
+    if (data.GetFilenames().empty()) return;
+
+    wxDropSource source(list_);
+    source.SetData(data);
+    (void)source.DoDragDrop(wxDrag_AllowMove);
+    e.Skip();
+  });
+
+  struct DropTarget final : public wxFileDropTarget {
+    FilePanel* panel{nullptr};
+    explicit DropTarget(FilePanel* p) : panel(p) {}
+
+    bool OnDropFiles(wxCoord, wxCoord, const wxArrayString& filenames) override {
+      if (!panel) return false;
+      if (!panel->onDropFiles_) return false;
+      if (panel->listingMode_ != ListingMode::Directory) return false;
+      if (panel->currentDir_.empty()) return false;
+
+      std::vector<fs::path> paths;
+      paths.reserve(filenames.size());
+      for (const auto& fn : filenames) {
+        const auto s = fn.ToStdString();
+        if (s.empty()) continue;
+        paths.emplace_back(s);
+      }
+      if (paths.empty()) return false;
+
+      const bool move = !wxGetKeyState(WXK_CONTROL);
+      panel->onDropFiles_(paths, move);
+      return true;
+    }
+  };
+
+  list_->SetDropTarget(new DropTarget(this));
 
   // Click behavior:
   // - Fast double click opens (handled by wxEVT_DATAVIEW_ITEM_ACTIVATED).

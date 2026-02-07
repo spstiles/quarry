@@ -303,6 +303,13 @@ void MainFrame::BindEvents() {
   top_->BindFocusEvents([this]() { SetActivePane(ActivePane::Top); });
   bottom_->BindFocusEvents([this]() { SetActivePane(ActivePane::Bottom); });
 
+  top_->BindDropFiles([this](const std::vector<std::filesystem::path>& paths, bool move) {
+    TransferDroppedPaths(top_, paths, move);
+  });
+  bottom_->BindDropFiles([this](const std::vector<std::filesystem::path>& paths, bool move) {
+    TransferDroppedPaths(bottom_, paths, move);
+  });
+
   auto onDirChanged = [this](const std::filesystem::path& dir, bool treeChanged) {
     RefreshPanelsShowing(dir, treeChanged);
   };
@@ -381,6 +388,115 @@ void MainFrame::BindEvents() {
   SetAcceleratorTable(wxAcceleratorTable(1, entries));
 }
 
+void MainFrame::TransferDroppedPaths(FilePanel* target,
+                                     const std::vector<std::filesystem::path>& sources,
+                                     bool move) {
+  if (!target) return;
+  if (sources.empty()) return;
+
+  const auto dstDir = target->GetDirectoryPath();
+  std::error_code ec;
+  if (dstDir.empty() || !std::filesystem::exists(dstDir, ec) || !std::filesystem::is_directory(dstDir, ec)) {
+    wxMessageBox("Drop target is not a local directory.", "Quarry", wxOK | wxICON_WARNING, this);
+    return;
+  }
+
+  // Validate sources are local filesystem paths.
+  for (const auto& p : sources) {
+    if (p.empty()) return;
+    const auto s = p.string();
+    if (s.find("://") != std::string::npos) {
+      wxMessageBox("Drag-and-drop from remote locations is not supported yet.", "Quarry",
+                   wxOK | wxICON_INFORMATION, this);
+      return;
+    }
+  }
+
+  const bool isMove = move;
+  const wxString title = isMove ? "Move" : "Copy";
+  const wxString dstDirWx = wxString::FromUTF8(dstDir.string());
+
+  const wxString confirmMsg = wxString::Format("%s %zu item(s) to:\n\n%s\n\nExisting files may be overwritten.",
+                                               title.c_str(),
+                                               sources.size(),
+                                               dstDirWx.c_str());
+  if (wxMessageBox(confirmMsg, title, wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION, this) != wxYES) {
+    return;
+  }
+
+  wxProgressDialog progress(isMove ? "Moving" : "Copying",
+                            "Preparing...",
+                            static_cast<int>(sources.size()),
+                            this,
+                            wxPD_APP_MODAL | wxPD_CAN_ABORT | wxPD_AUTO_HIDE | wxPD_ELAPSED_TIME);
+
+  bool cancelAll = false;
+  bool hasDir = false;
+
+  for (size_t i = 0; i < sources.size(); i++) {
+    const auto& src = sources[i];
+    if (!std::filesystem::exists(src, ec)) continue;
+    if (!progress.Update(static_cast<int>(i), src.filename().string())) break;
+
+    if (!hasDir) {
+      ec.clear();
+      if (std::filesystem::is_directory(src, ec) && !ec) hasDir = true;
+    }
+
+    auto dst = dstDir / src.filename();
+
+    // Conflict handling.
+    bool skipItem = false;
+    for (;;) {
+      std::error_code existsEc;
+      if (!std::filesystem::exists(dst, existsEc)) break;
+
+      const auto choice = PromptExists(this, dst);
+      if (choice == ExistsChoice::Skip) {
+        skipItem = true;
+        break;
+      }
+      if (choice == ExistsChoice::Cancel) {
+        cancelAll = true;
+        break;
+      }
+      if (choice == ExistsChoice::Rename) {
+        wxTextEntryDialog nameDlg(this, "New name:", "Rename", dst.filename().string());
+        if (nameDlg.ShowModal() != wxID_OK) {
+          cancelAll = true;
+          break;
+        }
+        dst = dstDir / nameDlg.GetValue().ToStdString();
+        continue;
+      }
+      break; // Overwrite
+    }
+
+    if (cancelAll) break;
+    if (skipItem) continue;
+
+    const auto result = isMove ? MovePath(src, dst) : CopyPathRecursive(src, dst);
+    if (!result.ok) {
+      wxMessageDialog dlg(this,
+                          wxString::Format("%s failed:\n\n%s\n\nContinue?",
+                                           title.c_str(),
+                                           result.message.c_str()),
+                          title,
+                          wxYES_NO | wxNO_DEFAULT | wxICON_ERROR);
+      dlg.SetYesNoLabels("Continue", "Cancel");
+      if (dlg.ShowModal() != wxID_YES) break;
+    }
+  }
+
+  // Refresh both panes; simplest/robust for now.
+  if (top_) top_->RefreshAll();
+  if (bottom_) bottom_->RefreshAll();
+  if (hasDir) {
+    if (top_) top_->RefreshTree();
+    if (bottom_) bottom_->RefreshTree();
+  }
+}
+
 void MainFrame::SetActivePane(ActivePane pane) {
   activePane_ = pane;
   if (top_) top_->SetActiveVisual(pane == ActivePane::Top);
@@ -450,7 +566,7 @@ void MainFrame::OnCopy(wxCommandEvent&) {
   }
   const auto confirmMsg = wxString::Format(
       "Copy %zu item(s) to:\n\n%s\n\nExisting files may be overwritten.",
-      sources.size(), dstDir.string());
+      sources.size(), wxString::FromUTF8(dstDir.string()).c_str());
   if (wxMessageBox(confirmMsg, "Copy", wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION, this) != wxYES) {
     return;
   }
@@ -501,7 +617,7 @@ void MainFrame::OnCopy(wxCommandEvent&) {
     const auto result = CopyPathRecursive(src, dst);
     if (!result.ok) {
       wxMessageDialog dlg(this,
-                          wxString::Format("Copy failed:\n\n%s\n\nContinue?", result.message),
+                          wxString::Format("Copy failed:\n\n%s\n\nContinue?", result.message.c_str()),
                           "Copy failed",
                           wxYES_NO | wxNO_DEFAULT | wxICON_ERROR);
       dlg.SetYesNoLabels("Continue", "Cancel");
@@ -530,7 +646,7 @@ void MainFrame::OnMove(wxCommandEvent&) {
   }
   const auto confirmMsg = wxString::Format(
       "Move %zu item(s) to:\n\n%s\n\nExisting files may be overwritten.",
-      sources.size(), dstDir.string());
+      sources.size(), wxString::FromUTF8(dstDir.string()).c_str());
   if (wxMessageBox(confirmMsg, "Move", wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION, this) != wxYES) {
     return;
   }
@@ -581,7 +697,7 @@ void MainFrame::OnMove(wxCommandEvent&) {
     const auto result = MovePath(src, dst);
     if (!result.ok) {
       wxMessageDialog dlg(this,
-                          wxString::Format("Move failed:\n\n%s\n\nContinue?", result.message),
+                          wxString::Format("Move failed:\n\n%s\n\nContinue?", result.message.c_str()),
                           "Move failed",
                           wxYES_NO | wxNO_DEFAULT | wxICON_ERROR);
       dlg.SetYesNoLabels("Continue", "Cancel");
@@ -625,7 +741,7 @@ void MainFrame::OnDelete(wxCommandEvent&) {
     if (!result.ok) {
       wxMessageDialog dlg(this,
                           wxString::Format("Trash failed:\n\n%s\n\nDelete permanently instead?",
-                                           result.message),
+                                           result.message.c_str()),
                           "Trash failed",
                           wxYES_NO | wxCANCEL | wxNO_DEFAULT | wxICON_ERROR);
       dlg.SetYesNoCancelLabels("Delete", "Skip", "Cancel");
@@ -634,7 +750,7 @@ void MainFrame::OnDelete(wxCommandEvent&) {
         const auto delRes = DeletePath(src);
         if (!delRes.ok) {
           wxMessageDialog dlg2(this,
-                               wxString::Format("Delete failed:\n\n%s\n\nContinue?", delRes.message),
+                               wxString::Format("Delete failed:\n\n%s\n\nContinue?", delRes.message.c_str()),
                                "Delete failed",
                                wxYES_NO | wxNO_DEFAULT | wxICON_ERROR);
           dlg2.SetYesNoLabels("Continue", "Cancel");
@@ -684,7 +800,7 @@ void MainFrame::OnDeletePermanent(wxCommandEvent&) {
     const auto result = DeletePath(src);
     if (!result.ok) {
       wxMessageDialog dlg(this,
-                          wxString::Format("Delete failed:\n\n%s\n\nContinue?", result.message),
+                          wxString::Format("Delete failed:\n\n%s\n\nContinue?", result.message.c_str()),
                           "Delete failed",
                           wxYES_NO | wxNO_DEFAULT | wxICON_ERROR);
       dlg.SetYesNoLabels("Continue", "Cancel");
