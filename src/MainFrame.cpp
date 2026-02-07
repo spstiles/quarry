@@ -74,7 +74,7 @@ std::string PercentEncode(std::string s) {
   return out;
 }
 
-enum class ServerType { SMB, SFTP, FTP, WebDAV, WebDAVS, AFP };
+enum class ServerType { SMB, SFTP, SSH, FTP, WebDAV, WebDAVS, AFP };
 
 struct ConnectParams {
   ServerType type{ServerType::SMB};
@@ -91,6 +91,7 @@ std::string BuildConnectUri(const ConnectParams& p) {
     switch (t) {
       case ServerType::SMB: return "smb";
       case ServerType::SFTP: return "sftp";
+      case ServerType::SSH: return "sftp"; // GIO uses sftp:// for SSH file transfers.
       case ServerType::FTP: return "ftp";
       case ServerType::WebDAV: return "dav";
       case ServerType::WebDAVS: return "davs";
@@ -140,6 +141,7 @@ std::optional<ConnectParams> ShowConnectDialog(wxWindow* parent) {
   wxArrayString types;
   types.Add("SMB (Windows Share)");
   types.Add("SFTP");
+  types.Add("SSH (SFTP)");
   types.Add("FTP");
   types.Add("WebDAV");
   types.Add("WebDAV (HTTPS)");
@@ -162,9 +164,10 @@ std::optional<ConnectParams> ShowConnectDialog(wxWindow* parent) {
   auto defaultPortForSelection = [](int sel) -> int {
     switch (sel) {
       case 1: return 22;  // SFTP
-      case 2: return 21;  // FTP
-      case 3: return 80;  // WebDAV
-      case 4: return 443; // WebDAVS
+      case 2: return 22;  // SSH (SFTP)
+      case 3: return 21;  // FTP
+      case 4: return 80;  // WebDAV
+      case 5: return 443; // WebDAVS
       default: return 0;  // SMB/AFP
     }
   };
@@ -224,10 +227,11 @@ std::optional<ConnectParams> ShowConnectDialog(wxWindow* parent) {
   switch (typeCtrl->GetSelection()) {
     case 0: out.type = ServerType::SMB; break;
     case 1: out.type = ServerType::SFTP; break;
-    case 2: out.type = ServerType::FTP; break;
-    case 3: out.type = ServerType::WebDAV; break;
-    case 4: out.type = ServerType::WebDAVS; break;
-    case 5: out.type = ServerType::AFP; break;
+    case 2: out.type = ServerType::SSH; break;
+    case 3: out.type = ServerType::FTP; break;
+    case 4: out.type = ServerType::WebDAV; break;
+    case 5: out.type = ServerType::WebDAVS; break;
+    case 6: out.type = ServerType::AFP; break;
     default: out.type = ServerType::SMB; break;
   }
 
