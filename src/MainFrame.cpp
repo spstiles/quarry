@@ -13,6 +13,7 @@
 #include <wx/sizer.h>
 #include <wx/splitter.h>
 #include <wx/textdlg.h>
+#include <wx/textctrl.h>
 
 namespace {
 enum MenuId : int {
@@ -33,8 +34,9 @@ ExistsChoice PromptExists(wxWindow* parent, const std::filesystem::path& dst) {
   choices.Add("Skip");
   choices.Add("Rename");
   choices.Add("Cancel");
+  const wxString dstWx = wxString::FromUTF8(dst.string());
   wxSingleChoiceDialog dlg(parent,
-                           wxString::Format("Destination already exists:\n\n%s", dst.string()),
+                           wxString::Format("Destination already exists:\n\n%s", dstWx.c_str()),
                            "File exists",
                            choices);
   if (dlg.ShowModal() != wxID_OK) return ExistsChoice::Cancel;
@@ -118,7 +120,21 @@ void MainFrame::BindEvents() {
 
   // Key navigation that should work regardless of which child has focus.
   Bind(wxEVT_CHAR_HOOK, [this](wxKeyEvent& e) {
+    auto isTextInputFocused = []() -> bool {
+      wxWindow* w = wxWindow::FindFocus();
+      while (w) {
+        if (dynamic_cast<wxTextCtrl*>(w) != nullptr) return true;
+        w = w->GetParent();
+      }
+      return false;
+    };
+
     const int key = e.GetKeyCode();
+    if (isTextInputFocused()) {
+      e.Skip();
+      return;
+    }
+
     if (key == WXK_TAB && !e.ControlDown() && !e.AltDown()) {
       SetActivePane(activePane_ == ActivePane::Top ? ActivePane::Bottom : ActivePane::Top);
       GetActivePanel()->FocusPrimary();
@@ -132,19 +148,46 @@ void MainFrame::BindEvents() {
       GetActivePanel()->NavigateUp();
       return;
     }
+    if (key == WXK_F5) {
+      wxCommandEvent ev;
+      OnRefresh(ev);
+      return;
+    }
+    if (key == WXK_F2) {
+      wxCommandEvent ev;
+      OnRename(ev);
+      return;
+    }
+    if (key == WXK_F7) {
+      wxCommandEvent ev;
+      OnMkDir(ev);
+      return;
+    }
+    if (key == WXK_DELETE) {
+      wxCommandEvent ev;
+      if (e.ShiftDown()) OnDeletePermanent(ev);
+      else OnDelete(ev);
+      return;
+    }
+    if (e.ControlDown() && !e.AltDown() && !e.MetaDown()) {
+      if (key == 'C' || key == 'c') {
+        wxCommandEvent ev;
+        OnCopy(ev);
+        return;
+      }
+      if (key == 'M' || key == 'm') {
+        wxCommandEvent ev;
+        OnMove(ev);
+        return;
+      }
+    }
     e.Skip();
   });
 
-  wxAcceleratorEntry entries[8];
+  // Keep global accelerators minimal so normal text editing shortcuts work in the address bar.
+  wxAcceleratorEntry entries[1];
   entries[0].Set(wxACCEL_CTRL, (int)'Q', wxID_EXIT);
-  entries[1].Set(wxACCEL_NORMAL, WXK_F5, ID_Refresh);
-  entries[2].Set(wxACCEL_CTRL, (int)'C', ID_Copy);
-  entries[3].Set(wxACCEL_CTRL, (int)'M', ID_Move);
-  entries[4].Set(wxACCEL_NORMAL, WXK_DELETE, ID_Trash);
-  entries[5].Set(wxACCEL_NORMAL, WXK_F2, ID_Rename);
-  entries[6].Set(wxACCEL_NORMAL, WXK_F7, ID_MkDir);
-  entries[7].Set(wxACCEL_SHIFT, WXK_DELETE, ID_DeletePermanent);
-  SetAcceleratorTable(wxAcceleratorTable(8, entries));
+  SetAcceleratorTable(wxAcceleratorTable(1, entries));
 }
 
 void MainFrame::SetActivePane(ActivePane pane) {
