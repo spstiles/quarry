@@ -100,6 +100,24 @@ std::string UriLastSegment(const std::string& s) {
   return PercentDecode(s.substr(lastSlash + 1, end - (lastSlash + 1)));
 }
 
+std::string ExtractSmbHostFromDnssd(std::string s) {
+  // Common network:// entry names look like:
+  //   dnssd-server-NAS0002._smb._tcp
+  // We want:
+  //   NAS0002
+  const std::string suffix = "._smb._tcp";
+  const auto sufPos = s.find(suffix);
+  if (sufPos == std::string::npos) return {};
+
+  s = s.substr(0, sufPos);
+
+  const std::string prefix = "dnssd-server-";
+  if (s.rfind(prefix, 0) == 0) s = s.substr(prefix.size());
+
+  if (s.empty()) return {};
+  return s;
+}
+
 bool IsBareSchemeUri(const std::string& s) {
   const auto pos = s.find("://");
   if (pos == std::string::npos) return false;
@@ -1306,7 +1324,11 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
         std::string effectiveUri = dirStr;
         if (scheme == "network" && dirStr != "network://") {
           const auto host = UriLastSegment(dirStr);
-          if (!host.empty()) effectiveUri = "smb://" + host + "/";
+          if (!host.empty()) {
+            // If the host is a DNS-SD service name, extract the underlying hostname.
+            const auto dnssdHost = ExtractSmbHostFromDnssd(host);
+            effectiveUri = "smb://" + (!dnssdHost.empty() ? dnssdHost : host) + "/";
+          }
         }
 
         if (scheme == "smb" && IsBareSchemeUri(dirStr)) {
