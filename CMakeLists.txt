@@ -9,6 +9,11 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(wxWidgets 3.2 REQUIRED COMPONENTS core base)
 include(${wxWidgets_USE_FILE})
 
+find_package(PkgConfig)
+if(PkgConfig_FOUND)
+  pkg_check_modules(GIO gio-2.0 glib-2.0)
+endif()
+
 add_executable(quarry
   src/main.cpp
   src/MainFrame.cpp
@@ -19,3 +24,10 @@ add_executable(quarry
 
 target_include_directories(quarry PRIVATE src)
 target_link_libraries(quarry PRIVATE ${wxWidgets_LIBRARIES})
+
+if(GIO_FOUND)
+  target_compile_definitions(quarry PRIVATE QUARRY_USE_GIO=1)
+  target_include_directories(quarry PRIVATE ${GIO_INCLUDE_DIRS})
+  target_link_libraries(quarry PRIVATE ${GIO_LIBRARIES})
+  target_compile_options(quarry PRIVATE ${GIO_CFLAGS_OTHER})
+endif()

@@ -20,6 +20,7 @@
 #include <wx/button.h>
 #include <wx/dataview.h>
 #include <wx/bmpbuttn.h>
+#include <wx/checkbox.h>
 #include <wx/filefn.h>
 #include <wx/filename.h>
 #include <wx/choicdlg.h>
@@ -39,6 +40,10 @@
 #include <wx/utils.h>
 
 #include <sys/wait.h>
+
+#ifdef QUARRY_USE_GIO
+#include <gio/gio.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -299,7 +304,292 @@ std::vector<fs::path> ReadRecentPaths(size_t limit) {
   return paths;
 }
 
-std::vector<FilePanel::Entry> ListGioLocation(const std::string& uri, std::string* err) {
+std::vector<FilePanel::Entry> ListGioLocation(const std::string& uri, std::string* err, wxWindow* parentForAuth);
+bool GioMountLocation(const std::string& uri, std::string* err, wxWindow* parentForAuth);
+
+#ifdef QUARRY_USE_GIO
+struct MountCreds {
+  std::string username;
+  std::string password;
+  std::string domain;
+  bool anonymous{false};
+  bool remember{false};
+};
+
+std::optional<MountCreds> PromptMountCreds(wxWindow* parent,
+                                          const std::string& message,
+                                          const std::string& defaultUser,
+                                          const std::string& defaultDomain,
+                                          GAskPasswordFlags flags) {
+  wxDialog dlg(parent, wxID_ANY, "Authentication Required", wxDefaultPosition, wxDefaultSize,
+               wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER);
+
+  auto* sizer = new wxBoxSizer(wxVERTICAL);
+  dlg.SetSizer(sizer);
+
+  sizer->Add(new wxStaticText(&dlg, wxID_ANY, wxString::FromUTF8(message)),
+             0, wxALL | wxEXPAND, 10);
+
+  auto* grid = new wxFlexGridSizer(2, 8, 8);
+  grid->AddGrowableCol(1, 1);
+  sizer->Add(grid, 0, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 10);
+
+  auto* userLabel = new wxStaticText(&dlg, wxID_ANY, "Username");
+  auto* userCtrl = new wxTextCtrl(&dlg, wxID_ANY, wxString::FromUTF8(defaultUser));
+  auto* passLabel = new wxStaticText(&dlg, wxID_ANY, "Password");
+  auto* passCtrl = new wxTextCtrl(&dlg, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, wxTE_PASSWORD);
+  auto* domainLabel = new wxStaticText(&dlg, wxID_ANY, "Domain");
+  auto* domainCtrl = new wxTextCtrl(&dlg, wxID_ANY, wxString::FromUTF8(defaultDomain));
+
+  grid->Add(userLabel, 0, wxALIGN_CENTER_VERTICAL);
+  grid->Add(userCtrl, 1, wxEXPAND);
+  grid->Add(passLabel, 0, wxALIGN_CENTER_VERTICAL);
+  grid->Add(passCtrl, 1, wxEXPAND);
+  grid->Add(domainLabel, 0, wxALIGN_CENTER_VERTICAL);
+  grid->Add(domainCtrl, 1, wxEXPAND);
+
+  auto* anonymous = new wxCheckBox(&dlg, wxID_ANY, "Anonymous");
+  auto* remember = new wxCheckBox(&dlg, wxID_ANY, "Remember password");
+  sizer->Add(anonymous, 0, wxLEFT | wxRIGHT | wxBOTTOM, 10);
+  sizer->Add(remember, 0, wxLEFT | wxRIGHT | wxBOTTOM, 10);
+
+  anonymous->SetValue(false);
+  remember->SetValue(false);
+
+  // Honor requested fields.
+  const bool needUser = (flags & G_ASK_PASSWORD_NEED_USERNAME) != 0;
+  const bool needPass = (flags & G_ASK_PASSWORD_NEED_PASSWORD) != 0;
+  const bool needDomain = (flags & G_ASK_PASSWORD_NEED_DOMAIN) != 0;
+  userLabel->Show(needUser);
+  userCtrl->Show(needUser);
+  passLabel->Show(needPass);
+  passCtrl->Show(needPass);
+  domainLabel->Show(needDomain);
+  domainCtrl->Show(needDomain);
+
+  const bool allowAnon = (flags & G_ASK_PASSWORD_ANONYMOUS_SUPPORTED) != 0;
+  anonymous->Show(allowAnon);
+
+  // Remember password support (we map to permanent keyring save when supported).
+  const bool allowSave = (flags & (G_ASK_PASSWORD_SAVING_SUPPORTED | G_ASK_PASSWORD_NEED_PASSWORD)) != 0;
+  remember->Show(allowSave);
+
+  auto* btnSizer = dlg.CreateButtonSizer(wxOK | wxCANCEL);
+  sizer->Add(btnSizer, 0, wxALL | wxEXPAND, 10);
+
+  dlg.Fit();
+  dlg.Layout();
+  dlg.CentreOnParent();
+
+  if (dlg.ShowModal() != wxID_OK) return std::nullopt;
+
+  MountCreds out;
+  out.anonymous = allowAnon && anonymous->GetValue();
+  out.remember = remember->IsShown() && remember->GetValue();
+  out.username = userCtrl->IsShown() ? userCtrl->GetValue().ToStdString() : "";
+  out.password = passCtrl->IsShown() ? passCtrl->GetValue().ToStdString() : "";
+  out.domain = domainCtrl->IsShown() ? domainCtrl->GetValue().ToStdString() : "";
+  return out;
+}
+
+struct MountResult {
+  bool ok{false};
+  std::string error;
+  bool aborted{false};
+};
+
+MountResult GioMountWithUi(wxWindow* parent, const std::string& uri) {
+  MountResult result;
+
+  GFile* file = g_file_new_for_uri(uri.c_str());
+  if (!file) {
+    result.error = "Invalid URI.";
+    return result;
+  }
+
+  GMountOperation* op = g_mount_operation_new();
+  if (!op) {
+    g_object_unref(file);
+    result.error = "Unable to create mount operation.";
+    return result;
+  }
+
+  struct Ctx {
+    wxWindow* parent{nullptr};
+    GMainLoop* loop{nullptr};
+    MountResult* out{nullptr};
+  } ctx{parent, nullptr, &result};
+
+  g_signal_connect(op,
+                   "ask-password",
+                   G_CALLBACK(+[](GMountOperation* mountOp,
+                                  const char* message,
+                                  const char* defaultUser,
+                                  const char* defaultDomain,
+                                  GAskPasswordFlags flags,
+                                  gpointer userData) {
+                     auto* c = static_cast<Ctx*>(userData);
+                     const std::string msg = message ? message : "Authentication required.";
+                     const std::string du = defaultUser ? defaultUser : "";
+                     const std::string dd = defaultDomain ? defaultDomain : "";
+
+                     const auto creds = PromptMountCreds(c->parent, msg, du, dd, flags);
+                     if (!creds) {
+                       c->out->aborted = true;
+                       g_mount_operation_reply(mountOp, G_MOUNT_OPERATION_ABORTED);
+                       return;
+                     }
+
+                     g_mount_operation_set_anonymous(mountOp, creds->anonymous);
+                     if (!creds->anonymous) {
+                       g_mount_operation_set_username(mountOp, creds->username.c_str());
+                       g_mount_operation_set_password(mountOp, creds->password.c_str());
+                       g_mount_operation_set_domain(mountOp, creds->domain.c_str());
+                     }
+                     g_mount_operation_set_password_save(
+                         mountOp, creds->remember ? G_PASSWORD_SAVE_PERMANENTLY : G_PASSWORD_SAVE_NEVER);
+                     g_mount_operation_reply(mountOp, G_MOUNT_OPERATION_HANDLED);
+                   }),
+                   &ctx);
+
+  struct AsyncState {
+    GMainLoop* loop{nullptr};
+    MountResult* out{nullptr};
+  } st;
+
+  ctx.loop = g_main_loop_new(nullptr, FALSE);
+  st.loop = ctx.loop;
+  st.out = &result;
+
+  g_file_mount_enclosing_volume(
+      file,
+      G_MOUNT_MOUNT_NONE,
+      op,
+      nullptr,
+      +[](GObject* source, GAsyncResult* res, gpointer userData) {
+        auto* s = static_cast<AsyncState*>(userData);
+        GError* error = nullptr;
+        const gboolean ok = g_file_mount_enclosing_volume_finish(G_FILE(source), res, &error);
+        if (!ok) {
+          if (error) {
+            s->out->error = error->message ? error->message : "Mount failed.";
+            g_error_free(error);
+          } else {
+            s->out->error = "Mount failed.";
+          }
+        } else {
+          s->out->ok = true;
+        }
+        if (s->loop) g_main_loop_quit(s->loop);
+      },
+      &st);
+
+  // Run a temporary GLib loop to wait for mount completion.
+  g_main_loop_run(ctx.loop);
+
+  g_main_loop_unref(ctx.loop);
+  g_object_unref(op);
+  g_object_unref(file);
+  return result;
+}
+
+bool GioMountLocation(const std::string& uri, std::string* err, wxWindow* parentForAuth) {
+  if (err) err->clear();
+  if (!parentForAuth) {
+    if (err) *err = "No UI available for authentication.";
+    return false;
+  }
+  const auto mountRes = GioMountWithUi(parentForAuth, uri);
+  if (mountRes.ok) return true;
+  if (err && !mountRes.error.empty()) *err = mountRes.error;
+  return false;
+}
+
+std::vector<FilePanel::Entry> ListGioLocation(const std::string& uri, std::string* err, wxWindow* parentForAuth) {
+  std::vector<FilePanel::Entry> entries;
+  if (err) err->clear();
+
+  GFile* file = g_file_new_for_uri(uri.c_str());
+  if (!file) {
+    if (err) *err = "Invalid URI.";
+    return entries;
+  }
+
+  // Mount first so auth can happen via our wx dialog instead of terminal prompts.
+  if (parentForAuth) {
+    const auto scheme = UriScheme(uri);
+    if (scheme == "smb" || scheme == "network") {
+      (void)GioMountLocation(uri, /*err=*/nullptr, parentForAuth);
+    }
+  }
+
+  GError* error = nullptr;
+  GFileEnumerator* en = g_file_enumerate_children(
+      file,
+      "standard::name,standard::type,standard::size,time::modified",
+      G_FILE_QUERY_INFO_NONE,
+      nullptr,
+      &error);
+
+  if (!en) {
+    if (err) {
+      if (error && error->message) *err = error->message;
+      else *err = "Unable to list location.";
+    }
+    if (error) g_error_free(error);
+    g_object_unref(file);
+    return entries;
+  }
+
+  for (;;) {
+    GError* nextErr = nullptr;
+    GFileInfo* info = g_file_enumerator_next_file(en, nullptr, &nextErr);
+    if (!info) {
+      if (nextErr) {
+        if (err) *err = nextErr->message ? nextErr->message : "Unable to list location.";
+        g_error_free(nextErr);
+      }
+      break;
+    }
+
+    const char* name = g_file_info_get_name(info);
+    const auto ftype = g_file_info_get_file_type(info);
+    const bool isDir = ftype == G_FILE_TYPE_DIRECTORY || ftype == G_FILE_TYPE_MOUNTABLE ||
+                       ftype == G_FILE_TYPE_SHORTCUT || ftype == G_FILE_TYPE_SPECIAL;
+
+    std::uintmax_t size = 0;
+    if (!isDir) size = static_cast<std::uintmax_t>(g_file_info_get_size(info));
+
+    std::string modified;
+    GDateTime* dt = g_file_info_get_modification_date_time(info);
+    if (dt) {
+      const gint64 unixSec = g_date_time_to_unix(dt);
+      modified = FormatUnixSeconds(static_cast<long long>(unixSec));
+    }
+
+    // Build child URI.
+    GFile* child = g_file_get_child(file, name ? name : "");
+    char* childUri = child ? g_file_get_uri(child) : nullptr;
+
+    entries.push_back(FilePanel::Entry{
+        .name = name ? name : "",
+        .isDir = isDir,
+        .size = size,
+        .modified = modified,
+        .fullPath = childUri ? childUri : "",
+    });
+
+    if (childUri) g_free(childUri);
+    if (child) g_object_unref(child);
+    g_object_unref(info);
+  }
+
+  g_object_unref(en);
+  g_object_unref(file);
+  return entries;
+}
+#else
+std::vector<FilePanel::Entry> ListGioLocation(const std::string& uri, std::string* err, wxWindow*) {
   std::vector<FilePanel::Entry> entries;
   if (err) err->clear();
 
@@ -389,7 +679,7 @@ std::vector<FilePanel::Entry> ListGioLocation(const std::string& uri, std::strin
   return entries;
 }
 
-bool GioMountLocation(const std::string& uri, std::string* err) {
+bool GioMountLocation(const std::string& uri, std::string* err, wxWindow*) {
   if (err) err->clear();
   const wxString cmd0 = "gio";
   const wxString cmd1 = "mount";
@@ -406,6 +696,7 @@ bool GioMountLocation(const std::string& uri, std::string* err) {
   }
   return true;
 }
+#endif
 
 std::string GetRowName(wxDataViewListCtrl* list, unsigned int row) {
   wxVariant v;
@@ -1010,18 +1301,12 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
         const auto p = UriToPath(dirStr);
         if (p) return LoadDirectory(*p);
       } else if (IsGioLocationUri(dirStr)) {
-        // network:// hosts sometimes appear as network:///HOST but aren't listable directly on all systems.
-        // If that happens, fall back to smb://HOST/ which is what users usually want when double-clicking a server.
+        // network:// hosts often appear as network:///HOST. On many systems the
+        // listable/browsable URI is smb://HOST/ instead, so we fall back.
         std::string effectiveUri = dirStr;
         if (scheme == "network" && dirStr != "network://") {
-          std::string probeErr;
-          (void)ListGioLocation(dirStr, &probeErr);
-          if (!probeErr.empty() &&
-              (probeErr.find("File doesn’t exist") != std::string::npos ||
-               probeErr.find("File doesn't exist") != std::string::npos)) {
-            const auto host = UriLastSegment(dirStr);
-            if (!host.empty()) effectiveUri = "smb://" + host + "/";
-          }
+          const auto host = UriLastSegment(dirStr);
+          if (!host.empty()) effectiveUri = "smb://" + host + "/";
         }
 
         if (scheme == "smb" && IsBareSchemeUri(dirStr)) {
@@ -1068,7 +1353,7 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
         }
 
         std::string err;
-        auto entries = ListGioLocation(effectiveUri, &err);
+        auto entries = ListGioLocation(effectiveUri, &err, this);
         if (!err.empty()) {
           const bool maybeNeedsMount =
               scheme == "network" || scheme == "smb" ||
@@ -1077,9 +1362,9 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
 
           if (maybeNeedsMount) {
             std::string mountErr;
-            if (GioMountLocation(effectiveUri, &mountErr)) {
+            if (GioMountLocation(effectiveUri, &mountErr, this)) {
               err.clear();
-              entries = ListGioLocation(effectiveUri, &err);
+              entries = ListGioLocation(effectiveUri, &err, this);
             } else if (!mountErr.empty()) {
               err = err.empty() ? mountErr : (err + "\n\nMount attempt: " + mountErr);
             }
