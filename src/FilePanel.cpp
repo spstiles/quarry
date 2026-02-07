@@ -66,7 +66,7 @@ enum class TreeIcon : int {
 
 class TreeNodeData final : public wxTreeItemData {
 public:
-  enum class Kind { Path, DevicesContainer };
+  enum class Kind { Path, DevicesContainer, NetworkContainer };
 
   explicit TreeNodeData(fs::path p, Kind k = Kind::Path) : path(std::move(p)), kind(k) {}
 
@@ -75,6 +75,7 @@ public:
 };
 
 std::string PercentDecode(std::string s);
+std::string TrimRight(std::string s);
 
 bool LooksLikeUri(const std::string& s) {
   const auto pos = s.find("://");
@@ -191,6 +192,114 @@ std::string PrettyNetworkLabel(const std::string& uriOrName) {
   }
 
   return PercentDecode(uriOrName);
+}
+
+fs::path RecentSharesFile() {
+  const auto home = wxGetHomeDir().ToStdString();
+  if (home.empty()) return {};
+  return fs::path(home) / ".config" / "quarry" / "recent-shares.txt";
+}
+
+std::vector<std::string> ReadRecentShares() {
+  std::vector<std::string> out;
+  const auto path = RecentSharesFile();
+  if (path.empty()) return out;
+
+  std::error_code ec;
+  if (!fs::exists(path, ec)) return out;
+
+  std::ifstream f(path);
+  if (!f.is_open()) return out;
+
+  std::string line;
+  std::unordered_map<std::string, bool> seen;
+  while (std::getline(f, line)) {
+    line = TrimRight(line);
+    if (line.empty()) continue;
+    if (seen.find(line) != seen.end()) continue;
+    seen[line] = true;
+    out.push_back(line);
+    if (out.size() >= 30) break;
+  }
+  return out;
+}
+
+void WriteRecentShares(const std::vector<std::string>& shares) {
+  const auto path = RecentSharesFile();
+  if (path.empty()) return;
+
+  std::error_code ec;
+  fs::create_directories(path.parent_path(), ec);
+
+  std::ofstream f(path, std::ios::trunc);
+  if (!f.is_open()) return;
+  for (const auto& s : shares) {
+    if (s.empty()) continue;
+    f << s << "\n";
+  }
+}
+
+std::optional<std::string> ShareRootForUri(const std::string& uri) {
+  if (!LooksLikeUri(uri)) return std::nullopt;
+  const auto scheme = UriScheme(uri);
+  if (scheme != "smb" && scheme != "afp") return std::nullopt;
+
+  const auto pos = uri.find("://");
+  if (pos == std::string::npos) return std::nullopt;
+  size_t start = pos + 3;
+  while (start < uri.size() && uri[start] == '/') start++;
+  const size_t firstSlash = uri.find('/', start);
+  if (firstSlash == std::string::npos) return std::nullopt;
+
+  const std::string host = uri.substr(start, firstSlash - start);
+  size_t shareStart = firstSlash + 1;
+  while (shareStart < uri.size() && uri[shareStart] == '/') shareStart++;
+  if (shareStart >= uri.size()) return std::nullopt;
+  const size_t shareEnd = uri.find('/', shareStart);
+  const std::string share = (shareEnd == std::string::npos) ? uri.substr(shareStart)
+                                                            : uri.substr(shareStart, shareEnd - shareStart);
+  if (share.empty()) return std::nullopt;
+
+  return scheme + "://" + host + "/" + share;
+}
+
+std::string PrettyShareLabel(const std::string& uri) {
+  const auto scheme = UriScheme(uri);
+  const auto host = UriAuthorityHost(uri);
+  if (host.empty()) return PrettyNetworkLabel(uri);
+
+  std::string share;
+  if (auto root = ShareRootForUri(uri)) {
+    const auto s = *root;
+    const auto pos = s.find("://");
+    if (pos != std::string::npos) {
+      size_t start = pos + 3;
+      while (start < s.size() && s[start] == '/') start++;
+      const size_t firstSlash = s.find('/', start);
+      if (firstSlash != std::string::npos && firstSlash + 1 < s.size()) {
+        share = PercentDecode(s.substr(firstSlash + 1));
+      }
+    }
+  }
+
+  if (!share.empty()) {
+    if (scheme == "smb") return host + "/" + share;
+    return host + "/" + share + "(" + UpperAscii(scheme) + ")";
+  }
+
+  return PrettyNetworkLabel(uri);
+}
+
+bool AddRecentShare(const std::string& uri) {
+  const auto root = ShareRootForUri(uri);
+  if (!root) return false;
+
+  auto shares = ReadRecentShares();
+  shares.erase(std::remove(shares.begin(), shares.end(), *root), shares.end());
+  shares.insert(shares.begin(), *root);
+  if (shares.size() > 15) shares.resize(15);
+  WriteRecentShares(shares);
+  return true;
 }
 
 bool IsBareSchemeUri(const std::string& s) {
@@ -1396,6 +1505,7 @@ void FilePanel::OnTreeSelectionChanged() {
   auto* data = dynamic_cast<TreeNodeData*>(tree_->GetItemData(item));
   if (!data) return;
   if (data->kind == TreeNodeData::Kind::DevicesContainer) return;
+  if (data->kind == TreeNodeData::Kind::NetworkContainer) return;
   if (data->path.empty()) return;
   NavigateTo(data->path, /*recordHistory=*/true);
 }
@@ -1411,6 +1521,10 @@ void FilePanel::OnTreeItemExpanding(wxTreeEvent& event) {
   // Devices container refreshes its children on expand.
   if (data->kind == TreeNodeData::Kind::DevicesContainer) {
     PopulateDevices(item);
+    return;
+  }
+  if (data->kind == TreeNodeData::Kind::NetworkContainer) {
+    PopulateNetwork(item);
     return;
   }
 
@@ -1533,6 +1647,10 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
 
         // Best-effort tree sync: highlight Network group.
         SyncTreeToCurrentDir();
+
+        if (AddRecentShare(effectiveUri) && networkRoot_.IsOk()) {
+          PopulateNetwork(networkRoot_);
+        }
 
         std::vector<std::string> selectedKeys;
         std::optional<std::string> currentKey;
@@ -2362,10 +2480,12 @@ void FilePanel::BuildComputerTree() {
   PopulateDevices(devicesRoot_);
 
   networkRoot_ = tree_->AppendItem(hiddenRoot_, "Network", static_cast<int>(TreeIcon::Drive),
-                                   -1, new TreeNodeData(fs::path("network://")));
+                                   -1, new TreeNodeData(fs::path(), TreeNodeData::Kind::NetworkContainer));
+  PopulateNetwork(networkRoot_);
 
   tree_->Expand(computerRoot_);
   tree_->Expand(devicesRoot_);
+  tree_->Expand(networkRoot_);
 
   tree_->Thaw();
 }
@@ -2428,6 +2548,55 @@ void FilePanel::PopulateDevices(const wxTreeItemId& devicesItem) {
   if (tree_->GetChildrenCount(devicesItem, false) == 0) {
     tree_->AppendItem(devicesItem, "(none)");
   }
+}
+
+void FilePanel::PopulateNetwork(const wxTreeItemId& networkItem) {
+  if (!tree_ || !networkItem.IsOk()) return;
+
+  std::string selectedPath;
+  const auto selected = tree_->GetSelection();
+  if (selected.IsOk()) {
+    if (auto* data = dynamic_cast<TreeNodeData*>(tree_->GetItemData(selected))) {
+      if (data->kind == TreeNodeData::Kind::Path) selectedPath = data->path.string();
+    }
+  }
+
+  tree_->Freeze();
+  tree_->DeleteChildren(networkItem);
+
+  tree_->AppendItem(networkItem,
+                    "Network",
+                    static_cast<int>(TreeIcon::Drive),
+                    -1,
+                    new TreeNodeData(fs::path("network://")));
+
+  const auto shares = ReadRecentShares();
+  for (const auto& uri : shares) {
+    if (uri.empty()) continue;
+    tree_->AppendItem(networkItem,
+                      wxString::FromUTF8(PrettyShareLabel(uri)),
+                      static_cast<int>(TreeIcon::Drive),
+                      -1,
+                      new TreeNodeData(fs::path(uri)));
+  }
+
+  if (!selectedPath.empty()) {
+    wxTreeItemIdValue ck;
+    auto c = tree_->GetFirstChild(networkItem, ck);
+    while (c.IsOk()) {
+      auto* data = dynamic_cast<TreeNodeData*>(tree_->GetItemData(c));
+      if (data && data->kind == TreeNodeData::Kind::Path && data->path.string() == selectedPath) {
+        ignoreTreeEvent_ = true;
+        tree_->SelectItem(c);
+        tree_->EnsureVisible(c);
+        ignoreTreeEvent_ = false;
+        break;
+      }
+      c = tree_->GetNextChild(networkItem, ck);
+    }
+  }
+
+  tree_->Thaw();
 }
 
 void FilePanel::PopulateDirChildren(const wxTreeItemId& parent, const fs::path& dir) {

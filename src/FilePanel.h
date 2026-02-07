@@ -92,6 +92,7 @@ private:
   void BuildComputerTree();
   void PopulateDirChildren(const wxTreeItemId& parent, const std::filesystem::path& dir);
   void PopulateDevices(const wxTreeItemId& devicesItem);
+  void PopulateNetwork(const wxTreeItemId& networkItem);
   wxTreeItemId EnsurePathSelected(const wxTreeItemId& baseItem,
                                  const std::filesystem::path& basePath,
                                  const std::filesystem::path& targetDir);
