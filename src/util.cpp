@@ -58,7 +58,94 @@ bool ConfirmFileOp(wxWindow* parent,
 
 OpResult CopyPathRecursive(const fs::path& src, const fs::path& dst) {
   std::error_code ec;
-  const auto options = fs::copy_options::recursive | fs::copy_options::overwrite_existing;
+
+  // Avoid pathological case: copying a directory into itself/subdirectory.
+  ec.clear();
+  const auto srcCanon = fs::weakly_canonical(src, ec);
+  const auto srcCanonOk = !ec;
+  ec.clear();
+  const auto dstCanon = fs::weakly_canonical(dst, ec);
+  const auto dstCanonOk = !ec;
+  if (srcCanonOk && dstCanonOk) {
+    const auto srcStr = srcCanon.native();
+    const auto dstStr = dstCanon.native();
+    if (dstStr.size() > srcStr.size() && dstStr.compare(0, srcStr.size(), srcStr) == 0 &&
+        (dstStr[srcStr.size()] == '/' || dstStr[srcStr.size()] == '\\')) {
+      return {.ok = false, .message = "Destination is inside the source folder."};
+    }
+  }
+
+  ec.clear();
+  const auto st = fs::symlink_status(src, ec);
+  if (ec) return {.ok = false, .message = wxString::FromUTF8(ec.message())};
+
+  auto yieldSometimes = [](std::uint64_t& counter) {
+    counter++;
+    if ((counter % 256u) == 0u) wxYieldIfNeeded();
+  };
+
+  std::uint64_t yieldCounter = 0;
+
+  if (fs::is_directory(st)) {
+    ec.clear();
+    fs::create_directories(dst, ec);
+    if (ec) return {.ok = false, .message = wxString::FromUTF8(ec.message())};
+
+    fs::recursive_directory_iterator it(src, fs::directory_options::skip_permission_denied, ec);
+    if (ec) return {.ok = false, .message = wxString::FromUTF8(ec.message())};
+
+    for (const auto& entry : it) {
+      yieldSometimes(yieldCounter);
+
+      const auto rel = entry.path().lexically_relative(src);
+      if (rel.empty()) continue;
+      const auto out = dst / rel;
+
+      ec.clear();
+      const auto entrySt = entry.symlink_status(ec);
+      if (ec) return {.ok = false, .message = wxString::FromUTF8(ec.message())};
+
+      if (fs::is_directory(entrySt)) {
+        ec.clear();
+        fs::create_directories(out, ec);
+        if (ec) return {.ok = false, .message = wxString::FromUTF8(ec.message())};
+        continue;
+      }
+
+      if (fs::is_regular_file(entrySt)) {
+        ec.clear();
+        fs::create_directories(out.parent_path(), ec);
+        if (ec) return {.ok = false, .message = wxString::FromUTF8(ec.message())};
+        ec.clear();
+        fs::copy_file(entry.path(), out, fs::copy_options::overwrite_existing, ec);
+        if (ec) return {.ok = false, .message = wxString::FromUTF8(ec.message())};
+        continue;
+      }
+
+      if (fs::is_symlink(entrySt)) {
+        ec.clear();
+        fs::create_directories(out.parent_path(), ec);
+        if (ec) return {.ok = false, .message = wxString::FromUTF8(ec.message())};
+        ec.clear();
+        fs::copy(entry.path(), out,
+                 fs::copy_options::overwrite_existing | fs::copy_options::copy_symlinks, ec);
+        if (ec) return {.ok = false, .message = wxString::FromUTF8(ec.message())};
+        continue;
+      }
+
+      // Skip other special file types for now.
+    }
+
+    return {.ok = true};
+  }
+
+  // Regular file (or symlink to file): copy one item.
+  ec.clear();
+  fs::create_directories(dst.parent_path(), ec);
+  if (ec) return {.ok = false, .message = wxString::FromUTF8(ec.message())};
+
+  ec.clear();
+  const auto options = fs::copy_options::overwrite_existing | fs::copy_options::copy_symlinks;
   fs::copy(src, dst, options, ec);
   if (ec) return {.ok = false, .message = wxString::FromUTF8(ec.message())};
   return {.ok = true};
