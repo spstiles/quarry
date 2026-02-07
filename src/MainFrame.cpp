@@ -430,6 +430,13 @@ void MainFrame::BindEvents() {
   Bind(wxEVT_MENU, &MainFrame::OnRename, this, ID_Rename);
   Bind(wxEVT_MENU, &MainFrame::OnMkDir, this, ID_MkDir);
 
+  Bind(wxEVT_ACTIVATE, [this](wxActivateEvent& e) {
+    if (e.GetActive() && fileOp_ && fileOp_->dlg && fileOp_->dlg->IsShown()) {
+      fileOp_->dlg->Raise();
+    }
+    e.Skip();
+  });
+
   top_->BindFocusEvents([this]() { SetActivePane(ActivePane::Top); });
   bottom_->BindFocusEvents([this]() { SetActivePane(ActivePane::Bottom); });
 
@@ -606,7 +613,7 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
 
   // Modeless dialog.
   fileOp_->dlg = new wxDialog(this, wxID_ANY, title, wxDefaultPosition, wxSize(600, 180),
-                              wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER);
+                              wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER | wxFRAME_FLOAT_ON_PARENT);
   auto* root = new wxBoxSizer(wxVERTICAL);
   fileOp_->dlg->SetSizer(root);
 
@@ -633,9 +640,7 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
     fileOp_->state->cv.notify_all();
   });
 
-  // Closing the modeless dialog just hides it; the operation continues.
   fileOp_->dlg->Bind(wxEVT_CLOSE_WINDOW, [this](wxCloseEvent& e) {
-    if (fileOp_ && fileOp_->dlg) fileOp_->dlg->Hide();
     e.Veto();
   });
 
