@@ -194,15 +194,20 @@ std::string PrettyNetworkLabel(const std::string& uriOrName) {
   return PercentDecode(uriOrName);
 }
 
-fs::path RecentSharesFile() {
+fs::path RecentHostsFile() {
+  const auto home = wxGetHomeDir().ToStdString();
+  if (home.empty()) return {};
+  return fs::path(home) / ".config" / "quarry" / "recent-hosts.txt";
+}
+
+fs::path LegacyRecentSharesFile() {
   const auto home = wxGetHomeDir().ToStdString();
   if (home.empty()) return {};
   return fs::path(home) / ".config" / "quarry" / "recent-shares.txt";
 }
 
-std::vector<std::string> ReadRecentShares() {
+std::vector<std::string> ReadLinesUnique(const fs::path& path, size_t limit) {
   std::vector<std::string> out;
-  const auto path = RecentSharesFile();
   if (path.empty()) return out;
 
   std::error_code ec;
@@ -219,13 +224,49 @@ std::vector<std::string> ReadRecentShares() {
     if (seen.find(line) != seen.end()) continue;
     seen[line] = true;
     out.push_back(line);
-    if (out.size() >= 30) break;
+    if (out.size() >= limit) break;
   }
   return out;
 }
 
-void WriteRecentShares(const std::vector<std::string>& shares) {
-  const auto path = RecentSharesFile();
+std::vector<std::string> ReadRecentHosts() {
+  auto out = ReadLinesUnique(RecentHostsFile(), 30);
+  if (!out.empty()) return out;
+
+  // One-time migration from legacy per-share list.
+  const auto legacy = LegacyRecentSharesFile();
+  if (legacy.empty()) return out;
+
+  const auto legacyLines = ReadLinesUnique(legacy, 100);
+  std::unordered_map<std::string, bool> seen;
+  for (const auto& uri : legacyLines) {
+    if (!LooksLikeUri(uri)) continue;
+    const auto scheme = UriScheme(uri);
+    if (scheme != "smb" && scheme != "afp") continue;
+    const auto host = UriAuthorityHost(uri);
+    if (host.empty()) continue;
+    const auto key = scheme + "://" + host + "/";
+    if (seen.find(key) != seen.end()) continue;
+    seen[key] = true;
+    out.push_back(key);
+    if (out.size() >= 30) break;
+  }
+
+  if (!out.empty()) {
+    // Persist migrated format and keep legacy file around.
+    std::error_code ec;
+    fs::create_directories(RecentHostsFile().parent_path(), ec);
+    std::ofstream f(RecentHostsFile(), std::ios::trunc);
+    if (f.is_open()) {
+      for (const auto& s : out) f << s << "\n";
+    }
+  }
+
+  return out;
+}
+
+void WriteRecentHosts(const std::vector<std::string>& hosts) {
+  const auto path = RecentHostsFile();
   if (path.empty()) return;
 
   std::error_code ec;
@@ -233,72 +274,31 @@ void WriteRecentShares(const std::vector<std::string>& shares) {
 
   std::ofstream f(path, std::ios::trunc);
   if (!f.is_open()) return;
-  for (const auto& s : shares) {
+  for (const auto& s : hosts) {
     if (s.empty()) continue;
     f << s << "\n";
   }
 }
 
-std::optional<std::string> ShareRootForUri(const std::string& uri) {
+std::optional<std::string> HostRootForUri(const std::string& uri) {
   if (!LooksLikeUri(uri)) return std::nullopt;
   const auto scheme = UriScheme(uri);
   if (scheme != "smb" && scheme != "afp") return std::nullopt;
 
-  const auto pos = uri.find("://");
-  if (pos == std::string::npos) return std::nullopt;
-  size_t start = pos + 3;
-  while (start < uri.size() && uri[start] == '/') start++;
-  const size_t firstSlash = uri.find('/', start);
-  if (firstSlash == std::string::npos) return std::nullopt;
-
-  const std::string host = uri.substr(start, firstSlash - start);
-  size_t shareStart = firstSlash + 1;
-  while (shareStart < uri.size() && uri[shareStart] == '/') shareStart++;
-  if (shareStart >= uri.size()) return std::nullopt;
-  const size_t shareEnd = uri.find('/', shareStart);
-  const std::string share = (shareEnd == std::string::npos) ? uri.substr(shareStart)
-                                                            : uri.substr(shareStart, shareEnd - shareStart);
-  if (share.empty()) return std::nullopt;
-
-  return scheme + "://" + host + "/" + share;
-}
-
-std::string PrettyShareLabel(const std::string& uri) {
-  const auto scheme = UriScheme(uri);
   const auto host = UriAuthorityHost(uri);
-  if (host.empty()) return PrettyNetworkLabel(uri);
-
-  std::string share;
-  if (auto root = ShareRootForUri(uri)) {
-    const auto s = *root;
-    const auto pos = s.find("://");
-    if (pos != std::string::npos) {
-      size_t start = pos + 3;
-      while (start < s.size() && s[start] == '/') start++;
-      const size_t firstSlash = s.find('/', start);
-      if (firstSlash != std::string::npos && firstSlash + 1 < s.size()) {
-        share = PercentDecode(s.substr(firstSlash + 1));
-      }
-    }
-  }
-
-  if (!share.empty()) {
-    if (scheme == "smb") return host + "/" + share;
-    return host + "/" + share + "(" + UpperAscii(scheme) + ")";
-  }
-
-  return PrettyNetworkLabel(uri);
+  if (host.empty()) return std::nullopt;
+  return scheme + "://" + host + "/";
 }
 
-bool AddRecentShare(const std::string& uri) {
-  const auto root = ShareRootForUri(uri);
+bool AddRecentHost(const std::string& uri) {
+  const auto root = HostRootForUri(uri);
   if (!root) return false;
 
-  auto shares = ReadRecentShares();
-  shares.erase(std::remove(shares.begin(), shares.end(), *root), shares.end());
-  shares.insert(shares.begin(), *root);
-  if (shares.size() > 15) shares.resize(15);
-  WriteRecentShares(shares);
+  auto hosts = ReadRecentHosts();
+  hosts.erase(std::remove(hosts.begin(), hosts.end(), *root), hosts.end());
+  hosts.insert(hosts.begin(), *root);
+  if (hosts.size() > 15) hosts.resize(15);
+  WriteRecentHosts(hosts);
   return true;
 }
 
@@ -1653,10 +1653,6 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
         // Best-effort tree sync: highlight Network group.
         SyncTreeToCurrentDir();
 
-        if (AddRecentShare(effectiveUri) && networkRoot_.IsOk()) {
-          PopulateNetwork(networkRoot_);
-        }
-
         std::vector<std::string> selectedKeys;
         std::optional<std::string> currentKey;
         if (list_) {
@@ -1716,6 +1712,11 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
                                         help.c_str()),
                        "Quarry", wxOK | wxICON_ERROR, this);
           return false;
+        }
+
+        if ((UriScheme(effectiveUri) == "smb" || UriScheme(effectiveUri) == "afp") && AddRecentHost(effectiveUri) &&
+            networkRoot_.IsOk()) {
+          PopulateNetwork(networkRoot_);
         }
 
         if (UriScheme(effectiveUri) == "network") {
@@ -2576,11 +2577,11 @@ void FilePanel::PopulateNetwork(const wxTreeItemId& networkItem) {
                                         -1,
                                         new TreeNodeData(fs::path("network://")));
 
-  const auto shares = ReadRecentShares();
-  for (const auto& uri : shares) {
+  const auto hosts = ReadRecentHosts();
+  for (const auto& uri : hosts) {
     if (uri.empty()) continue;
     tree_->AppendItem(networkItem,
-                      wxString::FromUTF8(PrettyShareLabel(uri)),
+                      wxString::FromUTF8(PrettyNetworkLabel(uri)),
                       static_cast<int>(TreeIcon::Drive),
                       -1,
                       new TreeNodeData(fs::path(uri)));
@@ -2706,11 +2707,7 @@ void FilePanel::SyncTreeToCurrentDir() {
 
       if (uri.rfind("network://", 0) == 0 && browseNetworkRoot_.IsOk()) {
         best = browseNetworkRoot_;
-      } else if ((UriScheme(uri) == "smb" || UriScheme(uri) == "afp") && browseNetworkRoot_.IsOk()) {
-        // Browsing a host (e.g. smb://HOST/) is conceptually still part of "Browse Network".
-        // Keep the Browse Network item selected unless we're inside a specific share.
-        if (!ShareRootForUri(uri)) best = browseNetworkRoot_;
-      } else if (auto root = ShareRootForUri(uri)) {
+      } else if (auto root = HostRootForUri(uri)) {
         wxTreeItemIdValue ck;
         auto c = tree_->GetFirstChild(networkRoot_, ck);
         while (c.IsOk()) {
