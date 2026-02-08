@@ -833,24 +833,26 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
       const int v = static_cast<int>(std::min<std::uintmax_t>(fileOp_->range, bytesDone / fileOp_->bytesUnit));
       fileOp_->gauge->SetValue(v);
     } else {
-      const int v = static_cast<int>(std::min(done, sources.size()));
-      fileOp_->gauge->SetValue(v);
+      // For remote sources we often don't know total bytes, so keep the gauge active.
+      fileOp_->gauge->Pulse();
     }
 
-    wxString remaining = "Remaining: --:--:--";
+    wxString remaining = (totalBytes > 0) ? "Remaining: --:--:--" : "Remaining: (unknown)";
     wxString speed = "Speed: -- MB/s";
-    if (fileOp_->configured && totalBytes > 0 && bytesDone > 0) {
+    wxString copied = "Copied: 0 B";
+
+    if (bytesDone > 0) {
       const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
           std::chrono::steady_clock::now() - fileOp_->start);
       const auto elapsedSec = std::max<long long>(1, elapsed.count());
       const double bytesPerSec = static_cast<double>(bytesDone) / static_cast<double>(elapsedSec);
       const double mbPerSec = bytesPerSec / (1024.0 * 1024.0);
       speed = wxString::Format("Speed: %.1f MB/s", mbPerSec);
+      copied = "Copied: " + wxString::FromUTF8(HumanSize(bytesDone));
 
-      const double rate = bytesPerSec;
-      if (rate > 1.0) {
+      if (totalBytes > 0 && bytesPerSec > 1.0) {
         const auto left = static_cast<double>(totalBytes > bytesDone ? (totalBytes - bytesDone) : 0);
-        const auto remSec = static_cast<long long>(left / rate);
+        const auto remSec = static_cast<long long>(left / bytesPerSec);
         remaining = "Remaining: " + FormatHMS(std::chrono::seconds(remSec));
       }
     }
@@ -858,8 +860,8 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
     if (canceling) {
       fileOp_->titleText->SetLabel("Canceling...");
     }
-    if (!label.empty()) fileOp_->detailText->SetLabel(label + "\n" + speed + "   " + remaining);
-    else fileOp_->detailText->SetLabel(speed + "   " + remaining);
+    if (!label.empty()) fileOp_->detailText->SetLabel(label + "\n" + copied + "   " + speed + "   " + remaining);
+    else fileOp_->detailText->SetLabel(copied + "   " + speed + "   " + remaining);
 
     if (fileOp_->dlg) {
       fileOp_->dlg->Layout();
