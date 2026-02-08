@@ -1,5 +1,6 @@
 #include "MainFrame.h"
 
+#include "Connections.h"
 #include "util.h"
 
 #include <filesystem>
@@ -13,7 +14,9 @@
 #include <memory>
 
 #include <wx/accel.h>
+#include <wx/aboutdlg.h>
 #include <wx/choicdlg.h>
+#include <wx/config.h>
 #include <wx/filefn.h>
 #include <wx/menu.h>
 #include <wx/msgdlg.h>
@@ -30,17 +33,21 @@
 #include <wx/timer.h>
 #include <wx/gauge.h>
 #include <wx/button.h>
+#include <wx/listbox.h>
 
 namespace {
 enum MenuId : int {
   ID_Refresh = wxID_HIGHEST + 1,
   ID_ConnectToServer,
+  ID_ConnectionsManager,
   ID_Copy,
   ID_Move,
   ID_Trash,
   ID_DeletePermanent,
   ID_Rename,
-  ID_MkDir
+  ID_MkDir,
+  ID_SaveDefaultView,
+  ID_LoadDefaultView
 };
 
 enum class ExistsChoice { Overwrite, Skip, Rename, Cancel };
@@ -335,8 +342,69 @@ std::optional<ConnectParams> ShowConnectDialog(wxWindow* parent) {
   userBox->Add(rememberCtrl, 0, wxLEFT | wxRIGHT | wxBOTTOM, 10);
 
   // Buttons
-  auto* btnSizer = dlg.CreateButtonSizer(wxOK | wxCANCEL);
+  auto* btnSizer = new wxBoxSizer(wxHORIZONTAL);
+  auto* saveBtn = new wxButton(&dlg, wxID_ANY, "Save...");
+  auto* connectBtn = new wxButton(&dlg, wxID_OK, "Connect");
+  auto* cancelBtn = new wxButton(&dlg, wxID_CANCEL, "Cancel");
+  connectBtn->SetDefault();
+  btnSizer->Add(saveBtn, 0, wxRIGHT, 8);
+  btnSizer->AddStretchSpacer(1);
+  btnSizer->Add(connectBtn, 0, wxRIGHT, 8);
+  btnSizer->Add(cancelBtn, 0);
   root->Add(btnSizer, 0, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 10);
+
+  auto readParams = [&]() -> ConnectParams {
+    ConnectParams out;
+    out.server = serverCtrl->GetValue().ToStdString();
+    out.port = portCtrl->GetValue();
+    out.folder = folderCtrl->GetValue().ToStdString();
+    out.username = userCtrl->GetValue().ToStdString();
+    out.password = passCtrl->GetValue().ToStdString();
+    out.rememberPassword = rememberCtrl->GetValue();
+    switch (typeCtrl->GetSelection()) {
+      case 0: out.type = ServerType::SMB; break;
+      case 1: out.type = ServerType::SSH; break;
+      case 2: out.type = ServerType::FTP; break;
+      case 3: out.type = ServerType::WebDAV; break;
+      case 4: out.type = ServerType::WebDAVS; break;
+      case 5: out.type = ServerType::AFP; break;
+      default: out.type = ServerType::SMB; break;
+    }
+    return out;
+  };
+
+  saveBtn->Bind(wxEVT_BUTTON, [&](wxCommandEvent&) {
+    const auto p = readParams();
+    if (p.server.empty()) {
+      wxMessageBox("Please enter a server before saving.", "Quarry", wxOK | wxICON_INFORMATION, &dlg);
+      return;
+    }
+
+    const auto uri = BuildConnectUri(p);
+    wxTextEntryDialog nameDlg(&dlg, "Connection name:", "Save Connection", wxString::FromUTF8(uri));
+    if (nameDlg.ShowModal() != wxID_OK) return;
+    const auto name = nameDlg.GetValue().ToStdString();
+    if (name.empty()) return;
+
+    connections::Connection c;
+    c.name = name;
+    c.server = p.server;
+    c.port = p.port;
+    c.folder = p.folder;
+    c.username = p.username;
+    c.rememberPassword = p.rememberPassword;
+    switch (p.type) {
+      case ServerType::SMB: c.type = connections::Type::SMB; break;
+      case ServerType::SSH: c.type = connections::Type::SSH; break;
+      case ServerType::FTP: c.type = connections::Type::FTP; break;
+      case ServerType::WebDAV: c.type = connections::Type::WebDAV; break;
+      case ServerType::WebDAVS: c.type = connections::Type::WebDAVS; break;
+      case ServerType::AFP: c.type = connections::Type::AFP; break;
+      default: c.type = connections::Type::Unknown; break;
+    }
+    connections::Upsert(std::move(c));
+    wxMessageBox("Saved.", "Quarry", wxOK | wxICON_INFORMATION, &dlg);
+  });
 
   dlg.Fit();
   dlg.Layout();
@@ -344,39 +412,25 @@ std::optional<ConnectParams> ShowConnectDialog(wxWindow* parent) {
 
   if (dlg.ShowModal() != wxID_OK) return std::nullopt;
 
-  ConnectParams out;
-  out.server = serverCtrl->GetValue().ToStdString();
-  out.port = portCtrl->GetValue();
-  out.folder = folderCtrl->GetValue().ToStdString();
-  out.username = userCtrl->GetValue().ToStdString();
-  out.password = passCtrl->GetValue().ToStdString();
-  out.rememberPassword = rememberCtrl->GetValue();
-
-  switch (typeCtrl->GetSelection()) {
-    case 0: out.type = ServerType::SMB; break;
-    case 1: out.type = ServerType::SSH; break;
-    case 2: out.type = ServerType::FTP; break;
-    case 3: out.type = ServerType::WebDAV; break;
-    case 4: out.type = ServerType::WebDAVS; break;
-    case 5: out.type = ServerType::AFP; break;
-    default: out.type = ServerType::SMB; break;
-  }
-
-  // Basic validation.
+  auto out = readParams();
   if (out.server.empty()) return std::nullopt;
   return out;
 }
 } // namespace
 
-MainFrame::MainFrame()
+MainFrame::MainFrame(std::string topDir, std::string bottomDir)
     : wxFrame(nullptr, wxID_ANY, "Quarry", wxDefaultPosition, wxSize(1200, 700)) {
   BuildMenu();
   BuildLayout();
   BindEvents();
 
   const auto home = wxGetHomeDir().ToStdString();
-  pendingTopDir_ = home;
-  pendingBottomDir_ = home;
+  pendingTopDir_ = topDir.empty() ? home : std::move(topDir);
+  pendingBottomDir_ = bottomDir.empty() ? pendingTopDir_ : std::move(bottomDir);
+
+  // On startup, try to load the saved default view (if any). If none exists,
+  // we fall back to built-in defaults.
+  LoadDefaultViewInternal(/*applyToPanes=*/false, /*showNoDefaultMessage=*/false);
 
   SetMinSize(wxSize(900, 500));
 
@@ -393,8 +447,6 @@ void MainFrame::StartFileOperation(const wxString& title,
 
 void MainFrame::BuildMenu() {
   auto* fileMenu = new wxMenu();
-  fileMenu->Append(ID_ConnectToServer, "Connect to Server...\tCtrl+L");
-  fileMenu->AppendSeparator();
   fileMenu->Append(wxID_EXIT, "Quit\tCtrl+Q");
 
   auto* opsMenu = new wxMenu();
@@ -408,9 +460,23 @@ void MainFrame::BuildMenu() {
   opsMenu->Append(ID_Rename, "Rename\tF2");
   opsMenu->Append(ID_MkDir, "New Folder\tF7");
 
+  auto* networkMenu = new wxMenu();
+  networkMenu->Append(ID_ConnectToServer, "Connect to Server...\tCtrl+L");
+  networkMenu->Append(ID_ConnectionsManager, "Connections...");
+
+  auto* viewMenu = new wxMenu();
+  viewMenu->Append(ID_SaveDefaultView, "Save View as Default");
+  viewMenu->Append(ID_LoadDefaultView, "Load Default View");
+
+  auto* helpMenu = new wxMenu();
+  helpMenu->Append(wxID_ABOUT, "About");
+
   auto* bar = new wxMenuBar();
   bar->Append(fileMenu, "&File");
-  bar->Append(opsMenu, "&Operations");
+  bar->Append(opsMenu, "&Edit");
+  bar->Append(viewMenu, "&View");
+  bar->Append(networkMenu, "&Network");
+  bar->Append(helpMenu, "&Help");
   SetMenuBar(bar);
 }
 
@@ -424,14 +490,18 @@ void MainFrame::BuildLayout() {
 
 void MainFrame::BindEvents() {
   Bind(wxEVT_MENU, &MainFrame::OnQuit, this, wxID_EXIT);
+  Bind(wxEVT_MENU, &MainFrame::OnAbout, this, wxID_ABOUT);
   Bind(wxEVT_MENU, &MainFrame::OnRefresh, this, ID_Refresh);
   Bind(wxEVT_MENU, &MainFrame::OnConnectToServer, this, ID_ConnectToServer);
+  Bind(wxEVT_MENU, &MainFrame::OnConnectionsManager, this, ID_ConnectionsManager);
   Bind(wxEVT_MENU, &MainFrame::OnCopy, this, ID_Copy);
   Bind(wxEVT_MENU, &MainFrame::OnMove, this, ID_Move);
   Bind(wxEVT_MENU, &MainFrame::OnDelete, this, ID_Trash);
   Bind(wxEVT_MENU, &MainFrame::OnDeletePermanent, this, ID_DeletePermanent);
   Bind(wxEVT_MENU, &MainFrame::OnRename, this, ID_Rename);
   Bind(wxEVT_MENU, &MainFrame::OnMkDir, this, ID_MkDir);
+  Bind(wxEVT_MENU, [this](wxCommandEvent&) { SaveDefaultView(); }, ID_SaveDefaultView);
+  Bind(wxEVT_MENU, [this](wxCommandEvent&) { LoadDefaultView(); }, ID_LoadDefaultView);
 
   Bind(wxEVT_ACTIVATE, [this](wxActivateEvent& e) {
     if (e.GetActive() && fileOp_ && fileOp_->dlg && fileOp_->dlg->IsShown()) {
@@ -542,7 +612,20 @@ void MainFrame::InitPanelsIfNeeded() {
                     bottom_->SidebarWindow(),
                     bottom_->ListWindow());
 
+  if (pendingVSash_) quad_->SetVerticalSashPosition(*pendingVSash_);
+  if (pendingHSash_) quad_->SetHorizontalSashPosition(*pendingHSash_);
+
   BindPanelEvents();
+
+  if (pendingTopCols_) top_->SetListColumnWidths(*pendingTopCols_);
+  if (pendingBottomCols_) bottom_->SetListColumnWidths(*pendingBottomCols_);
+
+  if (pendingTopSortCol_ || pendingTopSortAsc_) {
+    top_->SetSort(pendingTopSortCol_.value_or(0), pendingTopSortAsc_.value_or(true));
+  }
+  if (pendingBottomSortCol_ || pendingBottomSortAsc_) {
+    bottom_->SetSort(pendingBottomSortCol_.value_or(0), pendingBottomSortAsc_.value_or(true));
+  }
 
   if (!pendingTopDir_.empty()) top_->SetDirectory(pendingTopDir_);
   if (!pendingBottomDir_.empty()) bottom_->SetDirectory(pendingBottomDir_);
@@ -569,6 +652,174 @@ void MainFrame::BindPanelEvents() {
   };
   top_->BindDirContentsChanged(onDirChanged);
   bottom_->BindDirContentsChanged(onDirChanged);
+}
+
+void MainFrame::SaveDefaultView() {
+  InitPanelsIfNeeded();
+
+  wxConfig cfg("Quarry");
+  const wxString base = "/view/default";
+
+  cfg.Write(base + "/window/maximized", IsMaximized());
+
+  if (!IsMaximized() && !IsIconized()) {
+    const auto p = GetPosition();
+    const auto s = GetSize();
+    cfg.Write(base + "/window/x", p.x);
+    cfg.Write(base + "/window/y", p.y);
+    cfg.Write(base + "/window/w", s.x);
+    cfg.Write(base + "/window/h", s.y);
+  }
+
+  if (quad_) {
+    const int v = quad_->GetVerticalSashPosition();
+    const int h = quad_->GetHorizontalSashPosition();
+    if (v > 0) cfg.Write(base + "/split/v", v);
+    if (h > 0) cfg.Write(base + "/split/h", h);
+  }
+
+  if (top_) {
+    const auto widths = top_->GetListColumnWidths();
+    for (int i = 0; i < 4; i++) {
+      if (widths[static_cast<size_t>(i)] > 0) {
+        cfg.Write(wxString::Format(base + "/columns/top/%d", i), widths[static_cast<size_t>(i)]);
+      }
+    }
+    cfg.Write(base + "/sort/top/col", top_->GetSortColumnIndex());
+    cfg.Write(base + "/sort/top/asc", top_->IsSortAscending());
+  }
+  if (bottom_) {
+    const auto widths = bottom_->GetListColumnWidths();
+    for (int i = 0; i < 4; i++) {
+      if (widths[static_cast<size_t>(i)] > 0) {
+        cfg.Write(wxString::Format(base + "/columns/bottom/%d", i), widths[static_cast<size_t>(i)]);
+      }
+    }
+    cfg.Write(base + "/sort/bottom/col", bottom_->GetSortColumnIndex());
+    cfg.Write(base + "/sort/bottom/asc", bottom_->IsSortAscending());
+  }
+
+  cfg.Flush();
+  wxMessageBox("Default view saved.", "Quarry", wxOK | wxICON_INFORMATION, this);
+}
+
+void MainFrame::LoadDefaultView() {
+  LoadDefaultViewInternal(/*applyToPanes=*/true, /*showNoDefaultMessage=*/true);
+}
+
+bool MainFrame::LoadDefaultViewInternal(bool applyToPanes, bool showNoDefaultMessage) {
+  wxConfig cfg("Quarry");
+  const wxString base = "/view/default";
+
+  bool hasAny = false;
+
+  long x = 0, y = 0, w = 0, h = 0;
+  const bool hasX = cfg.Read(base + "/window/x", &x);
+  const bool hasY = cfg.Read(base + "/window/y", &y);
+  const bool hasW = cfg.Read(base + "/window/w", &w);
+  const bool hasH = cfg.Read(base + "/window/h", &h);
+  if (hasW && hasH && w > 0 && h > 0) {
+    SetSize(static_cast<int>(w), static_cast<int>(h));
+    hasAny = true;
+  }
+  if (hasX && hasY) {
+    Move(static_cast<int>(x), static_cast<int>(y));
+    hasAny = true;
+  }
+
+  bool maximized = false;
+  if (cfg.Read(base + "/window/maximized", &maximized)) {
+    hasAny = true;
+    if (maximized) Maximize(true);
+    else if (IsMaximized()) Maximize(false);
+  }
+
+  long vSash = 0;
+  if (cfg.Read(base + "/split/v", &vSash) && vSash > 0) {
+    pendingVSash_ = static_cast<int>(vSash);
+    hasAny = true;
+  }
+  long hSash = 0;
+  if (cfg.Read(base + "/split/h", &hSash) && hSash > 0) {
+    pendingHSash_ = static_cast<int>(hSash);
+    hasAny = true;
+  }
+
+  std::array<int, 4> topCols{0, 0, 0, 0};
+  std::array<int, 4> bottomCols{0, 0, 0, 0};
+  bool anyTop = false;
+  bool anyBottom = false;
+  for (int i = 0; i < 4; i++) {
+    long v = 0;
+    if (cfg.Read(wxString::Format(base + "/columns/top/%d", i), &v) && v > 0) {
+      topCols[static_cast<size_t>(i)] = static_cast<int>(v);
+      anyTop = true;
+    }
+    v = 0;
+    if (cfg.Read(wxString::Format(base + "/columns/bottom/%d", i), &v) && v > 0) {
+      bottomCols[static_cast<size_t>(i)] = static_cast<int>(v);
+      anyBottom = true;
+    }
+  }
+  if (anyTop) {
+    pendingTopCols_ = topCols;
+    hasAny = true;
+  }
+  if (anyBottom) {
+    pendingBottomCols_ = bottomCols;
+    hasAny = true;
+  }
+
+  long sortCol = 0;
+  bool sortAsc = true;
+  if (cfg.Read(base + "/sort/top/col", &sortCol)) {
+    pendingTopSortCol_ = static_cast<int>(sortCol);
+    hasAny = true;
+  }
+  if (cfg.Read(base + "/sort/top/asc", &sortAsc)) {
+    pendingTopSortAsc_ = sortAsc;
+    hasAny = true;
+  }
+  sortCol = 0;
+  sortAsc = true;
+  if (cfg.Read(base + "/sort/bottom/col", &sortCol)) {
+    pendingBottomSortCol_ = static_cast<int>(sortCol);
+    hasAny = true;
+  }
+  if (cfg.Read(base + "/sort/bottom/asc", &sortAsc)) {
+    pendingBottomSortAsc_ = sortAsc;
+    hasAny = true;
+  }
+
+  if (!hasAny) {
+    if (showNoDefaultMessage) {
+      wxMessageBox("No default view has been saved yet.", "Quarry", wxOK | wxICON_INFORMATION, this);
+    }
+    return false;
+  }
+
+  if (applyToPanes) {
+    InitPanelsIfNeeded();
+    if (quad_) {
+      if (pendingVSash_) quad_->SetVerticalSashPosition(*pendingVSash_);
+      if (pendingHSash_) quad_->SetHorizontalSashPosition(*pendingHSash_);
+    }
+    if (top_) {
+      if (pendingTopCols_) top_->SetListColumnWidths(*pendingTopCols_);
+      if (pendingTopSortCol_ || pendingTopSortAsc_) {
+        top_->SetSort(pendingTopSortCol_.value_or(0), pendingTopSortAsc_.value_or(true));
+      }
+    }
+    if (bottom_) {
+      if (pendingBottomCols_) bottom_->SetListColumnWidths(*pendingBottomCols_);
+      if (pendingBottomSortCol_ || pendingBottomSortAsc_) {
+        bottom_->SetSort(pendingBottomSortCol_.value_or(0), pendingBottomSortAsc_.value_or(true));
+      }
+    }
+    Layout();
+  }
+
+  return true;
 }
 
 void MainFrame::TransferDroppedPaths(FilePanel* target,
@@ -959,6 +1210,20 @@ FilePanel* MainFrame::GetInactivePanel() const {
 
 void MainFrame::OnQuit(wxCommandEvent&) { Close(true); }
 
+void MainFrame::OnAbout(wxCommandEvent&) {
+#ifdef QUARRY_VERSION
+  const wxString version = QUARRY_VERSION;
+#else
+  const wxString version = "dev";
+#endif
+
+  wxAboutDialogInfo info;
+  info.SetName("Quarry");
+  info.SetVersion(version);
+  info.SetDescription("Dual-pane file manager.");
+  wxAboutBox(info, this);
+}
+
 void MainFrame::OnRefresh(wxCommandEvent&) {
   InitPanelsIfNeeded();
   if (top_) top_->RefreshListing();
@@ -985,6 +1250,245 @@ void MainFrame::OnConnectToServer(wxCommandEvent&) {
     active->SetDirectory(uri);
     active->FocusPrimary();
   }
+
+  // Keep both sidebars in sync (e.g., Network group / recent hosts).
+  if (top_) top_->RefreshTree();
+  if (bottom_) bottom_->RefreshTree();
+}
+
+void MainFrame::OnConnectionsManager(wxCommandEvent&) {
+  InitPanelsIfNeeded();
+  if (!top_ || !bottom_) return;
+
+  wxDialog dlg(this, wxID_ANY, "Connections", wxDefaultPosition, wxSize(760, 420),
+               wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER);
+  auto* root = new wxBoxSizer(wxVERTICAL);
+  dlg.SetSizer(root);
+
+  auto* split = new wxSplitterWindow(&dlg, wxID_ANY);
+  split->SetSashGravity(0.0);
+  split->SetMinimumPaneSize(220);
+
+  auto* left = new wxPanel(split);
+  auto* right = new wxPanel(split);
+  split->SplitVertically(left, right, 260);
+  root->Add(split, 1, wxEXPAND | wxALL, 10);
+
+  auto* leftSizer = new wxBoxSizer(wxVERTICAL);
+  left->SetSizer(leftSizer);
+  auto* list = new wxListBox(left, wxID_ANY);
+  leftSizer->Add(list, 1, wxEXPAND);
+
+  auto* rightSizer = new wxBoxSizer(wxVERTICAL);
+  right->SetSizer(rightSizer);
+
+  auto* form = new wxFlexGridSizer(2, 8, 8);
+  form->AddGrowableCol(1, 1);
+  rightSizer->Add(form, 0, wxEXPAND | wxALL, 8);
+
+  auto* nameCtrl = new wxTextCtrl(right, wxID_ANY);
+  wxArrayString types;
+  types.Add("SMB (Windows Share)");
+  types.Add("SSH (SFTP)");
+  types.Add("FTP");
+  types.Add("WebDAV");
+  types.Add("WebDAV (HTTPS)");
+  types.Add("AFP");
+  auto* typeCtrl = new wxChoice(right, wxID_ANY, wxDefaultPosition, wxDefaultSize, types);
+  typeCtrl->SetSelection(0);
+  auto* serverCtrl = new wxTextCtrl(right, wxID_ANY);
+  auto* portCtrl = new wxSpinCtrl(right, wxID_ANY);
+  portCtrl->SetRange(0, 65535);
+  portCtrl->SetValue(0);
+  auto* folderCtrl = new wxTextCtrl(right, wxID_ANY);
+  auto* userCtrl = new wxTextCtrl(right, wxID_ANY);
+  auto* passCtrl = new wxTextCtrl(right, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, wxTE_PASSWORD);
+  auto* rememberCtrl = new wxCheckBox(right, wxID_ANY, "Remember this password");
+  rememberCtrl->SetValue(false);
+
+  form->Add(new wxStaticText(right, wxID_ANY, "Name:"), 0, wxALIGN_CENTER_VERTICAL);
+  form->Add(nameCtrl, 1, wxEXPAND);
+  form->Add(new wxStaticText(right, wxID_ANY, "Type:"), 0, wxALIGN_CENTER_VERTICAL);
+  form->Add(typeCtrl, 1, wxEXPAND);
+  form->Add(new wxStaticText(right, wxID_ANY, "Server:"), 0, wxALIGN_CENTER_VERTICAL);
+  form->Add(serverCtrl, 1, wxEXPAND);
+  form->Add(new wxStaticText(right, wxID_ANY, "Port:"), 0, wxALIGN_CENTER_VERTICAL);
+  form->Add(portCtrl, 1, wxEXPAND);
+  form->Add(new wxStaticText(right, wxID_ANY, "Folder:"), 0, wxALIGN_CENTER_VERTICAL);
+  form->Add(folderCtrl, 1, wxEXPAND);
+  form->Add(new wxStaticText(right, wxID_ANY, "User name:"), 0, wxALIGN_CENTER_VERTICAL);
+  form->Add(userCtrl, 1, wxEXPAND);
+  form->Add(new wxStaticText(right, wxID_ANY, "Password:"), 0, wxALIGN_CENTER_VERTICAL);
+  form->Add(passCtrl, 1, wxEXPAND);
+  rightSizer->Add(rememberCtrl, 0, wxLEFT | wxRIGHT | wxBOTTOM, 12);
+
+  auto* btnRow = new wxBoxSizer(wxHORIZONTAL);
+  auto* newBtn = new wxButton(&dlg, wxID_ANY, "New");
+  auto* delBtn = new wxButton(&dlg, wxID_ANY, "Delete");
+  auto* saveBtn = new wxButton(&dlg, wxID_ANY, "Save Changes");
+  auto* connectBtn = new wxButton(&dlg, wxID_ANY, "Connect");
+  auto* closeBtn = new wxButton(&dlg, wxID_CLOSE, "Close");
+  btnRow->Add(newBtn, 0, wxRIGHT, 8);
+  btnRow->Add(delBtn, 0, wxRIGHT, 16);
+  btnRow->Add(saveBtn, 0, wxRIGHT, 8);
+  btnRow->Add(connectBtn, 0, wxRIGHT, 8);
+  btnRow->AddStretchSpacer(1);
+  btnRow->Add(closeBtn, 0);
+  root->Add(btnRow, 0, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 10);
+
+  auto conns = connections::LoadAll();
+  std::vector<std::string> ids;
+  ids.reserve(conns.size());
+  list->Clear();
+  for (const auto& c : conns) {
+    ids.push_back(c.id);
+    list->Append(wxString::FromUTF8(c.name));
+  }
+
+  auto typeIndexFromType = [](connections::Type t) -> int {
+    switch (t) {
+      case connections::Type::SMB: return 0;
+      case connections::Type::SSH: return 1;
+      case connections::Type::FTP: return 2;
+      case connections::Type::WebDAV: return 3;
+      case connections::Type::WebDAVS: return 4;
+      case connections::Type::AFP: return 5;
+      default: return 0;
+    }
+  };
+  auto typeFromIndex = [](int sel) -> connections::Type {
+    switch (sel) {
+      case 0: return connections::Type::SMB;
+      case 1: return connections::Type::SSH;
+      case 2: return connections::Type::FTP;
+      case 3: return connections::Type::WebDAV;
+      case 4: return connections::Type::WebDAVS;
+      case 5: return connections::Type::AFP;
+      default: return connections::Type::Unknown;
+    }
+  };
+
+  auto defaultPortForSelection = [](int sel) -> int {
+    switch (sel) {
+      case 1: return 22;
+      case 2: return 21;
+      case 3: return 80;
+      case 4: return 443;
+      default: return 0;
+    }
+  };
+  bool portTouched = false;
+  portCtrl->Bind(wxEVT_SPINCTRL, [&portTouched](wxSpinEvent&) { portTouched = true; });
+  portCtrl->Bind(wxEVT_TEXT, [&portTouched](wxCommandEvent&) { portTouched = true; });
+  typeCtrl->Bind(wxEVT_CHOICE, [&](wxCommandEvent&) {
+    const int sel = typeCtrl->GetSelection();
+    const int def = defaultPortForSelection(sel);
+    if (!portTouched || portCtrl->GetValue() == 0) {
+      portCtrl->SetValue(def);
+      portTouched = false;
+    }
+  });
+
+  auto loadToForm = [&](const connections::Connection& c) {
+    nameCtrl->ChangeValue(wxString::FromUTF8(c.name));
+    typeCtrl->SetSelection(typeIndexFromType(c.type));
+    serverCtrl->ChangeValue(wxString::FromUTF8(c.server));
+    portCtrl->SetValue(c.port);
+    folderCtrl->ChangeValue(wxString::FromUTF8(c.folder));
+    userCtrl->ChangeValue(wxString::FromUTF8(c.username));
+    passCtrl->ChangeValue("");
+    rememberCtrl->SetValue(c.rememberPassword);
+    portTouched = false;
+  };
+
+  auto currentId = std::string{};
+  list->Bind(wxEVT_LISTBOX, [&](wxCommandEvent&) {
+    const int sel = list->GetSelection();
+    if (sel == wxNOT_FOUND) return;
+    currentId = ids[static_cast<size_t>(sel)];
+    const auto it = std::find_if(conns.begin(), conns.end(), [&](const auto& c) { return c.id == currentId; });
+    if (it != conns.end()) loadToForm(*it);
+  });
+
+  auto gatherFromForm = [&]() -> connections::Connection {
+    connections::Connection c;
+    c.id = currentId;
+    c.name = nameCtrl->GetValue().ToStdString();
+    c.type = typeFromIndex(typeCtrl->GetSelection());
+    c.server = serverCtrl->GetValue().ToStdString();
+    c.port = portCtrl->GetValue();
+    c.folder = folderCtrl->GetValue().ToStdString();
+    c.username = userCtrl->GetValue().ToStdString();
+    c.rememberPassword = rememberCtrl->GetValue();
+    return c;
+  };
+
+  auto refreshList = [&]() {
+    conns = connections::LoadAll();
+    ids.clear();
+    ids.reserve(conns.size());
+    list->Clear();
+    for (const auto& c : conns) {
+      ids.push_back(c.id);
+      list->Append(wxString::FromUTF8(c.name));
+    }
+  };
+
+  newBtn->Bind(wxEVT_BUTTON, [&](wxCommandEvent&) {
+    currentId.clear();
+    nameCtrl->ChangeValue("New Connection");
+    typeCtrl->SetSelection(0);
+    serverCtrl->ChangeValue("");
+    portCtrl->SetValue(0);
+    folderCtrl->ChangeValue("");
+    userCtrl->ChangeValue("");
+    passCtrl->ChangeValue("");
+    rememberCtrl->SetValue(false);
+    portTouched = false;
+  });
+
+  delBtn->Bind(wxEVT_BUTTON, [&](wxCommandEvent&) {
+    if (currentId.empty()) return;
+    connections::Remove(currentId);
+    currentId.clear();
+    refreshList();
+  });
+
+  saveBtn->Bind(wxEVT_BUTTON, [&](wxCommandEvent&) {
+    auto c = gatherFromForm();
+    if (c.name.empty() || c.server.empty()) {
+      wxMessageBox("Name and server are required.", "Quarry", wxOK | wxICON_INFORMATION, &dlg);
+      return;
+    }
+    currentId = connections::Upsert(std::move(c));
+    refreshList();
+  });
+
+  connectBtn->Bind(wxEVT_BUTTON, [&](wxCommandEvent&) {
+    auto c = gatherFromForm();
+    if (c.server.empty()) return;
+    const auto uri = connections::BuildUri(c);
+    if (!c.username.empty() || !passCtrl->GetValue().IsEmpty()) {
+      GetActivePanel()->SeedMountCredentials(uri,
+                                            c.username,
+                                            passCtrl->GetValue().ToStdString(),
+                                            /*rememberForever=*/rememberCtrl->GetValue());
+    }
+    GetActivePanel()->SetDirectory(uri);
+    GetActivePanel()->FocusPrimary();
+  });
+
+  closeBtn->Bind(wxEVT_BUTTON, [&](wxCommandEvent&) { dlg.EndModal(wxID_CLOSE); });
+
+  if (!conns.empty()) {
+    list->SetSelection(0);
+    currentId = ids[0];
+    loadToForm(conns[0]);
+  }
+
+  dlg.Layout();
+  dlg.CentreOnParent();
+  dlg.ShowModal();
 }
 
 void MainFrame::OnCopy(wxCommandEvent&) {

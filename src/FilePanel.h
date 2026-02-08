@@ -1,7 +1,9 @@
 #pragma once
 
 #include <filesystem>
+#include <array>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -18,6 +20,11 @@ class wxBitmapButton;
 class wxPanel;
 class wxTreeCtrl;
 class wxWindow;
+class wxProcess;
+
+struct WxProcessDeleter {
+  void operator()(wxProcess* p) const;
+};
 
 class FilePanel final {
 public:
@@ -70,6 +77,14 @@ public:
       std::function<void(const std::filesystem::path& dir, bool treeChanged)> onChanged);
   void BindDropFiles(std::function<void(const std::vector<std::filesystem::path>& paths, bool move)> onDrop);
 
+  std::array<int, 4> GetListColumnWidths() const;
+  void SetListColumnWidths(const std::array<int, 4>& widths);
+
+  // Sorting preferences: 0=Name, 1=Size, 2=Type, 3=Modified.
+  int GetSortColumnIndex() const;
+  bool IsSortAscending() const { return sortAscending_; }
+  void SetSort(int columnIndex, bool ascending);
+
 private:
   enum class ListingMode { Directory, Recent, Gio };
   enum class SortColumn { Name, Type, Size, Modified };
@@ -112,6 +127,9 @@ private:
   void SetStatus(const wxString& message);
   void Populate(const std::vector<Entry>& entries);
   wxWindow* DialogParent() const;
+  bool IsExtractableArchivePath(const std::filesystem::path& path) const;
+  void ExtractArchiveTo(const std::filesystem::path& archivePath, const std::filesystem::path& dstDir);
+  bool HasCommand(const wxString& name) const;
 
   wxPanel* sidebarRoot_{nullptr};
   wxPanel* listRoot_{nullptr};
@@ -163,4 +181,6 @@ private:
   wxTreeItemId videosRoot_{};
   wxTreeItemId recentRoot_{};
   wxTreeItemId trashRoot_{};
+
+  std::vector<std::unique_ptr<wxProcess, WxProcessDeleter>> extractProcs_{};
 };

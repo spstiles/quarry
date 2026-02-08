@@ -2,6 +2,7 @@
 
 #include "MainFrame.h"
 #include "NavIcons.h"
+#include "Connections.h"
 #include "util.h"
 
 #include <algorithm>
@@ -16,6 +17,7 @@
 #include <set>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <system_error>
 
 #include <wx/button.h>
@@ -32,11 +34,13 @@
 #include <wx/imaglist.h>
 #include <wx/menu.h>
 #include <wx/msgdlg.h>
+#include <wx/process.h>
 #include <wx/progdlg.h>
 #include <wx/settings.h>
 #include <wx/splitter.h>
 #include <wx/sizer.h>
 #include <wx/stattext.h>
+#include <wx/dirdlg.h>
 #include <wx/textctrl.h>
 #include <wx/textdlg.h>
 #include <wx/time.h>
@@ -247,16 +251,29 @@ bool AddRecentHost(const std::string& uri) {
   // De-dupe by canonical key (case-insensitive host).
   auto it = std::find_if(g_recentHosts.begin(), g_recentHosts.end(),
                          [&](const RecentHostEntry& e) { return e.key == *root; });
+
+  bool changed = false;
   if (it != g_recentHosts.end()) {
     // Prefer the display with "more" uppercase characters (usually from network discovery).
-    if (UppercaseCount(display) > UppercaseCount(it->display)) it->display = display;
+    if (UppercaseCount(display) > UppercaseCount(it->display)) {
+      it->display = display;
+      changed = true;
+    }
     display = it->display;
-    g_recentHosts.erase(it);
+
+    const bool alreadyFront = (it == g_recentHosts.begin());
+    if (!alreadyFront) {
+      g_recentHosts.erase(it);
+      g_recentHosts.insert(g_recentHosts.begin(), RecentHostEntry{.key = *root, .display = display});
+      changed = true;
+    }
+  } else {
+    g_recentHosts.insert(g_recentHosts.begin(), RecentHostEntry{.key = *root, .display = display});
+    changed = true;
   }
 
-  g_recentHosts.insert(g_recentHosts.begin(), RecentHostEntry{.key = *root, .display = display});
   if (g_recentHosts.size() > 15) g_recentHosts.resize(15);
-  return true;
+  return changed;
 }
 
 bool LooksLikeUriPath(const fs::path& p) {
@@ -989,6 +1006,10 @@ void SetRowName(wxDataViewListCtrl* list, unsigned int row, const std::string& n
 
 enum MenuId : int {
   ID_CTX_OPEN = wxID_HIGHEST + 200,
+  ID_CTX_REFRESH,
+  ID_CTX_EXTRACT_HERE,
+  ID_CTX_EXTRACT_TO,
+  ID_CTX_SAVE_CONNECTION,
   ID_CTX_COPY,
   ID_CTX_CUT,
   ID_CTX_PASTE,
@@ -1065,6 +1086,8 @@ std::vector<FilePanel::Entry> ListDir(const fs::path& dir, std::string* errorMes
 }
 } // namespace
 
+void WxProcessDeleter::operator()(wxProcess* p) const { delete p; }
+
 void FilePanel::SeedMountCredentials(const std::string& uri,
                                      const std::string& username,
                                      const std::string& password,
@@ -1106,6 +1129,50 @@ wxWindow* FilePanel::DialogParent() const {
 void FilePanel::BindDropFiles(
     std::function<void(const std::vector<std::filesystem::path>& paths, bool move)> onDrop) {
   onDropFiles_ = std::move(onDrop);
+}
+
+std::array<int, 4> FilePanel::GetListColumnWidths() const {
+  std::array<int, 4> out{0, 0, 0, 0};
+  if (!list_) return out;
+  for (size_t i = 0; i < out.size() && i < list_->GetColumnCount(); i++) {
+    if (auto* col = list_->GetColumn(static_cast<unsigned int>(i))) out[i] = col->GetWidth();
+  }
+  return out;
+}
+
+void FilePanel::SetListColumnWidths(const std::array<int, 4>& widths) {
+  if (!list_) return;
+  for (size_t i = 0; i < widths.size() && i < list_->GetColumnCount(); i++) {
+    const int w = widths[i];
+    if (w > 0) {
+      if (auto* col = list_->GetColumn(static_cast<unsigned int>(i))) col->SetWidth(w);
+    }
+  }
+}
+
+int FilePanel::GetSortColumnIndex() const {
+  switch (sortColumn_) {
+    case SortColumn::Name: return 0;
+    case SortColumn::Size: return 1;
+    case SortColumn::Type: return 2;
+    case SortColumn::Modified: return 3;
+    default: return 0;
+  }
+}
+
+void FilePanel::SetSort(int columnIndex, bool ascending) {
+  SortColumn col = SortColumn::Name;
+  switch (columnIndex) {
+    case 0: col = SortColumn::Name; break;
+    case 1: col = SortColumn::Size; break;
+    case 2: col = SortColumn::Type; break;
+    case 3: col = SortColumn::Modified; break;
+    default: col = SortColumn::Name; break;
+  }
+
+  sortColumn_ = col;
+  sortAscending_ = ascending;
+  ResortListing();
 }
 
 void FilePanel::BuildLayout(wxWindow* sidebarParent, wxWindow* listParent) {
@@ -1603,14 +1670,18 @@ void FilePanel::OpenSelectedIfDir(wxDataViewEvent& event) {
 
   wxVariant typeVar;
   list_->GetValue(typeVar, row, COL_TYPE);
-  if (typeVar.GetString() != "Dir") return;
-
   wxVariant pathVar;
   list_->GetValue(pathVar, row, COL_FULLPATH);
   const auto p = pathVar.GetString().ToStdString();
   if (p.empty()) return;
 
-  NavigateTo(fs::path(p), /*recordHistory=*/true);
+  const auto path = fs::path(p);
+  if (typeVar.GetString() == "Dir") {
+    NavigateTo(path, /*recordHistory=*/true);
+    return;
+  }
+
+  wxLaunchDefaultApplication(path.string());
 }
 
 void FilePanel::OnTreeSelectionChanged() {
@@ -1837,6 +1908,8 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
           PopulateNetwork(networkRoot_);
           // Now that the host exists in the sidebar, sync selection to it (instead of the group header).
           SyncTreeToCurrentDir();
+          // Ensure the other pane can update its sidebar too.
+          NotifyDirContentsChanged(/*treeChanged=*/true);
         }
 
         if (UriScheme(effectiveUri) == "network") {
@@ -2791,9 +2864,26 @@ void FilePanel::PopulateNetwork(const wxTreeItemId& networkItem) {
                                         -1,
                                         new TreeNodeData(fs::path("network://")));
 
+  // Saved connections (persistent).
+  std::unordered_set<std::string> savedHostRoots;
+  const auto saved = connections::LoadAll();
+  for (const auto& c : saved) {
+    const auto uri = connections::BuildUri(c);
+    if (uri.empty()) continue;
+    if (auto root = HostRootForUri(uri)) savedHostRoots.insert(*root);
+    const auto label = c.name.empty() ? uri : c.name;
+    tree_->AppendItem(networkItem,
+                      wxString::FromUTF8(label),
+                      static_cast<int>(TreeIcon::Drive),
+                      -1,
+                      new TreeNodeData(fs::path(uri)));
+  }
+
   const auto& hosts = GetRecentHosts();
   for (const auto& h : hosts) {
     if (h.key.empty()) continue;
+    // Avoid duplicating saved connections with an extra "recent host" entry.
+    if (savedHostRoots.find(h.key) != savedHostRoots.end()) continue;
     tree_->AppendItem(networkItem,
                       wxString::FromUTF8(h.display),
                       static_cast<int>(TreeIcon::Drive),
@@ -2921,17 +3011,40 @@ void FilePanel::SyncTreeToCurrentDir() {
 
       if (uri.rfind("network://", 0) == 0 && browseNetworkRoot_.IsOk()) {
         best = browseNetworkRoot_;
-      } else if (auto root = HostRootForUri(uri)) {
+      } else {
+        // Prefer the most specific matching network shortcut (saved connection
+        // or recent host). This keeps selection stable for share-level saved
+        // entries like smb://host/share/ when browsing within the share.
+        size_t bestLen = 0;
         wxTreeItemIdValue ck;
         auto c = tree_->GetFirstChild(networkRoot_, ck);
         while (c.IsOk()) {
           if (auto* data = dynamic_cast<TreeNodeData*>(tree_->GetItemData(c))) {
-            if (data->kind == TreeNodeData::Kind::Path && data->path.string() == *root) {
-              best = c;
-              break;
+            if (data->kind == TreeNodeData::Kind::Path) {
+              const auto key = data->path.string();
+              if (!key.empty() && uri.rfind(key, 0) == 0 && key.size() > bestLen) {
+                best = c;
+                bestLen = key.size();
+              }
             }
           }
           c = tree_->GetNextChild(networkRoot_, ck);
+        }
+
+        // Fallback: match by host root (scheme://host/).
+        if (best == networkRoot_) {
+          if (auto root = HostRootForUri(uri)) {
+            c = tree_->GetFirstChild(networkRoot_, ck);
+            while (c.IsOk()) {
+              if (auto* data = dynamic_cast<TreeNodeData*>(tree_->GetItemData(c))) {
+                if (data->kind == TreeNodeData::Kind::Path && data->path.string() == *root) {
+                  best = c;
+                  break;
+                }
+              }
+              c = tree_->GetNextChild(networkRoot_, ck);
+            }
+          }
         }
       }
 
@@ -3031,6 +3144,11 @@ void FilePanel::ShowListContextMenu(wxDataViewEvent& event) {
 
   wxMenu menu;
   menu.Append(ID_CTX_OPEN, "Open");
+  menu.Append(ID_CTX_REFRESH, "Refresh");
+  menu.AppendSeparator();
+  menu.Append(ID_CTX_EXTRACT_HERE, "Extract Here");
+  menu.Append(ID_CTX_EXTRACT_TO, "Extract To...");
+  menu.Append(ID_CTX_SAVE_CONNECTION, "Save this share...");
   menu.AppendSeparator();
   menu.Append(ID_CTX_COPY, "Copy");
   menu.Append(ID_CTX_CUT, "Cut");
@@ -3046,18 +3164,52 @@ void FilePanel::ShowListContextMenu(wxDataViewEvent& event) {
 
   const auto selected = GetSelectedPaths();
   const bool hasSelection = !selected.empty();
+  const bool single = selected.size() == 1;
   const bool allowCopyPaste = listingMode_ == ListingMode::Directory || listingMode_ == ListingMode::Gio;
   const bool allowFsOps = listingMode_ == ListingMode::Directory;
+  const bool canExtract = allowFsOps && single && IsExtractableArchivePath(selected[0]);
+  const bool canSaveShare = (listingMode_ == ListingMode::Gio) && single;
   menu.Enable(ID_CTX_OPEN, hasSelection);
+  menu.Enable(ID_CTX_REFRESH, true);
+  menu.Enable(ID_CTX_EXTRACT_HERE, canExtract);
+  menu.Enable(ID_CTX_EXTRACT_TO, canExtract);
+  menu.Enable(ID_CTX_SAVE_CONNECTION, canSaveShare);
   menu.Enable(ID_CTX_COPY, allowCopyPaste && hasSelection);
   menu.Enable(ID_CTX_CUT, allowCopyPaste && hasSelection);
-  menu.Enable(ID_CTX_RENAME, allowFsOps && selected.size() == 1);
+  menu.Enable(ID_CTX_RENAME, allowFsOps && single);
   menu.Enable(ID_CTX_NEW_FOLDER, allowFsOps);
   menu.Enable(ID_CTX_TRASH, allowFsOps && hasSelection);
   menu.Enable(ID_CTX_DELETE_PERM, allowFsOps && hasSelection);
   menu.Enable(ID_CTX_PASTE, allowCopyPaste && g_clipboard && !g_clipboard->paths.empty());
 
   menu.Bind(wxEVT_MENU, [this](wxCommandEvent&) { OpenSelection(); }, ID_CTX_OPEN);
+  menu.Bind(wxEVT_MENU, [this](wxCommandEvent&) { RefreshAll(); }, ID_CTX_REFRESH);
+  menu.Bind(wxEVT_MENU, [this, selected](wxCommandEvent&) {
+    if (selected.size() != 1) return;
+    ExtractArchiveTo(selected[0], currentDir_);
+  }, ID_CTX_EXTRACT_HERE);
+  menu.Bind(wxEVT_MENU, [this, selected](wxCommandEvent&) {
+    if (selected.size() != 1) return;
+    wxDirDialog dlg(DialogParent(), "Extract to...", currentDir_.string(),
+                    wxDD_DEFAULT_STYLE | wxDD_DIR_MUST_EXIST);
+    if (dlg.ShowModal() != wxID_OK) return;
+    ExtractArchiveTo(selected[0], std::filesystem::path(dlg.GetPath().ToStdString()));
+  }, ID_CTX_EXTRACT_TO);
+  menu.Bind(wxEVT_MENU, [this, selected](wxCommandEvent&) {
+    if (selected.size() != 1) return;
+    const auto uri = selected[0].string();
+    auto c = connections::ParseUri(uri);
+    if (c.server.empty()) {
+      wxMessageBox("This item doesn't look like a remote share URI.", "Quarry", wxOK | wxICON_INFORMATION, DialogParent());
+      return;
+    }
+    wxTextEntryDialog nameDlg(DialogParent(), "Connection name:", "Save Connection", wxString::FromUTF8(uri));
+    if (nameDlg.ShowModal() != wxID_OK) return;
+    c.name = nameDlg.GetValue().ToStdString();
+    if (c.name.empty()) return;
+    connections::Upsert(std::move(c));
+    wxMessageBox("Saved.", "Quarry", wxOK | wxICON_INFORMATION, DialogParent());
+  }, ID_CTX_SAVE_CONNECTION);
   menu.Bind(wxEVT_MENU, [this](wxCommandEvent&) { CopySelection(); }, ID_CTX_COPY);
   menu.Bind(wxEVT_MENU, [this](wxCommandEvent&) { CutSelection(); }, ID_CTX_CUT);
   menu.Bind(wxEVT_MENU, [this](wxCommandEvent&) { PasteIntoCurrentDir(); }, ID_CTX_PASTE);
@@ -3068,6 +3220,131 @@ void FilePanel::ShowListContextMenu(wxDataViewEvent& event) {
   menu.Bind(wxEVT_MENU, [this](wxCommandEvent&) { ShowProperties(); }, ID_CTX_PROPERTIES);
 
   list_->PopupMenu(&menu);
+}
+
+bool FilePanel::HasCommand(const wxString& name) const {
+  // Safe: name is a fixed literal we control (no spaces).
+  const wxString cmd = wxString::Format("sh -lc 'command -v %s >/dev/null 2>&1'", name);
+  return wxExecute(cmd, wxEXEC_SYNC) == 0;
+}
+
+bool FilePanel::IsExtractableArchivePath(const fs::path& path) const {
+  if (path.empty()) return false;
+  std::error_code ec;
+  if (!fs::exists(path, ec) || fs::is_directory(path, ec)) return false;
+
+  auto extLower = [](std::string s) -> std::string {
+    for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+  };
+
+  const auto name = extLower(path.filename().string());
+  const auto endsWith = [&](const std::string& suffix) -> bool {
+    return name.size() >= suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
+  };
+
+  return endsWith(".zip") || endsWith(".7z") || endsWith(".tar") || endsWith(".tar.gz") || endsWith(".tgz") ||
+         endsWith(".tar.bz2") || endsWith(".tbz2") || endsWith(".tar.xz") || endsWith(".txz");
+}
+
+void FilePanel::ExtractArchiveTo(const fs::path& archivePath, const fs::path& dstDir) {
+  if (listingMode_ != ListingMode::Directory) {
+    wxMessageBox("Extract is only available for local files right now.",
+                 "Quarry",
+                 wxOK | wxICON_INFORMATION,
+                 DialogParent());
+    return;
+  }
+  if (archivePath.empty() || dstDir.empty()) return;
+
+  std::error_code ec;
+  if (!fs::exists(archivePath, ec) || fs::is_directory(archivePath, ec)) return;
+  if (!fs::exists(dstDir, ec) || !fs::is_directory(dstDir, ec)) return;
+
+  if (!IsExtractableArchivePath(archivePath)) {
+    wxMessageBox("Unsupported archive type.",
+                 "Quarry",
+                 wxOK | wxICON_INFORMATION,
+                 DialogParent());
+    return;
+  }
+
+  auto lower = [](std::string s) -> std::string {
+    for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+  };
+  const auto name = lower(archivePath.filename().string());
+
+  std::vector<std::string> args;
+  if (name.size() >= 4 && name.rfind(".zip") == name.size() - 4) {
+    if (HasCommand("unzip")) {
+      args = {"unzip", "-o", archivePath.string(), "-d", dstDir.string()};
+    } else if (HasCommand("bsdtar")) {
+      args = {"bsdtar", "-xf", archivePath.string(), "-C", dstDir.string()};
+    }
+  } else if (name.size() >= 3 && name.rfind(".7z") == name.size() - 3) {
+    if (HasCommand("7z")) {
+      args = {"7z", "x", "-y", "-o" + dstDir.string(), archivePath.string()};
+    }
+  } else {
+    // tar and tar.* variants.
+    if (HasCommand("tar")) {
+      args = {"tar", "-xf", archivePath.string(), "-C", dstDir.string()};
+    } else if (HasCommand("bsdtar")) {
+      args = {"bsdtar", "-xf", archivePath.string(), "-C", dstDir.string()};
+    }
+  }
+
+  if (args.empty()) {
+    wxMessageBox("No suitable extractor found (need tar/unzip/7z/bsdtar).",
+                 "Quarry",
+                 wxOK | wxICON_ERROR,
+                 DialogParent());
+    return;
+  }
+
+  if (statusText_) {
+    statusText_->SetLabel(wxString::Format("Extracting: %s", archivePath.filename().string()));
+    statusText_->Refresh();
+  }
+
+  std::unique_ptr<wxProcess, WxProcessDeleter> proc(new wxProcess());
+  wxProcess* procRaw = proc.get();
+  procRaw->Bind(wxEVT_END_PROCESS, [this, procRaw](wxProcessEvent& e) {
+    const int code = e.GetExitCode();
+    // Remove proc from tracking vector.
+    extractProcs_.erase(std::remove_if(extractProcs_.begin(),
+                                      extractProcs_.end(),
+                                      [procRaw](const auto& p) { return p.get() == procRaw; }),
+                        extractProcs_.end());
+
+    RefreshAll();
+    RefreshTree();
+    NotifyDirContentsChanged(true);
+
+    if (code != 0) {
+      wxMessageBox(wxString::Format("Extract failed (exit code %d).", code),
+                   "Quarry",
+                   wxOK | wxICON_ERROR,
+                   DialogParent());
+    }
+  });
+
+  std::vector<const char*> argv;
+  argv.reserve(args.size() + 1);
+  for (const auto& s : args) argv.push_back(s.c_str());
+  argv.push_back(nullptr);
+
+  long pid = wxExecute(argv.data(), wxEXEC_ASYNC, procRaw);
+  if (pid == 0) {
+    wxMessageBox("Failed to start extractor.",
+                 "Quarry",
+                 wxOK | wxICON_ERROR,
+                 DialogParent());
+    return;
+  }
+
+  extractProcs_.push_back(std::move(proc));
 }
 
 bool FilePanel::AnySelectedDirs() const {
