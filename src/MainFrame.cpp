@@ -79,6 +79,12 @@ public:
     return ids_[static_cast<size_t>(sel)];
   }
 
+  void ClearSelection() {
+    if (GetSelection() == wxNOT_FOUND) return;
+    SetSelection(wxNOT_FOUND);
+    RefreshAll();
+  }
+
 protected:
   wxCoord OnMeasureItem(size_t) const override {
     const int ch = GetCharHeight();
@@ -1277,6 +1283,39 @@ void MainFrame::CopyMoveWithProgressInternal(const wxString& title,
     UpdateQueueUi();
   });
   fileOp_->clearQueueBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { opQueue_.clear(); UpdateQueueUi(); });
+
+  auto bindOutsideQueueDeselect = [this](wxWindow* w) {
+    if (!w) return;
+    w->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& e) {
+      if (!fileOp_ || !fileOp_->queueList) {
+        e.Skip();
+        return;
+      }
+      wxWindow* obj = dynamic_cast<wxWindow*>(e.GetEventObject());
+      if (obj) {
+        if (obj == fileOp_->queueList || obj->IsDescendant(fileOp_->queueList)) {
+          e.Skip();
+          return;
+        }
+        if (fileOp_->cancelQueuedBtn && (obj == fileOp_->cancelQueuedBtn || obj->IsDescendant(fileOp_->cancelQueuedBtn))) {
+          e.Skip();
+          return;
+        }
+        if (fileOp_->clearQueueBtn && (obj == fileOp_->clearQueueBtn || obj->IsDescendant(fileOp_->clearQueueBtn))) {
+          e.Skip();
+          return;
+        }
+      }
+      fileOp_->queueList->ClearSelection();
+      e.Skip();
+    });
+  };
+
+  bindOutsideQueueDeselect(fileOp_->dlg);
+  bindOutsideQueueDeselect(fileOp_->notebook);
+  bindOutsideQueueDeselect(fileOp_->progressPanel);
+  bindOutsideQueueDeselect(fileOp_->queuePanel);
+
   UpdateQueueUi(); // show Queue tab only when needed
 
   // wxTimer events are delivered to the timer owner (not the wxTimer object).
@@ -1670,6 +1709,40 @@ void MainFrame::TrashWithProgressInternal(const std::vector<std::filesystem::pat
     UpdateQueueUi();
   });
   fileOp_->clearQueueBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { opQueue_.clear(); UpdateQueueUi(); });
+
+  auto bindOutsideQueueDeselect = [this](wxWindow* w) {
+    if (!w) return;
+    w->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& e) {
+      if (!fileOp_ || !fileOp_->queueList) {
+        e.Skip();
+        return;
+      }
+      wxWindow* obj = dynamic_cast<wxWindow*>(e.GetEventObject());
+      if (obj) {
+        if (obj == fileOp_->queueList || obj->IsDescendant(fileOp_->queueList)) {
+          e.Skip();
+          return;
+        }
+        if (fileOp_->cancelQueuedBtn &&
+            (obj == fileOp_->cancelQueuedBtn || obj->IsDescendant(fileOp_->cancelQueuedBtn))) {
+          e.Skip();
+          return;
+        }
+        if (fileOp_->clearQueueBtn && (obj == fileOp_->clearQueueBtn || obj->IsDescendant(fileOp_->clearQueueBtn))) {
+          e.Skip();
+          return;
+        }
+      }
+      fileOp_->queueList->ClearSelection();
+      e.Skip();
+    });
+  };
+
+  bindOutsideQueueDeselect(fileOp_->dlg);
+  bindOutsideQueueDeselect(fileOp_->notebook);
+  bindOutsideQueueDeselect(fileOp_->progressPanel);
+  bindOutsideQueueDeselect(fileOp_->queuePanel);
+
   UpdateQueueUi(); // show Queue tab only when needed
 
   fileOp_->timerId = wxWindow::NewControlId();
@@ -1933,6 +2006,40 @@ void MainFrame::DeleteWithProgressInternal(const std::vector<std::filesystem::pa
     UpdateQueueUi();
   });
   fileOp_->clearQueueBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { opQueue_.clear(); UpdateQueueUi(); });
+
+  auto bindOutsideQueueDeselect = [this](wxWindow* w) {
+    if (!w) return;
+    w->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& e) {
+      if (!fileOp_ || !fileOp_->queueList) {
+        e.Skip();
+        return;
+      }
+      wxWindow* obj = dynamic_cast<wxWindow*>(e.GetEventObject());
+      if (obj) {
+        if (obj == fileOp_->queueList || obj->IsDescendant(fileOp_->queueList)) {
+          e.Skip();
+          return;
+        }
+        if (fileOp_->cancelQueuedBtn &&
+            (obj == fileOp_->cancelQueuedBtn || obj->IsDescendant(fileOp_->cancelQueuedBtn))) {
+          e.Skip();
+          return;
+        }
+        if (fileOp_->clearQueueBtn && (obj == fileOp_->clearQueueBtn || obj->IsDescendant(fileOp_->clearQueueBtn))) {
+          e.Skip();
+          return;
+        }
+      }
+      fileOp_->queueList->ClearSelection();
+      e.Skip();
+    });
+  };
+
+  bindOutsideQueueDeselect(fileOp_->dlg);
+  bindOutsideQueueDeselect(fileOp_->notebook);
+  bindOutsideQueueDeselect(fileOp_->progressPanel);
+  bindOutsideQueueDeselect(fileOp_->queuePanel);
+
   UpdateQueueUi(); // show Queue tab only when needed
 
   fileOp_->timerId = wxWindow::NewControlId();
@@ -2140,6 +2247,40 @@ void MainFrame::ExtractWithProgress(const std::vector<std::string>& argv,
     UpdateQueueUi();
   });
   fileOp_->clearQueueBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { opQueue_.clear(); UpdateQueueUi(); });
+
+  auto bindOutsideQueueDeselect = [this](wxWindow* w) {
+    if (!w) return;
+    w->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& e) {
+      if (!fileOp_ || !fileOp_->queueList) {
+        e.Skip();
+        return;
+      }
+      wxWindow* obj = dynamic_cast<wxWindow*>(e.GetEventObject());
+      if (obj) {
+        if (obj == fileOp_->queueList || obj->IsDescendant(fileOp_->queueList)) {
+          e.Skip();
+          return;
+        }
+        if (fileOp_->cancelQueuedBtn &&
+            (obj == fileOp_->cancelQueuedBtn || obj->IsDescendant(fileOp_->cancelQueuedBtn))) {
+          e.Skip();
+          return;
+        }
+        if (fileOp_->clearQueueBtn && (obj == fileOp_->clearQueueBtn || obj->IsDescendant(fileOp_->clearQueueBtn))) {
+          e.Skip();
+          return;
+        }
+      }
+      fileOp_->queueList->ClearSelection();
+      e.Skip();
+    });
+  };
+
+  bindOutsideQueueDeselect(fileOp_->dlg);
+  bindOutsideQueueDeselect(fileOp_->notebook);
+  bindOutsideQueueDeselect(fileOp_->progressPanel);
+  bindOutsideQueueDeselect(fileOp_->queuePanel);
+
   UpdateQueueUi(); // show Queue tab only when needed
 
   fileOp_->timerId = wxWindow::NewControlId();
