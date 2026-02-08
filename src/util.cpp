@@ -1,10 +1,12 @@
 #include "util.h"
 
 #include <chrono>
+#include <atomic>
 #include <ctime>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <thread>
 #include <system_error>
 
 #include <wx/msgdlg.h>
@@ -32,6 +34,7 @@ struct GioProgressCtx {
   const CancelFn* shouldCancel{nullptr};
   const CopyProgressFn* onProgress{nullptr};
   const CopyBytesProgressFn* onBytes{nullptr};
+  GCancellable* cancellable{nullptr};
   std::uintmax_t lastBytes{0};
   std::string label{};
 };
@@ -42,6 +45,12 @@ void GioProgressCallback(goffset current_num_bytes,
   (void)total_num_bytes;
   auto* ctx = static_cast<GioProgressCtx*>(user_data);
   if (!ctx) return;
+
+  if (ctx->shouldCancel && *ctx->shouldCancel && (*ctx->shouldCancel)()) {
+    if (ctx->cancellable) g_cancellable_cancel(ctx->cancellable);
+    return;
+  }
+
   const std::uintmax_t cur = current_num_bytes > 0 ? static_cast<std::uintmax_t>(current_num_bytes) : 0;
   if (cur >= ctx->lastBytes) {
     const auto delta = cur - ctx->lastBytes;
@@ -192,6 +201,7 @@ OpResult GioCopyRecursive(GFile* src,
         ctx.shouldCancel = &shouldCancel;
         ctx.onProgress = &onProgress;
         ctx.onBytes = &onBytes;
+        ctx.cancellable = cancellable;
         ctx.lastBytes = 0;
         ctx.label = name;
 
@@ -237,6 +247,7 @@ OpResult GioCopyRecursive(GFile* src,
   ctx.shouldCancel = &shouldCancel;
   ctx.onProgress = &onProgress;
   ctx.onBytes = &onBytes;
+  ctx.cancellable = cancellable;
   ctx.lastBytes = 0;
   if (src) {
     char* b = g_file_get_basename(src);
@@ -276,10 +287,27 @@ OpResult GioMoveAny(const std::string& srcStr,
   GFile* src = g_file_new_for_commandline_arg(srcStr.c_str());
   GFile* dst = g_file_new_for_commandline_arg(dstStr.c_str());
 
+  std::atomic_bool done{false};
+  std::thread cancelWatcher;
+  if (shouldCancel) {
+    cancelWatcher = std::thread([&done, cancellable, &shouldCancel]() {
+      using namespace std::chrono_literals;
+      while (!done.load()) {
+        if (shouldCancel()) {
+          g_cancellable_cancel(cancellable);
+          break;
+        }
+        std::this_thread::sleep_for(50ms);
+      }
+    });
+  }
+
   if (IsCanceled(shouldCancel)) {
     g_cancellable_cancel(cancellable);
     g_object_unref(src);
     g_object_unref(dst);
+    done.store(true);
+    if (cancelWatcher.joinable()) cancelWatcher.join();
     g_object_unref(cancellable);
     return CanceledResult();
   }
@@ -288,6 +316,7 @@ OpResult GioMoveAny(const std::string& srcStr,
   ctx.shouldCancel = &shouldCancel;
   ctx.onProgress = &onProgress;
   ctx.onBytes = &onBytes;
+  ctx.cancellable = cancellable;
   ctx.lastBytes = 0;
 
   GError* moveErr = nullptr;
@@ -306,6 +335,8 @@ OpResult GioMoveAny(const std::string& srcStr,
       g_error_free(moveErr);
       g_object_unref(src);
       g_object_unref(dst);
+      done.store(true);
+      if (cancelWatcher.joinable()) cancelWatcher.join();
       g_object_unref(cancellable);
       return CanceledResult();
     }
@@ -316,12 +347,16 @@ OpResult GioMoveAny(const std::string& srcStr,
       if (!copyRes.ok) {
         g_object_unref(src);
         g_object_unref(dst);
+        done.store(true);
+        if (cancelWatcher.joinable()) cancelWatcher.join();
         g_object_unref(cancellable);
         return copyRes;
       }
       const auto delRes = GioDeleteRecursive(src, cancellable);
       g_object_unref(src);
       g_object_unref(dst);
+      done.store(true);
+      if (cancelWatcher.joinable()) cancelWatcher.join();
       g_object_unref(cancellable);
       return delRes;
     }
@@ -330,12 +365,16 @@ OpResult GioMoveAny(const std::string& srcStr,
     if (moveErr) g_error_free(moveErr);
     g_object_unref(src);
     g_object_unref(dst);
+    done.store(true);
+    if (cancelWatcher.joinable()) cancelWatcher.join();
     g_object_unref(cancellable);
     return {.ok = false, .message = msg};
   }
 
   g_object_unref(src);
   g_object_unref(dst);
+  done.store(true);
+  if (cancelWatcher.joinable()) cancelWatcher.join();
   g_object_unref(cancellable);
   return {.ok = true};
 }
@@ -348,9 +387,27 @@ OpResult GioCopyAny(const std::string& srcStr,
   GCancellable* cancellable = g_cancellable_new();
   GFile* src = g_file_new_for_commandline_arg(srcStr.c_str());
   GFile* dst = g_file_new_for_commandline_arg(dstStr.c_str());
+
+  std::atomic_bool done{false};
+  std::thread cancelWatcher;
+  if (shouldCancel) {
+    cancelWatcher = std::thread([&done, cancellable, &shouldCancel]() {
+      using namespace std::chrono_literals;
+      while (!done.load()) {
+        if (shouldCancel()) {
+          g_cancellable_cancel(cancellable);
+          break;
+        }
+        std::this_thread::sleep_for(50ms);
+      }
+    });
+  }
+
   const auto res = GioCopyRecursive(src, dst, cancellable, shouldCancel, onProgress, onBytes);
   g_object_unref(src);
   g_object_unref(dst);
+  done.store(true);
+  if (cancelWatcher.joinable()) cancelWatcher.join();
   g_object_unref(cancellable);
   return res;
 }
@@ -685,6 +742,20 @@ fs::path JoinDirAndNameAny(const fs::path& dir, const std::string& name) {
 }
 
 OpResult DeletePath(const fs::path& src) {
+  const auto srcStr = src.string();
+  if (LooksLikeUriString(srcStr)) {
+#ifdef QUARRY_USE_GIO
+    GCancellable* cancellable = g_cancellable_new();
+    GFile* file = g_file_new_for_commandline_arg(srcStr.c_str());
+    const auto res = GioDeleteRecursive(file, cancellable);
+    g_object_unref(file);
+    g_object_unref(cancellable);
+    return res;
+#else
+    return {.ok = false, .message = "Network delete is not available (built without GIO)."};
+#endif
+  }
+
   std::error_code ec;
   fs::remove_all(src, ec);
   if (ec) return {.ok = false, .message = wxString::FromUTF8(ec.message())};
@@ -692,11 +763,44 @@ OpResult DeletePath(const fs::path& src) {
 }
 
 OpResult TrashPath(const fs::path& src) {
-  // Prefer the freedesktop Trash spec implementation via gio.
+  const auto srcStr = src.string();
+#ifdef QUARRY_USE_GIO
+  // Prefer gio's native trash API when available (works for local and some remote mounts).
+  GError* err = nullptr;
+  GFile* file = g_file_new_for_commandline_arg(srcStr.c_str());
+  const gboolean ok = g_file_trash(file, /*cancellable=*/nullptr, &err);
+  g_object_unref(file);
+  if (!ok) {
+    const bool fallback =
+        err && (g_error_matches(err, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED) ||
+                g_error_matches(err, G_IO_ERROR, G_IO_ERROR_NOT_MOUNTED));
+    const wxString msg = err ? wxString::FromUTF8(err->message) : "Trash failed.";
+    if (err) g_error_free(err);
+
+    if (!fallback) {
+      return {.ok = false, .message = msg};
+    }
+
+    // Some setups report NOT_SUPPORTED via g_file_trash() but the gio CLI can still
+    // succeed (depending on GVfs backend). Try it before giving up.
+    const wxString cmd0 = "gio";
+    const wxString cmd1 = "trash";
+    const wxString cmd2 = wxString(srcStr);
+    const wxChar* const argv[] = {cmd0.wc_str(), cmd1.wc_str(), cmd2.wc_str(), nullptr};
+    const long rc = wxExecute(argv, wxEXEC_SYNC);
+    if (rc == 0) return {.ok = true};
+    if (rc == -1) {
+      return {.ok = false, .message = msg + "\n\n(Also failed to run gio trash.)"};
+    }
+    return {.ok = false, .message = msg + wxString::Format("\n\n(gio trash exit code %ld)", rc)};
+  }
+  return {.ok = true};
+#else
+  // Fallback: freedesktop Trash spec implementation via gio command.
   // This is intentionally simple for the MVP.
   const wxString cmd0 = "gio";
   const wxString cmd1 = "trash";
-  const wxString cmd2 = wxString(src.string());
+  const wxString cmd2 = wxString(srcStr);
 
   const wxChar* const argv[] = {cmd0.wc_str(), cmd1.wc_str(), cmd2.wc_str(), nullptr};
   const long rc = wxExecute(argv, wxEXEC_SYNC);
@@ -707,4 +811,5 @@ OpResult TrashPath(const fs::path& src) {
     return {.ok = false, .message = wxString::Format("gio trash failed (exit code %ld)", rc)};
   }
   return {.ok = true};
+#endif
 }

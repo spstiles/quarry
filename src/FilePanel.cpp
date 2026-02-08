@@ -25,12 +25,14 @@
 #include <wx/bmpbuttn.h>
 #include <wx/checkbox.h>
 #include <wx/radiobox.h>
+#include <wx/dcclient.h>
 #include <wx/filefn.h>
 #include <wx/filename.h>
 #include <wx/choicdlg.h>
 #include <wx/artprov.h>
 #include <wx/dnd.h>
 #include <wx/dataobj.h>
+#include <wx/event.h>
 #include <wx/imaglist.h>
 #include <wx/menu.h>
 #include <wx/msgdlg.h>
@@ -1341,7 +1343,118 @@ void FilePanel::BindEvents() {
     }
     UpdateStatusText();
   });
-  list_->Bind(wxEVT_DATAVIEW_ITEM_CONTEXT_MENU, [this](wxDataViewEvent& e) { ShowListContextMenu(e); });
+  // Item context menu: this is the reliable event for right-clicking rows.
+  list_->Bind(wxEVT_DATAVIEW_ITEM_CONTEXT_MENU, [this](wxDataViewEvent& e) {
+    if (!list_) return;
+    if (suppressNextContextMenu_) {
+      suppressNextContextMenu_ = false;
+      return;
+    }
+
+    const wxPoint screenPos = wxGetMousePosition();
+    const wxPoint listClientPos = list_->ScreenToClient(screenPos);
+
+    wxDataViewColumn* nameCol = list_->GetColumn(COL_NAME);
+    bool onNameText = false;
+    if (nameCol) {
+      const wxRect nameRect = list_->GetItemRect(e.GetItem(), nameCol);
+      if (nameRect.width > 0 && nameRect.height > 0 && nameRect.Contains(listClientPos)) {
+        const int row = list_->ItemToRow(e.GetItem());
+        wxString name;
+        if (row >= 0) {
+          wxVariant nameVar;
+          list_->GetValue(nameVar, static_cast<unsigned int>(row), COL_NAME);
+          wxDataViewIconText iconText;
+          // We store Name as wxDataViewIconText; extract it from the variant
+          // rather than relying on GetTextValue(), which can be inconsistent on GTK.
+          iconText << nameVar;
+          name = iconText.GetText();
+        }
+
+        wxClientDC dc(list_->GetMainWindow() ? list_->GetMainWindow() : static_cast<wxWindow*>(list_));
+        dc.SetFont(list_->GetFont());
+        int textW = 0, textH = 0;
+        dc.GetTextExtent(name, &textW, &textH);
+
+        constexpr int kIconPad = 22;
+        constexpr int kExtraPad = 8;
+        const int textLeftX = nameRect.x + kIconPad;
+        const int textRightX = textLeftX + textW + kExtraPad;
+        // Some GTK themes/rows can report unexpectedly large text extents (and very
+        // long filenames can span most of the column). To keep the Nemo-like "right
+        // of name" background-menu behavior usable, cap the clickable "name text"
+        // region to a reasonable width from the left edge of the name cell.
+        const int capRightX = nameRect.x + std::min(nameRect.width, 320);
+        const int effectiveRightX = std::min(textRightX, capRightX);
+        onNameText = (listClientPos.x >= textLeftX && listClientPos.x <= effectiveRightX);
+      }
+    }
+
+    if (!onNameText) {
+      list_->UnselectAll();
+      renameArmedItem_ = wxDataViewItem();
+      renameArmedAtMs_ = 0;
+      UpdateStatusText();
+      ShowListContextMenu(wxDataViewItem(), screenPos, /*isBackgroundContext=*/true);
+      return;
+    }
+
+    ShowListContextMenu(e.GetItem(), screenPos, /*isBackgroundContext=*/false);
+  });
+
+  // On GTK, right-click on empty space can still auto-select something before the
+  // context menu event fires. Intercept the mouse-down on the main window and
+  // show our menu directly when the click isn't over an item.
+  if (auto* mainWin = list_->GetMainWindow()) {
+    mainWin->Bind(wxEVT_CONTEXT_MENU, [this, mainWin](wxContextMenuEvent& e) {
+      if (!list_) return;
+      if (suppressNextContextMenu_) {
+        suppressNextContextMenu_ = false;
+        return;
+      }
+
+      wxPoint screenPos = e.GetPosition();
+      if (screenPos == wxDefaultPosition) screenPos = wxGetMousePosition();
+      const wxPoint listClientPos = list_->ScreenToClient(screenPos);
+      wxDataViewItem hitItem;
+      wxDataViewColumn* hitCol = nullptr;
+      list_->HitTest(listClientPos, hitItem, hitCol);
+      if (hitItem.IsOk()) {
+        e.Skip();
+        return;
+      }
+
+      ShowListContextMenu(wxDataViewItem(), screenPos, /*isBackgroundContext=*/true);
+    });
+
+    mainWin->Bind(wxEVT_RIGHT_DOWN, [this, mainWin](wxMouseEvent& e) {
+      if (!list_) return;
+
+      const wxPoint screenPos = mainWin->ClientToScreen(e.GetPosition());
+      const wxPoint listClientPos = list_->ScreenToClient(screenPos);
+
+      wxDataViewItem hitItem;
+      wxDataViewColumn* hitCol = nullptr;
+      list_->HitTest(listClientPos, hitItem, hitCol);
+      if (hitItem.IsOk()) {
+        const wxRect rect = list_->GetItemRect(hitItem, hitCol);
+        if (rect.width > 0 && rect.height > 0 && !rect.Contains(listClientPos)) {
+          hitItem = wxDataViewItem();
+        }
+      }
+      if (!hitItem.IsOk()) {
+        suppressNextContextMenu_ = true;
+        list_->UnselectAll();
+        renameArmedItem_ = wxDataViewItem();
+        renameArmedAtMs_ = 0;
+        UpdateStatusText();
+        ShowListContextMenu(wxDataViewItem(), screenPos, /*isBackgroundContext=*/true);
+        return;  // don't let default selection logic run
+      }
+
+      e.Skip();
+    });
+  }
 
   list_->Bind(wxEVT_DATAVIEW_ITEM_BEGIN_DRAG, [this](wxDataViewEvent& e) {
     if (listingMode_ != ListingMode::Directory && listingMode_ != ListingMode::Gio) return;
@@ -2412,13 +2525,6 @@ void FilePanel::BeginInlineRename() {
 }
 
 void FilePanel::CreateFolder() {
-  if (listingMode_ != ListingMode::Directory) {
-    wxMessageBox("Create Folder is not available here.",
-                 "Quarry",
-                 wxOK | wxICON_INFORMATION,
-                 DialogParent());
-    return;
-  }
   const auto name =
       wxGetTextFromUser("Folder name:", "Create Folder", "", DialogParent()).ToStdString();
   if (name.empty()) return;
@@ -2427,17 +2533,101 @@ void FilePanel::CreateFolder() {
     return;
   }
 
-  std::error_code ec;
-  fs::create_directory(currentDir_ / name, ec);
-  if (ec) {
-    const wxString errWx = wxString::FromUTF8(ec.message());
-    wxMessageBox(wxString::Format("Create folder failed:\n\n%s", errWx.c_str()), "Create Folder",
-                 wxOK | wxICON_ERROR, DialogParent());
+  if (listingMode_ == ListingMode::Directory) {
+    std::error_code ec;
+    fs::create_directory(currentDir_ / name, ec);
+    if (ec) {
+      const wxString errWx = wxString::FromUTF8(ec.message());
+      wxMessageBox(wxString::Format("Create folder failed:\n\n%s", errWx.c_str()), "Create Folder",
+                   wxOK | wxICON_ERROR, DialogParent());
+      return;
+    }
+    RefreshAll();
+    RefreshTree();
+    NotifyDirContentsChanged(true);
     return;
   }
-  RefreshAll();
-  RefreshTree();
-  NotifyDirContentsChanged(true);
+
+  if (listingMode_ == ListingMode::Gio) {
+#ifdef QUARRY_USE_GIO
+    const std::string uri = currentDir_.string();
+    if (uri.empty() || IsBareSchemeUri(uri) || UriScheme(uri) == "network") {
+      wxMessageBox("Create Folder is not available here.",
+                   "Quarry",
+                   wxOK | wxICON_INFORMATION,
+                   DialogParent());
+      return;
+    }
+
+    auto tryCreate = [&](std::string* outErr) -> bool {
+      if (outErr) outErr->clear();
+      GError* gerr = nullptr;
+      GFile* base = g_file_new_for_uri(uri.c_str());
+      if (!base) {
+        if (outErr) *outErr = "Invalid URI.";
+        return false;
+      }
+      GFile* child = g_file_get_child(base, name.c_str());
+      if (!child) {
+        g_object_unref(base);
+        if (outErr) *outErr = "Unable to create destination URI.";
+        return false;
+      }
+
+      const gboolean ok = g_file_make_directory(child, /*cancellable=*/nullptr, &gerr);
+      g_object_unref(child);
+      g_object_unref(base);
+      if (ok) return true;
+
+      if (gerr) {
+        if (outErr) *outErr = gerr->message ? gerr->message : "Unknown error.";
+        g_error_free(gerr);
+      } else {
+        if (outErr) *outErr = "Unknown error.";
+      }
+      return false;
+    };
+
+    std::string err;
+    if (!tryCreate(&err)) {
+      // If the location isn't mounted, try mounting once and retry.
+      if (err.find("not mounted") != std::string::npos || err.find("Not mounted") != std::string::npos) {
+        std::string mountErr;
+        if (GioMountLocation(uri, &mountErr, DialogParent())) {
+          err.clear();
+          if (tryCreate(&err)) {
+            RefreshAll();
+            NotifyDirContentsChanged(false);
+            return;
+          }
+        } else if (!mountErr.empty()) {
+          err = mountErr;
+        }
+      }
+
+      wxMessageBox(wxString::Format("Create folder failed:\n\n%s", wxString::FromUTF8(err).c_str()),
+                   "Create Folder",
+                   wxOK | wxICON_ERROR,
+                   DialogParent());
+      return;
+    }
+
+    RefreshAll();
+    NotifyDirContentsChanged(false);
+    return;
+#else
+    wxMessageBox("Create Folder is not available here.",
+                 "Quarry",
+                 wxOK | wxICON_INFORMATION,
+                 DialogParent());
+    return;
+#endif
+  }
+
+  wxMessageBox("Create Folder is not available here.",
+               "Quarry",
+               wxOK | wxICON_INFORMATION,
+               DialogParent());
 }
 
 void FilePanel::CopySelection() {
@@ -2481,38 +2671,18 @@ void FilePanel::TrashSelection() {
   if (paths.empty()) return;
 
   const auto message = wxString::Format("Move %zu item(s) to Trash?", paths.size());
-  if (wxMessageBox(message,
-                   "Trash",
-                   wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION,
-                   DialogParent()) != wxYES) {
+  if (wxMessageBox(message, "Trash", wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION, DialogParent()) !=
+      wxYES) {
     return;
   }
 
-  wxProgressDialog progress("Trashing",
-                            "Preparing...",
-                            static_cast<int>(paths.size()),
-                            DialogParent(),
-                            wxPD_APP_MODAL | wxPD_CAN_ABORT | wxPD_AUTO_HIDE | wxPD_ELAPSED_TIME);
-
-  for (size_t i = 0; i < paths.size(); i++) {
-    const auto& src = paths[i];
-    if (!progress.Update(static_cast<int>(i), src.filename().string())) break;
-
-    const auto result = TrashPath(src);
-    if (!result.ok) {
-      wxMessageDialog dlg(DialogParent(),
-                          wxString::Format("Trash failed:\n\n%s\n\nContinue?", result.message.c_str()),
-                          "Trash failed",
-                          wxYES_NO | wxNO_DEFAULT | wxICON_ERROR);
-      dlg.SetYesNoLabels("Continue", "Cancel");
-      if (dlg.ShowModal() != wxID_YES) break;
-    }
+  auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(DialogParent()));
+  if (!frame) {
+    wxMessageBox("Trash is not available here.", "Quarry", wxOK | wxICON_INFORMATION, DialogParent());
+    return;
   }
 
-  const bool treeChanged = AnySelectedDirs();
-  RefreshAll();
-  if (treeChanged) RefreshTree();
-  NotifyDirContentsChanged(treeChanged);
+  frame->StartTrashOperation(paths);
 }
 
 void FilePanel::DeleteSelectionPermanent() {
@@ -2528,31 +2698,13 @@ void FilePanel::DeleteSelectionPermanent() {
     return;
   }
 
-  wxProgressDialog progress("Deleting",
-                            "Preparing...",
-                            static_cast<int>(paths.size()),
-                            DialogParent(),
-                            wxPD_APP_MODAL | wxPD_CAN_ABORT | wxPD_AUTO_HIDE | wxPD_ELAPSED_TIME);
-
-  for (size_t i = 0; i < paths.size(); i++) {
-    const auto& src = paths[i];
-    if (!progress.Update(static_cast<int>(i), src.filename().string())) break;
-
-    const auto result = DeletePath(src);
-    if (!result.ok) {
-      wxMessageDialog dlg(DialogParent(),
-                          wxString::Format("Delete failed:\n\n%s\n\nContinue?", result.message.c_str()),
-                          "Delete failed",
-                          wxYES_NO | wxNO_DEFAULT | wxICON_ERROR);
-      dlg.SetYesNoLabels("Continue", "Cancel");
-      if (dlg.ShowModal() != wxID_YES) break;
-    }
+  auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(DialogParent()));
+  if (!frame) {
+    wxMessageBox("Delete is not available here.", "Quarry", wxOK | wxICON_INFORMATION, DialogParent());
+    return;
   }
 
-  const bool treeChanged = AnySelectedDirs();
-  RefreshAll();
-  if (treeChanged) RefreshTree();
-  NotifyDirContentsChanged(treeChanged);
+  frame->StartDeleteOperation(paths);
 }
 
 void FilePanel::NotifyDirContentsChanged(bool treeChanged) {
@@ -3132,14 +3284,21 @@ void FilePanel::SyncTreeToCurrentDir() {
   ignoreTreeEvent_ = false;
 }
 
-void FilePanel::ShowListContextMenu(wxDataViewEvent& event) {
+void FilePanel::ShowListContextMenu(const wxDataViewItem& contextItem,
+                                    const wxPoint& screenPos,
+                                    bool isBackgroundContext) {
   if (!list_) return;
 
   // If we right-click a specific item, ensure it's part of the selection.
-  if (event.GetItem().IsOk() && !list_->IsSelected(event.GetItem())) {
+  if (contextItem.IsOk() && !list_->IsSelected(contextItem)) {
     list_->UnselectAll();
-    list_->Select(event.GetItem());
-    list_->SetCurrentItem(event.GetItem());
+    list_->Select(contextItem);
+    list_->SetCurrentItem(contextItem);
+  } else if (!contextItem.IsOk()) {
+    list_->UnselectAll();
+    renameArmedItem_ = wxDataViewItem();
+    renameArmedAtMs_ = 0;
+    UpdateStatusText();
   }
 
   wxMenu menu;
@@ -3167,6 +3326,14 @@ void FilePanel::ShowListContextMenu(wxDataViewEvent& event) {
   const bool single = selected.size() == 1;
   const bool allowCopyPaste = listingMode_ == ListingMode::Directory || listingMode_ == ListingMode::Gio;
   const bool allowFsOps = listingMode_ == ListingMode::Directory;
+  bool allowCreateFolder = listingMode_ == ListingMode::Directory;
+  bool allowTrashDelete = listingMode_ == ListingMode::Directory;
+  if (listingMode_ == ListingMode::Gio) {
+    const std::string uri = currentDir_.string();
+    const bool allowRemoteOps = !uri.empty() && !IsBareSchemeUri(uri) && UriScheme(uri) != "network";
+    allowCreateFolder = allowRemoteOps;
+    allowTrashDelete = allowRemoteOps;
+  }
   const bool canExtract = allowFsOps && single && IsExtractableArchivePath(selected[0]);
   const bool canSaveShare = (listingMode_ == ListingMode::Gio) && single;
   menu.Enable(ID_CTX_OPEN, hasSelection);
@@ -3177,9 +3344,9 @@ void FilePanel::ShowListContextMenu(wxDataViewEvent& event) {
   menu.Enable(ID_CTX_COPY, allowCopyPaste && hasSelection);
   menu.Enable(ID_CTX_CUT, allowCopyPaste && hasSelection);
   menu.Enable(ID_CTX_RENAME, allowFsOps && single);
-  menu.Enable(ID_CTX_NEW_FOLDER, allowFsOps);
-  menu.Enable(ID_CTX_TRASH, allowFsOps && hasSelection);
-  menu.Enable(ID_CTX_DELETE_PERM, allowFsOps && hasSelection);
+  menu.Enable(ID_CTX_NEW_FOLDER, allowCreateFolder && isBackgroundContext);
+  menu.Enable(ID_CTX_TRASH, allowTrashDelete && hasSelection);
+  menu.Enable(ID_CTX_DELETE_PERM, allowTrashDelete && hasSelection);
   menu.Enable(ID_CTX_PASTE, allowCopyPaste && g_clipboard && !g_clipboard->paths.empty());
 
   menu.Bind(wxEVT_MENU, [this](wxCommandEvent&) { OpenSelection(); }, ID_CTX_OPEN);
@@ -3219,7 +3386,11 @@ void FilePanel::ShowListContextMenu(wxDataViewEvent& event) {
   menu.Bind(wxEVT_MENU, [this](wxCommandEvent&) { DeleteSelectionPermanent(); }, ID_CTX_DELETE_PERM);
   menu.Bind(wxEVT_MENU, [this](wxCommandEvent&) { ShowProperties(); }, ID_CTX_PROPERTIES);
 
-  list_->PopupMenu(&menu);
+  if (screenPos != wxDefaultPosition) {
+    list_->PopupMenu(&menu, list_->ScreenToClient(screenPos));
+  } else {
+    list_->PopupMenu(&menu);
+  }
 }
 
 bool FilePanel::HasCommand(const wxString& name) const {
@@ -3303,48 +3474,18 @@ void FilePanel::ExtractArchiveTo(const fs::path& archivePath, const fs::path& ds
     return;
   }
 
-  if (statusText_) {
-    statusText_->SetLabel(wxString::Format("Extracting: %s", archivePath.filename().string()));
-    statusText_->Refresh();
-  }
-
-  std::unique_ptr<wxProcess, WxProcessDeleter> proc(new wxProcess());
-  wxProcess* procRaw = proc.get();
-  procRaw->Bind(wxEVT_END_PROCESS, [this, procRaw](wxProcessEvent& e) {
-    const int code = e.GetExitCode();
-    // Remove proc from tracking vector.
-    extractProcs_.erase(std::remove_if(extractProcs_.begin(),
-                                      extractProcs_.end(),
-                                      [procRaw](const auto& p) { return p.get() == procRaw; }),
-                        extractProcs_.end());
-
-    RefreshAll();
-    RefreshTree();
-    NotifyDirContentsChanged(true);
-
-    if (code != 0) {
-      wxMessageBox(wxString::Format("Extract failed (exit code %d).", code),
-                   "Quarry",
-                   wxOK | wxICON_ERROR,
-                   DialogParent());
-    }
-  });
-
-  std::vector<const char*> argv;
-  argv.reserve(args.size() + 1);
-  for (const auto& s : args) argv.push_back(s.c_str());
-  argv.push_back(nullptr);
-
-  long pid = wxExecute(argv.data(), wxEXEC_ASYNC, procRaw);
-  if (pid == 0) {
-    wxMessageBox("Failed to start extractor.",
-                 "Quarry",
-                 wxOK | wxICON_ERROR,
-                 DialogParent());
+  auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(DialogParent()));
+  if (!frame) {
+    wxMessageBox("Extract is not available here.", "Quarry", wxOK | wxICON_INFORMATION, DialogParent());
     return;
   }
 
-  extractProcs_.push_back(std::move(proc));
+  if (statusText_) {
+    statusText_->SetLabel(wxString::Format("Queued extract: %s", archivePath.filename().string()));
+    statusText_->Refresh();
+  }
+
+  frame->StartExtractOperation(args, dstDir, /*treeChanged=*/true);
 }
 
 bool FilePanel::AnySelectedDirs() const {

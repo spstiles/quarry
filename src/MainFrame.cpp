@@ -12,15 +12,18 @@
 #include <limits>
 #include <chrono>
 #include <memory>
+#include <algorithm>
 
 #include <wx/accel.h>
 #include <wx/aboutdlg.h>
 #include <wx/choicdlg.h>
 #include <wx/config.h>
+#include <wx/display.h>
 #include <wx/filefn.h>
 #include <wx/menu.h>
 #include <wx/msgdlg.h>
 #include <wx/progdlg.h>
+#include <wx/radiobox.h>
 #include <wx/sizer.h>
 #include <wx/splitter.h>
 #include <wx/textdlg.h>
@@ -34,6 +37,8 @@
 #include <wx/gauge.h>
 #include <wx/button.h>
 #include <wx/listbox.h>
+#include <wx/utils.h>
+#include <wx/scrolwin.h>
 
 namespace {
 enum MenuId : int {
@@ -75,11 +80,14 @@ ExistsChoice PromptExists(wxWindow* parent, const std::filesystem::path& dst) {
 }  // namespace
 
 struct AsyncFileOpPrompt {
-  enum class Kind { Exists, Error };
+  enum class Kind { Exists, Error, TrashFailed };
   Kind kind{Kind::Exists};
+  std::filesystem::path src{};
   std::filesystem::path dst{};
   std::string errorMessage{};
 };
+
+enum class TrashFailChoice { DeletePermanent, Skip, Cancel };
 
 struct AsyncFileOpReply {
   // For Kind::Exists
@@ -88,6 +96,9 @@ struct AsyncFileOpReply {
 
   // For Kind::Error
   bool continueAfterError{false};
+
+  // For Kind::TrashFailed
+  TrashFailChoice trashFailChoice{TrashFailChoice::Cancel};
 };
 
 struct AsyncFileOpState {
@@ -175,6 +186,10 @@ struct MainFrame::FileOpSession final {
   wxStaticText* detailText{nullptr};
   wxGauge* gauge{nullptr};
   wxButton* cancelBtn{nullptr};
+  wxStaticBox* queueBox{nullptr};
+  wxScrolledWindow* queueScroll{nullptr};
+  wxBoxSizer* queueItemsSizer{nullptr};
+  wxButton* clearQueueBtn{nullptr};
   wxTimer timer;
   int timerId{wxID_ANY};
 
@@ -189,6 +204,73 @@ struct MainFrame::FileOpSession final {
 
   explicit FileOpSession(wxEvtHandler* owner) : timer(owner) {}
 };
+
+void MainFrame::UpdateQueueUi() {
+  if (!fileOp_ || !fileOp_->dlg || !fileOp_->queueScroll || !fileOp_->queueItemsSizer) return;
+
+  auto describe = [](const QueuedOp& op) -> wxString {
+    switch (op.kind) {
+      case OpKind::CopyMove: {
+        const wxString verb = op.move ? "Move" : "Copy";
+        const wxString dst = wxString::FromUTF8(op.dstDir.string());
+        return wxString::Format("%s %zu item(s) → %s", verb.c_str(), op.sources.size(), dst.c_str());
+      }
+      case OpKind::Trash:
+        return wxString::Format("Trash %zu item(s)", op.sources.size());
+      case OpKind::Delete:
+        return wxString::Format("Delete %zu item(s)", op.sources.size());
+      case OpKind::Extract: {
+        const wxString cmd = op.argv.empty() ? "extract" : wxString::FromUTF8(op.argv[0]);
+        return wxString::Format("Extract (%s)", cmd.c_str());
+      }
+    }
+    return "Operation";
+  };
+
+  fileOp_->queueScroll->Freeze();
+  fileOp_->queueItemsSizer->Clear(/*delete_windows=*/true);
+
+  const int count = static_cast<int>(opQueue_.size());
+  for (int i = 0; i < count; i++) {
+    const auto& op = opQueue_[static_cast<size_t>(i)];
+    auto* row = new wxPanel(fileOp_->queueScroll, wxID_ANY);
+    auto* hs = new wxBoxSizer(wxHORIZONTAL);
+    row->SetSizer(hs);
+
+    auto* vs = new wxBoxSizer(wxVERTICAL);
+    auto* title = new wxStaticText(row, wxID_ANY, describe(op));
+    const wxString status = (i == 0) ? "Waiting..." : "Queued...";
+    auto* st = new wxStaticText(row, wxID_ANY, status);
+    vs->Add(title, 0, wxBOTTOM, 2);
+    vs->Add(st, 0);
+    hs->Add(vs, 1, wxEXPAND | wxRIGHT, 8);
+
+    auto* cancel = new wxButton(row, wxID_ANY, "Cancel");
+    const std::uint64_t id = op.id;
+    cancel->Bind(wxEVT_BUTTON, [this, id](wxCommandEvent&) {
+      for (auto it = opQueue_.begin(); it != opQueue_.end(); ++it) {
+        if (it->id == id) {
+          opQueue_.erase(it);
+          break;
+        }
+      }
+      UpdateQueueUi();
+    });
+    hs->Add(cancel, 0, wxALIGN_CENTER_VERTICAL);
+
+    fileOp_->queueItemsSizer->Add(row, 0, wxEXPAND | wxALL, 4);
+  }
+
+  if (fileOp_->queueBox) {
+    fileOp_->queueBox->SetLabel(count > 0 ? wxString::Format("Queue (%d)", count) : "Queue");
+  }
+  if (fileOp_->clearQueueBtn) fileOp_->clearQueueBtn->Enable(count > 0);
+
+  fileOp_->queueScroll->FitInside();
+  fileOp_->queueScroll->Layout();
+  fileOp_->queueScroll->Thaw();
+  fileOp_->dlg->Layout();
+}
 
 namespace {
 
@@ -428,9 +510,7 @@ MainFrame::MainFrame(std::string topDir, std::string bottomDir)
   pendingTopDir_ = topDir.empty() ? home : std::move(topDir);
   pendingBottomDir_ = bottomDir.empty() ? pendingTopDir_ : std::move(bottomDir);
 
-  // On startup, try to load the saved default view (if any). If none exists,
-  // we fall back to built-in defaults.
-  LoadDefaultViewInternal(/*applyToPanes=*/false, /*showNoDefaultMessage=*/false);
+  LoadStartupView();
 
   SetMinSize(wxSize(900, 500));
 
@@ -443,6 +523,20 @@ void MainFrame::StartFileOperation(const wxString& title,
                                    const std::filesystem::path& dstDir,
                                    bool move) {
   CopyMoveWithProgress(title, sources, dstDir, move);
+}
+
+void MainFrame::StartTrashOperation(const std::vector<std::filesystem::path>& sources) {
+  TrashWithProgress(sources);
+}
+
+void MainFrame::StartDeleteOperation(const std::vector<std::filesystem::path>& sources) {
+  DeleteWithProgress(sources);
+}
+
+void MainFrame::StartExtractOperation(const std::vector<std::string>& argv,
+                                      const std::filesystem::path& refreshDir,
+                                      bool treeChanged) {
+  ExtractWithProgress(argv, refreshDir, treeChanged);
 }
 
 void MainFrame::BuildMenu() {
@@ -459,6 +553,8 @@ void MainFrame::BuildMenu() {
   opsMenu->AppendSeparator();
   opsMenu->Append(ID_Rename, "Rename\tF2");
   opsMenu->Append(ID_MkDir, "New Folder\tF7");
+  opsMenu->AppendSeparator();
+  opsMenu->Append(wxID_PREFERENCES, "Preferences...\tCtrl+,");
 
   auto* networkMenu = new wxMenu();
   networkMenu->Append(ID_ConnectToServer, "Connect to Server...\tCtrl+L");
@@ -491,6 +587,7 @@ void MainFrame::BuildLayout() {
 void MainFrame::BindEvents() {
   Bind(wxEVT_MENU, &MainFrame::OnQuit, this, wxID_EXIT);
   Bind(wxEVT_MENU, &MainFrame::OnAbout, this, wxID_ABOUT);
+  Bind(wxEVT_MENU, &MainFrame::OnPreferences, this, wxID_PREFERENCES);
   Bind(wxEVT_MENU, &MainFrame::OnRefresh, this, ID_Refresh);
   Bind(wxEVT_MENU, &MainFrame::OnConnectToServer, this, ID_ConnectToServer);
   Bind(wxEVT_MENU, &MainFrame::OnConnectionsManager, this, ID_ConnectionsManager);
@@ -513,7 +610,18 @@ void MainFrame::BindEvents() {
   Bind(wxEVT_SHOW, [this](wxShowEvent& e) {
     e.Skip();
     if (!e.IsShown()) return;
-    CallAfter([this]() { InitPanelsIfNeeded(); });
+    CallAfter([this]() {
+      ApplyStartupWindowCascade();
+      InitPanelsIfNeeded();
+    });
+  });
+
+  Bind(wxEVT_CLOSE_WINDOW, [this](wxCloseEvent& e) {
+    wxConfig cfg("Quarry");
+    bool restoreLast = false;
+    cfg.Read("/prefs/startup/restore_last", &restoreLast, false);
+    if (restoreLast) SaveLastView(/*showMessage=*/false);
+    e.Skip();
   });
 
   // Key navigation that should work regardless of which child has focus.
@@ -654,11 +762,45 @@ void MainFrame::BindPanelEvents() {
   bottom_->BindDirContentsChanged(onDirChanged);
 }
 
+void MainFrame::LoadStartupView() {
+  wxConfig cfg("Quarry");
+  bool restoreLast = false;
+  cfg.Read("/prefs/startup/restore_last", &restoreLast, false);
+
+  if (restoreLast) {
+    if (LoadViewFromConfig("/view/last", /*applyToPanes=*/false, /*showNoViewMessage=*/false)) {
+      // When restoring last view, don't apply the startup cascade offset; users
+      // expect the window to reopen exactly where it was.
+      skipStartupCascade_ = true;
+      return;
+    }
+  }
+
+  // Default behavior: try to load the saved default view (if any). If none exists,
+  // we fall back to built-in defaults.
+  LoadViewFromConfig("/view/default", /*applyToPanes=*/false, /*showNoViewMessage=*/false);
+}
+
 void MainFrame::SaveDefaultView() {
+  SaveViewToConfig("/view/default", /*showMessage=*/true);
+}
+
+void MainFrame::LoadDefaultView() {
+  LoadDefaultViewInternal(/*applyToPanes=*/true, /*showNoDefaultMessage=*/true);
+}
+
+bool MainFrame::LoadDefaultViewInternal(bool applyToPanes, bool showNoDefaultMessage) {
+  return LoadViewFromConfig("/view/default", applyToPanes, showNoDefaultMessage);
+}
+
+void MainFrame::SaveLastView(bool showMessage) {
+  SaveViewToConfig("/view/last", showMessage);
+}
+
+void MainFrame::SaveViewToConfig(const wxString& base, bool showMessage) {
   InitPanelsIfNeeded();
 
   wxConfig cfg("Quarry");
-  const wxString base = "/view/default";
 
   cfg.Write(base + "/window/maximized", IsMaximized());
 
@@ -700,16 +842,19 @@ void MainFrame::SaveDefaultView() {
   }
 
   cfg.Flush();
-  wxMessageBox("Default view saved.", "Quarry", wxOK | wxICON_INFORMATION, this);
+  if (showMessage) {
+    if (base == "/view/default") {
+      wxMessageBox("Default view saved.", "Quarry", wxOK | wxICON_INFORMATION, this);
+    } else {
+      wxMessageBox("Saved.", "Quarry", wxOK | wxICON_INFORMATION, this);
+    }
+  }
 }
 
-void MainFrame::LoadDefaultView() {
-  LoadDefaultViewInternal(/*applyToPanes=*/true, /*showNoDefaultMessage=*/true);
-}
-
-bool MainFrame::LoadDefaultViewInternal(bool applyToPanes, bool showNoDefaultMessage) {
+bool MainFrame::LoadViewFromConfig(const wxString& base,
+                                  bool applyToPanes,
+                                  bool showNoViewMessage) {
   wxConfig cfg("Quarry");
-  const wxString base = "/view/default";
 
   bool hasAny = false;
 
@@ -792,8 +937,12 @@ bool MainFrame::LoadDefaultViewInternal(bool applyToPanes, bool showNoDefaultMes
   }
 
   if (!hasAny) {
-    if (showNoDefaultMessage) {
-      wxMessageBox("No default view has been saved yet.", "Quarry", wxOK | wxICON_INFORMATION, this);
+    if (showNoViewMessage) {
+      if (base == "/view/default") {
+        wxMessageBox("No default view has been saved yet.", "Quarry", wxOK | wxICON_INFORMATION, this);
+      } else {
+        wxMessageBox("No saved view is available.", "Quarry", wxOK | wxICON_INFORMATION, this);
+      }
     }
     return false;
   }
@@ -822,6 +971,47 @@ bool MainFrame::LoadDefaultViewInternal(bool applyToPanes, bool showNoDefaultMes
   return true;
 }
 
+void MainFrame::ApplyStartupWindowCascade() {
+  if (startupCascadeApplied_) return;
+  startupCascadeApplied_ = true;
+  if (skipStartupCascade_) return;
+
+  if (IsMaximized() || IsFullScreen()) return;
+
+  int displayIndex = wxDisplay::GetFromWindow(this);
+  if (displayIndex < 0) displayIndex = 0;
+  if (displayIndex >= wxDisplay::GetCount()) displayIndex = 0;
+  wxDisplay display(displayIndex);
+  const wxRect work = display.GetClientArea();
+  if (work.width <= 0 || work.height <= 0) return;
+
+  wxPoint pos = GetPosition();
+  const wxSize size = GetSize();
+  if (pos.x < 0 || pos.y < 0) {
+    pos = wxPoint(work.x + 24, work.y + 24);
+  }
+
+  wxConfig cfg("Quarry");
+  long slot = 0;
+  cfg.Read("/runtime/cascade/slot", &slot, 0);
+  slot = (slot + 1) % 16;
+  cfg.Write("/runtime/cascade/slot", slot);
+  cfg.Flush();
+
+  const int dx = 24;
+  const int dy = 24;
+  int nx = pos.x + static_cast<int>(slot) * dx;
+  int ny = pos.y + static_cast<int>(slot) * dy;
+
+  const int maxX = work.x + std::max(0, work.width - size.GetWidth());
+  const int maxY = work.y + std::max(0, work.height - size.GetHeight());
+  nx = std::max(work.x, std::min(nx, maxX));
+  ny = std::max(work.y, std::min(ny, maxY));
+
+  if (nx == pos.x && ny == pos.y) return;
+  Move(nx, ny);
+}
+
 void MainFrame::TransferDroppedPaths(FilePanel* target,
                                      const std::vector<std::filesystem::path>& sources,
                                      bool move) {
@@ -841,28 +1031,43 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
                                      const std::vector<std::filesystem::path>& sources,
                                      const std::filesystem::path& dstDir,
                                      bool move) {
-  if (sources.empty()) return;
+  CopyMoveWithProgressInternal(title, sources, dstDir, move, /*alreadyConfirmed=*/false);
+}
 
-  if (fileOp_) {
-    wxMessageBox("An operation is already running. Please wait for it to finish or cancel it.",
-                 "Quarry",
-                 wxOK | wxICON_INFORMATION,
-                 this);
-    return;
-  }
+void MainFrame::CopyMoveWithProgressInternal(const wxString& title,
+                                             const std::vector<std::filesystem::path>& sources,
+                                             const std::filesystem::path& dstDir,
+                                             bool move,
+                                             bool alreadyConfirmed) {
+  if (sources.empty()) return;
 
   if (dstDir.empty() || !PathExistsAny(dstDir) || !IsDirectoryAny(dstDir)) {
     wxMessageBox("Destination is not a directory.", "Quarry", wxOK | wxICON_WARNING, this);
     return;
   }
 
-  const wxString dstDirWx = wxString::FromUTF8(dstDir.string());
-  const wxString confirmMsg = wxString::Format("%s %zu item(s) to:\n\n%s\n\nExisting files may be overwritten.",
-                                               title.c_str(),
-                                               sources.size(),
-                                               dstDirWx.c_str());
-  if (wxMessageBox(confirmMsg, title, wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION, this) != wxYES) {
+  // If an operation is already running, queue immediately without extra prompts.
+  // Conflicts (overwrite/skip/rename) are resolved per-file when the job runs.
+  if (fileOp_) {
+    EnqueueOp(QueuedOp{.kind = OpKind::CopyMove,
+                       .title = title,
+                       .sources = sources,
+                       .dstDir = dstDir,
+                       .move = move});
     return;
+  }
+
+  // Confirmation: copy is safe enough to start immediately; move is more dangerous.
+  // Do not show an "overwrite" warning: per-file conflicts are handled during the operation.
+  if (!alreadyConfirmed && move) {
+    const wxString dstDirWx = wxString::FromUTF8(dstDir.string());
+    const wxString confirmMsg = wxString::Format("%s %zu item(s) to:\n\n%s",
+                                                 title.c_str(),
+                                                 sources.size(),
+                                                 dstDirWx.c_str());
+    if (wxMessageBox(confirmMsg, title, wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION, this) != wxYES) {
+      return;
+    }
   }
 
   fileOp_ = std::make_unique<FileOpSession>(this);
@@ -878,7 +1083,7 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
   }
 
   // Modeless dialog.
-  fileOp_->dlg = new wxDialog(this, wxID_ANY, title, wxDefaultPosition, wxSize(600, 180),
+  fileOp_->dlg = new wxDialog(this, wxID_ANY, title, wxDefaultPosition, wxSize(650, 340),
                               wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER | wxFRAME_FLOAT_ON_PARENT);
   auto* root = new wxBoxSizer(wxVERTICAL);
   fileOp_->dlg->SetSizer(root);
@@ -891,12 +1096,36 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
   root->Add(fileOp_->titleText, 0, wxEXPAND | wxALL, 10);
   root->Add(fileOp_->detailText, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
   root->Add(fileOp_->gauge, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+
+  auto* queueSizer = new wxStaticBoxSizer(wxVERTICAL, fileOp_->dlg, "Queue");
+  fileOp_->queueBox = queueSizer->GetStaticBox();
+  fileOp_->queueScroll = new wxScrolledWindow(fileOp_->dlg, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+                                              wxVSCROLL);
+  fileOp_->queueScroll->SetScrollRate(0, 10);
+  fileOp_->queueItemsSizer = new wxBoxSizer(wxVERTICAL);
+  fileOp_->queueScroll->SetSizer(fileOp_->queueItemsSizer);
+  queueSizer->Add(fileOp_->queueScroll, 1, wxEXPAND | wxALL, 8);
+
+  auto* qBtns = new wxBoxSizer(wxHORIZONTAL);
+  qBtns->AddStretchSpacer(1);
+  fileOp_->clearQueueBtn = new wxButton(fileOp_->dlg, wxID_ANY, "Clear Queue");
+  qBtns->Add(fileOp_->clearQueueBtn, 0);
+  queueSizer->Add(qBtns, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
+
+  root->Add(queueSizer, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+
   auto* btns = new wxBoxSizer(wxHORIZONTAL);
   btns->AddStretchSpacer(1);
   btns->Add(fileOp_->cancelBtn, 0);
   root->Add(btns, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
   fileOp_->dlg->Layout();
   fileOp_->dlg->Show();
+
+  fileOp_->clearQueueBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+    opQueue_.clear();
+    UpdateQueueUi();
+  });
+  UpdateQueueUi();
 
   // wxTimer events are delivered to the timer owner (not the wxTimer object).
   // Bind them on the dialog so updates continue even while the main window is used.
@@ -1075,7 +1304,7 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
             reply.renameTo = nameDlg.GetValue().ToStdString();
           }
         }
-      } else {
+      } else if (prompt->kind == AsyncFileOpPrompt::Kind::Error) {
         wxMessageDialog dlg(this,
                             wxString::Format("%s failed:\n\n%s\n\nContinue?",
                                              title.c_str(),
@@ -1084,6 +1313,17 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
                             wxYES_NO | wxNO_DEFAULT | wxICON_ERROR);
         dlg.SetYesNoLabels("Continue", "Cancel");
         reply.continueAfterError = (dlg.ShowModal() == wxID_YES);
+      } else {
+        wxMessageDialog dlg(this,
+                            wxString::Format("Trash failed:\n\n%s\n\nDelete permanently instead?",
+                                             wxString::FromUTF8(prompt->errorMessage).c_str()),
+                            "Trash failed",
+                            wxYES_NO | wxNO_DEFAULT | wxCANCEL | wxICON_ERROR);
+        dlg.SetYesNoCancelLabels("Delete", "Skip", "Cancel");
+        const int rc = dlg.ShowModal();
+        if (rc == wxID_YES) reply.trashFailChoice = TrashFailChoice::DeletePermanent;
+        else if (rc == wxID_NO) reply.trashFailChoice = TrashFailChoice::Skip;
+        else reply.trashFailChoice = TrashFailChoice::Cancel;
       }
 
       {
@@ -1176,10 +1416,657 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
 
       if (fileOp_->dlg) fileOp_->dlg->Destroy();
       fileOp_.reset();
+      StartNextQueuedOp();
     }
   }, fileOp_->timerId);
 
   fileOp_->timer.Start(100);
+}
+
+void MainFrame::TrashWithProgress(const std::vector<std::filesystem::path>& sources) {
+  TrashWithProgressInternal(sources, /*alreadyConfirmed=*/false);
+}
+
+void MainFrame::TrashWithProgressInternal(const std::vector<std::filesystem::path>& sources,
+                                          bool alreadyConfirmed) {
+  if (sources.empty()) return;
+
+  if (!alreadyConfirmed) {
+    const auto message = wxString::Format("Move %zu item(s) to Trash?", sources.size());
+    if (wxMessageBox(message, "Trash", wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION, this) != wxYES) {
+      return;
+    }
+  }
+
+  if (fileOp_) {
+    EnqueueOp(QueuedOp{.kind = OpKind::Trash, .title = "Trash", .sources = sources});
+    return;
+  }
+
+  fileOp_ = std::make_unique<FileOpSession>(this);
+  fileOp_->state = std::make_shared<AsyncFileOpState>();
+
+  bool hasDir = false;
+  for (const auto& p : sources) {
+    if (IsDirectoryAny(p)) {
+      hasDir = true;
+      break;
+    }
+  }
+  fileOp_->state->hasDir = hasDir;
+  {
+    std::lock_guard<std::mutex> lock(fileOp_->state->mu);
+    fileOp_->state->scanDone = true;
+    fileOp_->state->totalBytes = 0;
+    fileOp_->state->currentLabel = "Preparing...";
+  }
+
+  fileOp_->dlg = new wxDialog(this, wxID_ANY, "Trash", wxDefaultPosition, wxSize(650, 340),
+                              wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER | wxFRAME_FLOAT_ON_PARENT);
+  auto* root = new wxBoxSizer(wxVERTICAL);
+  fileOp_->dlg->SetSizer(root);
+
+  fileOp_->titleText = new wxStaticText(fileOp_->dlg, wxID_ANY, "Trashing...");
+  fileOp_->detailText = new wxStaticText(fileOp_->dlg, wxID_ANY, "Preparing...");
+  fileOp_->gauge = new wxGauge(fileOp_->dlg, wxID_ANY, fileOp_->range);
+  fileOp_->cancelBtn = new wxButton(fileOp_->dlg, wxID_CANCEL, "Cancel");
+
+  root->Add(fileOp_->titleText, 0, wxEXPAND | wxALL, 10);
+  root->Add(fileOp_->detailText, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+  root->Add(fileOp_->gauge, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+
+  auto* queueSizer = new wxStaticBoxSizer(wxVERTICAL, fileOp_->dlg, "Queue");
+  fileOp_->queueBox = queueSizer->GetStaticBox();
+  fileOp_->queueScroll = new wxScrolledWindow(fileOp_->dlg, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+                                              wxVSCROLL);
+  fileOp_->queueScroll->SetScrollRate(0, 10);
+  fileOp_->queueItemsSizer = new wxBoxSizer(wxVERTICAL);
+  fileOp_->queueScroll->SetSizer(fileOp_->queueItemsSizer);
+  queueSizer->Add(fileOp_->queueScroll, 1, wxEXPAND | wxALL, 8);
+
+  auto* qBtns = new wxBoxSizer(wxHORIZONTAL);
+  qBtns->AddStretchSpacer(1);
+  fileOp_->clearQueueBtn = new wxButton(fileOp_->dlg, wxID_ANY, "Clear Queue");
+  qBtns->Add(fileOp_->clearQueueBtn, 0);
+  queueSizer->Add(qBtns, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
+
+  root->Add(queueSizer, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+
+  auto* btns = new wxBoxSizer(wxHORIZONTAL);
+  btns->AddStretchSpacer(1);
+  btns->Add(fileOp_->cancelBtn, 0);
+  root->Add(btns, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+  fileOp_->dlg->Layout();
+  fileOp_->dlg->Show();
+
+  fileOp_->clearQueueBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+    opQueue_.clear();
+    UpdateQueueUi();
+  });
+  UpdateQueueUi();
+
+  fileOp_->timerId = wxWindow::NewControlId();
+  fileOp_->timer.SetOwner(fileOp_->dlg, fileOp_->timerId);
+
+  fileOp_->cancelBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+    if (!fileOp_ || !fileOp_->state) return;
+    fileOp_->state->cancelRequested.store(true);
+    fileOp_->cancelBtn->Disable();
+    std::lock_guard<std::mutex> lock(fileOp_->state->mu);
+    fileOp_->state->cv.notify_all();
+  });
+
+  fileOp_->dlg->Bind(wxEVT_CLOSE_WINDOW, [this](wxCloseEvent& e) { e.Veto(); });
+
+  const auto state = fileOp_->state;
+  fileOp_->worker = std::thread([state, sources]() {
+    for (const auto& src : sources) {
+      if (state->cancelRequested.load()) break;
+      if (src.empty()) {
+        state->done.fetch_add(1);
+        continue;
+      }
+
+      {
+        std::lock_guard<std::mutex> lock(state->mu);
+        const auto fn = src.filename().string();
+        state->currentLabel = fn.empty() ? src.string() : fn;
+      }
+
+      const auto result = TrashPath(src);
+      if (!result.ok) {
+        std::unique_lock<std::mutex> lock(state->mu);
+        state->prompt = AsyncFileOpPrompt{.kind = AsyncFileOpPrompt::Kind::TrashFailed,
+                                          .src = src,
+                                          .errorMessage = result.message.ToStdString()};
+        state->reply.reset();
+        state->cv.notify_all();
+        state->cv.wait(lock, [state]() { return state->reply.has_value() || state->cancelRequested.load(); });
+        if (state->cancelRequested.load()) break;
+
+        const auto reply = *state->reply;
+        state->prompt.reset();
+        state->reply.reset();
+
+        if (reply.trashFailChoice == TrashFailChoice::Skip) {
+          state->done.fetch_add(1);
+          continue;
+        }
+        if (reply.trashFailChoice == TrashFailChoice::Cancel) {
+          state->cancelRequested.store(true);
+          break;
+        }
+
+        const auto delRes = DeletePath(src);
+        if (!delRes.ok) {
+          std::unique_lock<std::mutex> lock2(state->mu);
+          state->prompt = AsyncFileOpPrompt{.kind = AsyncFileOpPrompt::Kind::Error,
+                                            .src = src,
+                                            .errorMessage = delRes.message.ToStdString()};
+          state->reply.reset();
+          state->cv.notify_all();
+          state->cv.wait(lock2, [state]() { return state->reply.has_value() || state->cancelRequested.load(); });
+          if (state->cancelRequested.load()) break;
+
+          const auto r2 = *state->reply;
+          state->prompt.reset();
+          state->reply.reset();
+          if (!r2.continueAfterError) {
+            state->cancelRequested.store(true);
+            break;
+          }
+        }
+      }
+
+      state->done.fetch_add(1);
+    }
+
+    std::lock_guard<std::mutex> lock(state->mu);
+    state->finished = true;
+    state->cv.notify_all();
+  });
+
+  fileOp_->dlg->Bind(wxEVT_TIMER, [this, sources](wxTimerEvent&) {
+    if (!fileOp_ || !fileOp_->state) return;
+    const auto state = fileOp_->state;
+
+    std::optional<AsyncFileOpPrompt> prompt;
+    {
+      std::lock_guard<std::mutex> lock(state->mu);
+      prompt = state->prompt;
+    }
+    if (prompt && !fileOp_->promptActive) {
+      fileOp_->promptActive = true;
+      AsyncFileOpReply reply;
+      if (prompt->kind == AsyncFileOpPrompt::Kind::TrashFailed) {
+        wxMessageDialog dlg(this,
+                            wxString::Format("Trash failed:\n\n%s\n\nDelete permanently instead?",
+                                             wxString::FromUTF8(prompt->errorMessage).c_str()),
+                            "Trash failed",
+                            wxYES_NO | wxNO_DEFAULT | wxCANCEL | wxICON_ERROR);
+        dlg.SetYesNoCancelLabels("Delete", "Skip", "Cancel");
+        const int rc = dlg.ShowModal();
+        if (rc == wxID_YES) reply.trashFailChoice = TrashFailChoice::DeletePermanent;
+        else if (rc == wxID_NO) reply.trashFailChoice = TrashFailChoice::Skip;
+        else reply.trashFailChoice = TrashFailChoice::Cancel;
+      } else if (prompt->kind == AsyncFileOpPrompt::Kind::Error) {
+        wxMessageDialog dlg(this,
+                            wxString::Format("Delete failed:\n\n%s\n\nContinue?",
+                                             wxString::FromUTF8(prompt->errorMessage).c_str()),
+                            "Delete failed",
+                            wxYES_NO | wxNO_DEFAULT | wxICON_ERROR);
+        dlg.SetYesNoLabels("Continue", "Cancel");
+        reply.continueAfterError = (dlg.ShowModal() == wxID_YES);
+      }
+
+      {
+        std::lock_guard<std::mutex> lock(state->mu);
+        state->reply = reply;
+        state->cv.notify_all();
+      }
+      fileOp_->promptActive = false;
+    }
+
+    const auto done = state->done.load();
+
+    wxString label;
+    bool finished = false;
+    const bool canceling = state->cancelRequested.load();
+    {
+      std::lock_guard<std::mutex> lock(state->mu);
+      label = wxString::FromUTF8(state->currentLabel);
+      finished = state->finished;
+    }
+
+    if (!fileOp_->configured) {
+      fileOp_->range = static_cast<int>(std::max<size_t>(1, sources.size()));
+      fileOp_->gauge->SetRange(fileOp_->range);
+      fileOp_->configured = true;
+    }
+
+    fileOp_->gauge->SetValue(std::min<int>(fileOp_->range, static_cast<int>(done)));
+    if (canceling) fileOp_->titleText->SetLabel("Canceling...");
+
+    fileOp_->detailText->SetLabel(
+        wxString::Format("%s\n%zu / %zu", label.c_str(), done, sources.size()));
+    if (fileOp_->dlg) fileOp_->dlg->Layout();
+
+    if (finished) {
+      fileOp_->timer.Stop();
+      if (fileOp_->worker.joinable()) fileOp_->worker.join();
+      if (top_) top_->RefreshAll();
+      if (bottom_) bottom_->RefreshAll();
+      if (state->hasDir) {
+        if (top_) top_->RefreshTree();
+        if (bottom_) bottom_->RefreshTree();
+      }
+      if (fileOp_->dlg) fileOp_->dlg->Destroy();
+      fileOp_.reset();
+      StartNextQueuedOp();
+    }
+  }, fileOp_->timerId);
+
+  fileOp_->timer.Start(100);
+}
+
+void MainFrame::DeleteWithProgress(const std::vector<std::filesystem::path>& sources) {
+  DeleteWithProgressInternal(sources, /*alreadyConfirmed=*/false);
+}
+
+void MainFrame::DeleteWithProgressInternal(const std::vector<std::filesystem::path>& sources,
+                                           bool alreadyConfirmed) {
+  if (sources.empty()) return;
+
+  if (!alreadyConfirmed) {
+    const auto message = wxString::Format(
+        "Permanently delete %zu item(s)?\n\nThis cannot be undone.", sources.size());
+    if (wxMessageBox(message, "Delete", wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this) != wxYES) {
+      return;
+    }
+  }
+
+  if (fileOp_) {
+    EnqueueOp(QueuedOp{.kind = OpKind::Delete, .title = "Delete", .sources = sources});
+    return;
+  }
+
+  fileOp_ = std::make_unique<FileOpSession>(this);
+  fileOp_->state = std::make_shared<AsyncFileOpState>();
+
+  bool hasDir = false;
+  for (const auto& p : sources) {
+    if (IsDirectoryAny(p)) {
+      hasDir = true;
+      break;
+    }
+  }
+  fileOp_->state->hasDir = hasDir;
+  {
+    std::lock_guard<std::mutex> lock(fileOp_->state->mu);
+    fileOp_->state->scanDone = true;
+    fileOp_->state->totalBytes = 0;
+    fileOp_->state->currentLabel = "Preparing...";
+  }
+
+  fileOp_->dlg = new wxDialog(this, wxID_ANY, "Delete", wxDefaultPosition, wxSize(650, 340),
+                              wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER | wxFRAME_FLOAT_ON_PARENT);
+  auto* root = new wxBoxSizer(wxVERTICAL);
+  fileOp_->dlg->SetSizer(root);
+
+  fileOp_->titleText = new wxStaticText(fileOp_->dlg, wxID_ANY, "Deleting...");
+  fileOp_->detailText = new wxStaticText(fileOp_->dlg, wxID_ANY, "Preparing...");
+  fileOp_->gauge = new wxGauge(fileOp_->dlg, wxID_ANY, fileOp_->range);
+  fileOp_->cancelBtn = new wxButton(fileOp_->dlg, wxID_CANCEL, "Cancel");
+
+  root->Add(fileOp_->titleText, 0, wxEXPAND | wxALL, 10);
+  root->Add(fileOp_->detailText, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+  root->Add(fileOp_->gauge, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+
+  auto* queueSizer = new wxStaticBoxSizer(wxVERTICAL, fileOp_->dlg, "Queue");
+  fileOp_->queueBox = queueSizer->GetStaticBox();
+  fileOp_->queueScroll = new wxScrolledWindow(fileOp_->dlg, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+                                              wxVSCROLL);
+  fileOp_->queueScroll->SetScrollRate(0, 10);
+  fileOp_->queueItemsSizer = new wxBoxSizer(wxVERTICAL);
+  fileOp_->queueScroll->SetSizer(fileOp_->queueItemsSizer);
+  queueSizer->Add(fileOp_->queueScroll, 1, wxEXPAND | wxALL, 8);
+
+  auto* qBtns = new wxBoxSizer(wxHORIZONTAL);
+  qBtns->AddStretchSpacer(1);
+  fileOp_->clearQueueBtn = new wxButton(fileOp_->dlg, wxID_ANY, "Clear Queue");
+  qBtns->Add(fileOp_->clearQueueBtn, 0);
+  queueSizer->Add(qBtns, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
+
+  root->Add(queueSizer, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+
+  auto* btns = new wxBoxSizer(wxHORIZONTAL);
+  btns->AddStretchSpacer(1);
+  btns->Add(fileOp_->cancelBtn, 0);
+  root->Add(btns, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+  fileOp_->dlg->Layout();
+  fileOp_->dlg->Show();
+
+  fileOp_->clearQueueBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+    opQueue_.clear();
+    UpdateQueueUi();
+  });
+  UpdateQueueUi();
+
+  fileOp_->timerId = wxWindow::NewControlId();
+  fileOp_->timer.SetOwner(fileOp_->dlg, fileOp_->timerId);
+
+  fileOp_->cancelBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+    if (!fileOp_ || !fileOp_->state) return;
+    fileOp_->state->cancelRequested.store(true);
+    fileOp_->cancelBtn->Disable();
+    std::lock_guard<std::mutex> lock(fileOp_->state->mu);
+    fileOp_->state->cv.notify_all();
+  });
+  fileOp_->dlg->Bind(wxEVT_CLOSE_WINDOW, [this](wxCloseEvent& e) { e.Veto(); });
+
+  const auto state = fileOp_->state;
+  fileOp_->worker = std::thread([state, sources]() {
+    for (const auto& src : sources) {
+      if (state->cancelRequested.load()) break;
+      if (src.empty()) {
+        state->done.fetch_add(1);
+        continue;
+      }
+
+      {
+        std::lock_guard<std::mutex> lock(state->mu);
+        const auto fn = src.filename().string();
+        state->currentLabel = fn.empty() ? src.string() : fn;
+      }
+
+      const auto result = DeletePath(src);
+      if (!result.ok) {
+        std::unique_lock<std::mutex> lock(state->mu);
+        state->prompt = AsyncFileOpPrompt{.kind = AsyncFileOpPrompt::Kind::Error,
+                                          .src = src,
+                                          .errorMessage = result.message.ToStdString()};
+        state->reply.reset();
+        state->cv.notify_all();
+        state->cv.wait(lock, [state]() { return state->reply.has_value() || state->cancelRequested.load(); });
+        if (state->cancelRequested.load()) break;
+
+        const auto reply = *state->reply;
+        state->prompt.reset();
+        state->reply.reset();
+        if (!reply.continueAfterError) {
+          state->cancelRequested.store(true);
+          break;
+        }
+      }
+
+      state->done.fetch_add(1);
+    }
+
+    std::lock_guard<std::mutex> lock(state->mu);
+    state->finished = true;
+    state->cv.notify_all();
+  });
+
+  fileOp_->dlg->Bind(wxEVT_TIMER, [this, sources](wxTimerEvent&) {
+    if (!fileOp_ || !fileOp_->state) return;
+    const auto state = fileOp_->state;
+
+    std::optional<AsyncFileOpPrompt> prompt;
+    {
+      std::lock_guard<std::mutex> lock(state->mu);
+      prompt = state->prompt;
+    }
+    if (prompt && !fileOp_->promptActive) {
+      fileOp_->promptActive = true;
+      AsyncFileOpReply reply;
+      if (prompt->kind == AsyncFileOpPrompt::Kind::Error) {
+        wxMessageDialog dlg(this,
+                            wxString::Format("Delete failed:\n\n%s\n\nContinue?",
+                                             wxString::FromUTF8(prompt->errorMessage).c_str()),
+                            "Delete failed",
+                            wxYES_NO | wxNO_DEFAULT | wxICON_ERROR);
+        dlg.SetYesNoLabels("Continue", "Cancel");
+        reply.continueAfterError = (dlg.ShowModal() == wxID_YES);
+      }
+      {
+        std::lock_guard<std::mutex> lock(state->mu);
+        state->reply = reply;
+        state->cv.notify_all();
+      }
+      fileOp_->promptActive = false;
+    }
+
+    const auto done = state->done.load();
+    wxString label;
+    bool finished = false;
+    const bool canceling = state->cancelRequested.load();
+    {
+      std::lock_guard<std::mutex> lock(state->mu);
+      label = wxString::FromUTF8(state->currentLabel);
+      finished = state->finished;
+    }
+
+    if (!fileOp_->configured) {
+      fileOp_->range = static_cast<int>(std::max<size_t>(1, sources.size()));
+      fileOp_->gauge->SetRange(fileOp_->range);
+      fileOp_->configured = true;
+    }
+
+    fileOp_->gauge->SetValue(std::min<int>(fileOp_->range, static_cast<int>(done)));
+    if (canceling) fileOp_->titleText->SetLabel("Canceling...");
+
+    fileOp_->detailText->SetLabel(
+        wxString::Format("%s\n%zu / %zu", label.c_str(), done, sources.size()));
+    if (fileOp_->dlg) fileOp_->dlg->Layout();
+
+    if (finished) {
+      fileOp_->timer.Stop();
+      if (fileOp_->worker.joinable()) fileOp_->worker.join();
+      if (top_) top_->RefreshAll();
+      if (bottom_) bottom_->RefreshAll();
+      if (state->hasDir) {
+        if (top_) top_->RefreshTree();
+        if (bottom_) bottom_->RefreshTree();
+      }
+      if (fileOp_->dlg) fileOp_->dlg->Destroy();
+      fileOp_.reset();
+      StartNextQueuedOp();
+    }
+  }, fileOp_->timerId);
+
+  fileOp_->timer.Start(100);
+}
+
+void MainFrame::ExtractWithProgress(const std::vector<std::string>& argv,
+                                    const std::filesystem::path& refreshDir,
+                                    bool treeChanged) {
+  if (argv.empty()) return;
+  if (fileOp_) {
+    EnqueueOp(QueuedOp{.kind = OpKind::Extract,
+                       .title = "Extract",
+                       .argv = argv,
+                       .refreshDir = refreshDir,
+                       .treeChanged = treeChanged});
+    return;
+  }
+
+  fileOp_ = std::make_unique<FileOpSession>(this);
+  fileOp_->state = std::make_shared<AsyncFileOpState>();
+  fileOp_->state->hasDir = treeChanged;
+  {
+    std::lock_guard<std::mutex> lock(fileOp_->state->mu);
+    fileOp_->state->scanDone = true;
+    fileOp_->state->totalBytes = 0;
+    fileOp_->state->currentLabel = "Preparing...";
+  }
+
+  fileOp_->dlg = new wxDialog(this, wxID_ANY, "Extract", wxDefaultPosition, wxSize(650, 340),
+                              wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER | wxFRAME_FLOAT_ON_PARENT);
+  auto* root = new wxBoxSizer(wxVERTICAL);
+  fileOp_->dlg->SetSizer(root);
+
+  fileOp_->titleText = new wxStaticText(fileOp_->dlg, wxID_ANY, "Extracting...");
+  fileOp_->detailText = new wxStaticText(fileOp_->dlg, wxID_ANY, "Preparing...");
+  fileOp_->gauge = new wxGauge(fileOp_->dlg, wxID_ANY, 100);
+  fileOp_->cancelBtn = new wxButton(fileOp_->dlg, wxID_CANCEL, "Cancel");
+
+  root->Add(fileOp_->titleText, 0, wxEXPAND | wxALL, 10);
+  root->Add(fileOp_->detailText, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+  root->Add(fileOp_->gauge, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+
+  auto* queueSizer = new wxStaticBoxSizer(wxVERTICAL, fileOp_->dlg, "Queue");
+  fileOp_->queueBox = queueSizer->GetStaticBox();
+  fileOp_->queueScroll = new wxScrolledWindow(fileOp_->dlg, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+                                              wxVSCROLL);
+  fileOp_->queueScroll->SetScrollRate(0, 10);
+  fileOp_->queueItemsSizer = new wxBoxSizer(wxVERTICAL);
+  fileOp_->queueScroll->SetSizer(fileOp_->queueItemsSizer);
+  queueSizer->Add(fileOp_->queueScroll, 1, wxEXPAND | wxALL, 8);
+
+  auto* qBtns = new wxBoxSizer(wxHORIZONTAL);
+  qBtns->AddStretchSpacer(1);
+  fileOp_->clearQueueBtn = new wxButton(fileOp_->dlg, wxID_ANY, "Clear Queue");
+  qBtns->Add(fileOp_->clearQueueBtn, 0);
+  queueSizer->Add(qBtns, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
+
+  root->Add(queueSizer, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+
+  auto* btns = new wxBoxSizer(wxHORIZONTAL);
+  btns->AddStretchSpacer(1);
+  btns->Add(fileOp_->cancelBtn, 0);
+  root->Add(btns, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+  fileOp_->dlg->Layout();
+  fileOp_->dlg->Show();
+
+  fileOp_->clearQueueBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+    opQueue_.clear();
+    UpdateQueueUi();
+  });
+  UpdateQueueUi();
+
+  fileOp_->timerId = wxWindow::NewControlId();
+  fileOp_->timer.SetOwner(fileOp_->dlg, fileOp_->timerId);
+
+  fileOp_->cancelBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+    if (!fileOp_ || !fileOp_->state) return;
+    fileOp_->state->cancelRequested.store(true);
+    fileOp_->cancelBtn->Disable();
+  });
+  fileOp_->dlg->Bind(wxEVT_CLOSE_WINDOW, [this](wxCloseEvent& e) { e.Veto(); });
+
+  const auto state = fileOp_->state;
+  fileOp_->worker = std::thread([state, argv]() {
+    std::vector<wxString> argsWx;
+    argsWx.reserve(argv.size());
+    for (const auto& s : argv) argsWx.push_back(wxString::FromUTF8(s));
+
+    {
+      std::lock_guard<std::mutex> lock(state->mu);
+      state->currentLabel = argv[0];
+    }
+
+    std::vector<const wxChar*> cargv;
+    cargv.reserve(argsWx.size() + 1);
+    for (const auto& s : argsWx) cargv.push_back(s.wc_str());
+    cargv.push_back(nullptr);
+
+    const long rc = wxExecute(cargv.data(), wxEXEC_SYNC);
+    if (rc != 0) {
+      std::unique_lock<std::mutex> lock(state->mu);
+      state->prompt = AsyncFileOpPrompt{.kind = AsyncFileOpPrompt::Kind::Error,
+                                        .errorMessage = "Extractor failed (exit code " +
+                                                        std::to_string(rc) + ")."};
+      state->reply.reset();
+      state->cv.notify_all();
+      state->cv.wait(lock, [state]() { return state->reply.has_value() || state->cancelRequested.load(); });
+      state->prompt.reset();
+      state->reply.reset();
+    }
+    state->done.store(1);
+
+    std::lock_guard<std::mutex> lock(state->mu);
+    state->finished = true;
+    state->cv.notify_all();
+  });
+
+  fileOp_->dlg->Bind(wxEVT_TIMER, [this, refreshDir](wxTimerEvent&) {
+    if (!fileOp_ || !fileOp_->state) return;
+    const auto state = fileOp_->state;
+
+    std::optional<AsyncFileOpPrompt> prompt;
+    {
+      std::lock_guard<std::mutex> lock(state->mu);
+      prompt = state->prompt;
+    }
+    if (prompt && !fileOp_->promptActive) {
+      fileOp_->promptActive = true;
+      AsyncFileOpReply reply;
+      wxMessageBox(wxString::FromUTF8(prompt->errorMessage), "Extract", wxOK | wxICON_ERROR, this);
+      reply.continueAfterError = true;
+      {
+        std::lock_guard<std::mutex> lock(state->mu);
+        state->reply = reply;
+        state->cv.notify_all();
+      }
+      fileOp_->promptActive = false;
+    }
+
+    wxString label;
+    bool finished = false;
+    {
+      std::lock_guard<std::mutex> lock(state->mu);
+      label = wxString::FromUTF8(state->currentLabel);
+      finished = state->finished;
+    }
+
+    fileOp_->gauge->Pulse();
+    fileOp_->detailText->SetLabel(label);
+    if (fileOp_->dlg) fileOp_->dlg->Layout();
+
+    if (finished) {
+      fileOp_->timer.Stop();
+      if (fileOp_->worker.joinable()) fileOp_->worker.join();
+      if (top_ && (refreshDir.empty() || top_->GetDirectoryPath() == refreshDir)) top_->RefreshAll();
+      if (bottom_ && (refreshDir.empty() || bottom_->GetDirectoryPath() == refreshDir)) bottom_->RefreshAll();
+      if (state->hasDir) {
+        if (top_) top_->RefreshTree();
+        if (bottom_) bottom_->RefreshTree();
+      }
+      if (fileOp_->dlg) fileOp_->dlg->Destroy();
+      fileOp_.reset();
+      StartNextQueuedOp();
+    }
+  }, fileOp_->timerId);
+
+  fileOp_->timer.Start(100);
+}
+
+void MainFrame::EnqueueOp(QueuedOp op) {
+  if (op.id == 0) op.id = nextOpId_++;
+  opQueue_.push_back(std::move(op));
+  UpdateQueueUi();
+}
+
+void MainFrame::StartNextQueuedOp() {
+  if (fileOp_) return;
+  if (opQueue_.empty()) return;
+
+  QueuedOp op = std::move(opQueue_.front());
+  opQueue_.pop_front();
+  switch (op.kind) {
+    case OpKind::CopyMove:
+      CopyMoveWithProgressInternal(op.title, op.sources, op.dstDir, op.move, /*alreadyConfirmed=*/true);
+      break;
+    case OpKind::Trash:
+      TrashWithProgressInternal(op.sources, /*alreadyConfirmed=*/true);
+      break;
+    case OpKind::Delete:
+      DeleteWithProgressInternal(op.sources, /*alreadyConfirmed=*/true);
+      break;
+    case OpKind::Extract:
+      ExtractWithProgress(op.argv, op.refreshDir, op.treeChanged);
+      break;
+  }
 }
 
 void MainFrame::SetActivePane(ActivePane pane) {
@@ -1222,6 +2109,48 @@ void MainFrame::OnAbout(wxCommandEvent&) {
   info.SetVersion(version);
   info.SetDescription("Dual-pane file manager.");
   wxAboutBox(info, this);
+}
+
+void MainFrame::OnPreferences(wxCommandEvent&) {
+  wxConfig cfg("Quarry");
+  bool restoreLast = false;
+  cfg.Read("/prefs/startup/restore_last", &restoreLast, false);
+
+  wxDialog dlg(this, wxID_ANY, "Preferences", wxDefaultPosition, wxDefaultSize,
+               wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER);
+  auto* root = new wxBoxSizer(wxVERTICAL);
+  dlg.SetSizer(root);
+
+  wxArrayString choices;
+  choices.Add("Load Default View on startup (use View → Save View as Default)");
+  choices.Add("Restore last used view on startup (remember automatically)");
+  auto* startupMode = new wxRadioBox(&dlg,
+                                     wxID_ANY,
+                                     "Startup",
+                                     wxDefaultPosition,
+                                     wxDefaultSize,
+                                     choices,
+                                     1,
+                                     wxRA_SPECIFY_ROWS);
+  startupMode->SetSelection(restoreLast ? 1 : 0);
+  root->Add(startupMode, 0, wxALL | wxEXPAND, 10);
+
+  auto* btns = dlg.CreateButtonSizer(wxOK | wxCANCEL);
+  root->Add(btns, 0, wxALL | wxEXPAND, 10);
+
+  dlg.Fit();
+  dlg.Layout();
+  dlg.CentreOnParent();
+
+  if (dlg.ShowModal() != wxID_OK) return;
+
+  const bool newRestoreLast = (startupMode->GetSelection() == 1);
+  cfg.Write("/prefs/startup/restore_last", newRestoreLast);
+  cfg.Flush();
+
+  if (newRestoreLast) {
+    SaveLastView(/*showMessage=*/false);
+  }
 }
 
 void MainFrame::OnRefresh(wxCommandEvent&) {
@@ -1523,59 +2452,7 @@ void MainFrame::OnDelete(wxCommandEvent&) {
   auto* from = GetActivePanel();
   const auto sources = from->GetSelectedPaths();
   if (sources.empty()) return;
-
-  const auto srcDir = from->GetDirectoryPath();
-  bool hasDir = false;
-  for (const auto& p : sources) {
-    std::error_code ec;
-    if (std::filesystem::is_directory(p, ec) && !ec) {
-      hasDir = true;
-      break;
-    }
-  }
-  const auto message = wxString::Format("Move %zu item(s) to Trash?", sources.size());
-  if (wxMessageBox(message, "Trash", wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION, this) != wxYES) {
-    return;
-  }
-
-  wxProgressDialog progress("Trashing",
-                            "Preparing...",
-                            static_cast<int>(sources.size()),
-                            this,
-                            wxPD_APP_MODAL | wxPD_CAN_ABORT | wxPD_AUTO_HIDE | wxPD_ELAPSED_TIME);
-
-  for (size_t i = 0; i < sources.size(); i++) {
-    const auto& src = sources[i];
-    if (!progress.Update(static_cast<int>(i), src.filename().string())) break;
-
-    const auto result = TrashPath(src);
-    if (!result.ok) {
-      wxMessageDialog dlg(this,
-                          wxString::Format("Trash failed:\n\n%s\n\nDelete permanently instead?",
-                                           result.message.c_str()),
-                          "Trash failed",
-                          wxYES_NO | wxCANCEL | wxNO_DEFAULT | wxICON_ERROR);
-      dlg.SetYesNoCancelLabels("Delete", "Skip", "Cancel");
-      const int rc = dlg.ShowModal();
-      if (rc == wxID_YES) {
-        const auto delRes = DeletePath(src);
-        if (!delRes.ok) {
-          wxMessageDialog dlg2(this,
-                               wxString::Format("Delete failed:\n\n%s\n\nContinue?", delRes.message.c_str()),
-                               "Delete failed",
-                               wxYES_NO | wxNO_DEFAULT | wxICON_ERROR);
-          dlg2.SetYesNoLabels("Continue", "Cancel");
-          if (dlg2.ShowModal() != wxID_YES) break;
-        }
-      } else if (rc == wxID_NO) {
-        continue;
-      } else {
-        break;
-      }
-    }
-  }
-
-  RefreshPanelsShowing(srcDir, /*treeChanged=*/hasDir);
+  StartTrashOperation(sources);
 }
 
 void MainFrame::OnDeletePermanent(wxCommandEvent&) {
@@ -1584,43 +2461,7 @@ void MainFrame::OnDeletePermanent(wxCommandEvent&) {
   auto* from = GetActivePanel();
   const auto sources = from->GetSelectedPaths();
   if (sources.empty()) return;
-
-  const auto srcDir = from->GetDirectoryPath();
-  bool hasDir = false;
-  for (const auto& p : sources) {
-    std::error_code ec;
-    if (std::filesystem::is_directory(p, ec) && !ec) {
-      hasDir = true;
-      break;
-    }
-  }
-  const auto message = wxString::Format(
-      "Permanently delete %zu item(s)?\n\nThis cannot be undone.", sources.size());
-  if (wxMessageBox(message, "Delete", wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this) != wxYES) {
-    return;
-  }
-
-  wxProgressDialog progress("Deleting",
-                            "Preparing...",
-                            static_cast<int>(sources.size()),
-                            this,
-                            wxPD_APP_MODAL | wxPD_CAN_ABORT | wxPD_AUTO_HIDE | wxPD_ELAPSED_TIME);
-
-  for (size_t i = 0; i < sources.size(); i++) {
-    const auto& src = sources[i];
-    if (!progress.Update(static_cast<int>(i), src.filename().string())) break;
-
-    const auto result = DeletePath(src);
-    if (!result.ok) {
-      wxMessageDialog dlg(this,
-                          wxString::Format("Delete failed:\n\n%s\n\nContinue?", result.message.c_str()),
-                          "Delete failed",
-                          wxYES_NO | wxNO_DEFAULT | wxICON_ERROR);
-      dlg.SetYesNoLabels("Continue", "Cancel");
-      if (dlg.ShowModal() != wxID_YES) break;
-    }
-  }
-  RefreshPanelsShowing(srcDir, /*treeChanged=*/hasDir);
+  StartDeleteOperation(sources);
 }
 
 void MainFrame::OnRename(wxCommandEvent&) {

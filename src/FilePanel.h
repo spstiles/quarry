@@ -104,7 +104,9 @@ private:
   void NotifyDirContentsChanged(bool treeChanged);
   void ReselectAndReveal(const std::vector<std::string>& selectedKeys,
                          const std::optional<std::string>& currentKey);
-  void ShowListContextMenu(wxDataViewEvent& event);
+  void ShowListContextMenu(const wxDataViewItem& contextItem,
+                           const wxPoint& screenPos,
+                           bool isBackgroundContext);
   bool AnySelectedDirs() const;
   bool LoadDirectory(const std::filesystem::path& dir);
   void NavigateTo(const std::filesystem::path& dir, bool recordHistory);
@@ -165,6 +167,7 @@ private:
   wxDataViewItem renameArmedItem_{};
   long long renameArmedAtMs_{0};
   bool allowInlineEdit_{false};
+  bool suppressNextContextMenu_{false};
 
   wxTreeItemId hiddenRoot_{};
   wxTreeItemId computerRoot_{};
