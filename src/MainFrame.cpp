@@ -1520,6 +1520,7 @@ void MainFrame::TrashWithProgressInternal(const std::vector<std::filesystem::pat
 
   const auto state = fileOp_->state;
   fileOp_->worker = std::thread([state, sources]() {
+    const CancelFn shouldCancel = [state]() { return state->cancelRequested.load(); };
     for (const auto& src : sources) {
       if (state->cancelRequested.load()) break;
       if (src.empty()) {
@@ -1533,7 +1534,7 @@ void MainFrame::TrashWithProgressInternal(const std::vector<std::filesystem::pat
         state->currentLabel = fn.empty() ? src.string() : fn;
       }
 
-      const auto result = TrashPath(src);
+      const auto result = TrashPath(src, shouldCancel);
       if (!result.ok) {
         std::unique_lock<std::mutex> lock(state->mu);
         state->prompt = AsyncFileOpPrompt{.kind = AsyncFileOpPrompt::Kind::TrashFailed,

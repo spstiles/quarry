@@ -763,14 +763,43 @@ OpResult DeletePath(const fs::path& src) {
 }
 
 OpResult TrashPath(const fs::path& src) {
+  return TrashPath(src, CancelFn{});
+}
+
+OpResult TrashPath(const fs::path& src, const CancelFn& shouldCancel) {
   const auto srcStr = src.string();
 #ifdef QUARRY_USE_GIO
   // Prefer gio's native trash API when available (works for local and some remote mounts).
+  if (IsCanceled(shouldCancel)) return CanceledResult();
+
+  GCancellable* cancellable = g_cancellable_new();
+  std::atomic_bool done{false};
+  std::thread cancelWatcher;
+  if (shouldCancel) {
+    cancelWatcher = std::thread([&done, cancellable, &shouldCancel]() {
+      using namespace std::chrono_literals;
+      while (!done.load()) {
+        if (shouldCancel()) {
+          g_cancellable_cancel(cancellable);
+          break;
+        }
+        std::this_thread::sleep_for(50ms);
+      }
+    });
+  }
+
   GError* err = nullptr;
   GFile* file = g_file_new_for_commandline_arg(srcStr.c_str());
-  const gboolean ok = g_file_trash(file, /*cancellable=*/nullptr, &err);
+  const gboolean ok = g_file_trash(file, cancellable, &err);
   g_object_unref(file);
+  done.store(true);
+  if (cancelWatcher.joinable()) cancelWatcher.join();
+  g_object_unref(cancellable);
   if (!ok) {
+    if (err && g_error_matches(err, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+      g_error_free(err);
+      return CanceledResult();
+    }
     const bool fallback =
         err && (g_error_matches(err, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED) ||
                 g_error_matches(err, G_IO_ERROR, G_IO_ERROR_NOT_MOUNTED));
@@ -781,18 +810,8 @@ OpResult TrashPath(const fs::path& src) {
       return {.ok = false, .message = msg};
     }
 
-    // Some setups report NOT_SUPPORTED via g_file_trash() but the gio CLI can still
-    // succeed (depending on GVfs backend). Try it before giving up.
-    const wxString cmd0 = "gio";
-    const wxString cmd1 = "trash";
-    const wxString cmd2 = wxString(srcStr);
-    const wxChar* const argv[] = {cmd0.wc_str(), cmd1.wc_str(), cmd2.wc_str(), nullptr};
-    const long rc = wxExecute(argv, wxEXEC_SYNC);
-    if (rc == 0) return {.ok = true};
-    if (rc == -1) {
-      return {.ok = false, .message = msg + "\n\n(Also failed to run gio trash.)"};
-    }
-    return {.ok = false, .message = msg + wxString::Format("\n\n(gio trash exit code %ld)", rc)};
+    // If trash isn't supported, let the caller decide (e.g., prompt to delete permanently).
+    return {.ok = false, .message = msg};
   }
   return {.ok = true};
 #else

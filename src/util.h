@@ -37,6 +37,7 @@ OpResult MovePath(const std::filesystem::path& src,
                   const CopyBytesProgressFn& onBytes);
 OpResult DeletePath(const std::filesystem::path& src);
 OpResult TrashPath(const std::filesystem::path& src);
+OpResult TrashPath(const std::filesystem::path& src, const CancelFn& shouldCancel);
 
 bool PathExistsAny(const std::filesystem::path& p);
 bool IsDirectoryAny(const std::filesystem::path& p);
