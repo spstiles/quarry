@@ -38,12 +38,14 @@
 #include <wx/gauge.h>
 #include <wx/button.h>
 #include <wx/listbox.h>
+#include <wx/bmpbuttn.h>
 #include <wx/notebook.h>
 #include <wx/utils.h>
 #include <wx/scrolwin.h>
 #include <wx/vlbox.h>
 #include <wx/settings.h>
 #include <wx/dc.h>
+#include <wx/artprov.h>
 
 namespace {
 class QueueVListBox final : public wxVListBox {
@@ -71,6 +73,17 @@ public:
     lines_ = std::move(lines);
     SetItemCount(lines_.size());
     RefreshAll();
+  }
+
+  bool SelectOpId(std::uint64_t id) {
+    for (size_t i = 0; i < ids_.size(); i++) {
+      if (ids_[i] == id) {
+        SetSelection(static_cast<int>(i));
+        RefreshAll();
+        return true;
+      }
+    }
+    return false;
   }
 
   std::optional<std::uint64_t> GetSelectedOpId() const {
@@ -135,7 +148,10 @@ private:
 void InstallOutsideQueueDeselectHandlers(wxWindow* root,
                                         QueueVListBox* list,
                                         wxWindow* cancelSelectedBtn,
-                                        wxWindow* clearQueueBtn) {
+                                        wxWindow* clearQueueBtn,
+                                        wxWindow* moveTopBtn,
+                                        wxWindow* moveUpBtn,
+                                        wxWindow* moveDownBtn) {
   if (!root || !list) return;
 
   auto isInside = [](wxWindow* w, wxWindow* container) -> bool {
@@ -147,10 +163,17 @@ void InstallOutsideQueueDeselectHandlers(wxWindow* root,
   bindRec = [&](wxWindow* w) {
     if (!w) return;
 
-    auto handler = [list, cancelSelectedBtn, clearQueueBtn, isInside](wxMouseEvent& e) {
+    auto handler = [list,
+                    cancelSelectedBtn,
+                    clearQueueBtn,
+                    moveTopBtn,
+                    moveUpBtn,
+                    moveDownBtn,
+                    isInside](wxMouseEvent& e) {
       wxWindow* obj = dynamic_cast<wxWindow*>(e.GetEventObject());
       if (obj) {
         if (isInside(obj, list) || isInside(obj, cancelSelectedBtn) || isInside(obj, clearQueueBtn) ||
+            isInside(obj, moveTopBtn) || isInside(obj, moveUpBtn) || isInside(obj, moveDownBtn) ||
             dynamic_cast<wxButton*>(obj)) {
           e.Skip();
           return;
@@ -319,12 +342,16 @@ struct MainFrame::FileOpSession final {
   wxPanel* progressPanel{nullptr};
   wxPanel* queuePanel{nullptr};
   bool queueTabShown{false};
+  bool updatingQueueUi{false};
 
   wxStaticText* titleText{nullptr};
   wxStaticText* detailText{nullptr};
   wxGauge* gauge{nullptr};
   wxButton* cancelBtn{nullptr};
   QueueVListBox* queueList{nullptr};
+  wxBitmapButton* moveTopBtn{nullptr};
+  wxBitmapButton* moveUpBtn{nullptr};
+  wxBitmapButton* moveDownBtn{nullptr};
   wxButton* cancelQueuedBtn{nullptr};
   wxButton* clearQueueBtn{nullptr};
   wxTimer timer;
@@ -344,6 +371,8 @@ struct MainFrame::FileOpSession final {
 
 void MainFrame::UpdateQueueUi() {
   if (!fileOp_ || !fileOp_->dlg || !fileOp_->notebook || !fileOp_->queuePanel) return;
+  if (fileOp_->updatingQueueUi) return;
+  fileOp_->updatingQueueUi = true;
 
   auto describeLines = [this](const QueuedOp& op) -> std::array<wxString, 3> {
     auto itemsSummary = [this](const std::vector<std::filesystem::path>& sources) -> wxString {
@@ -426,6 +455,12 @@ void MainFrame::UpdateQueueUi() {
       if (page != wxNOT_FOUND) fileOp_->notebook->RemovePage(static_cast<size_t>(page));
       fileOp_->queueTabShown = false;
     }
+    if (fileOp_->cancelQueuedBtn) fileOp_->cancelQueuedBtn->Enable(false);
+    if (fileOp_->clearQueueBtn) fileOp_->clearQueueBtn->Enable(false);
+    if (fileOp_->moveTopBtn) fileOp_->moveTopBtn->Enable(false);
+    if (fileOp_->moveUpBtn) fileOp_->moveUpBtn->Enable(false);
+    if (fileOp_->moveDownBtn) fileOp_->moveDownBtn->Enable(false);
+    fileOp_->updatingQueueUi = false;
     return;
   }
 
@@ -438,7 +473,11 @@ void MainFrame::UpdateQueueUi() {
     if (page != wxNOT_FOUND) fileOp_->notebook->SetPageText(static_cast<size_t>(page), tabLabel);
   }
 
-  if (!fileOp_->queueList) return;
+  if (!fileOp_->queueList) {
+    fileOp_->updatingQueueUi = false;
+    return;
+  }
+  const auto selectedId = fileOp_->queueList->GetSelectedOpId();
   std::vector<std::uint64_t> ids;
   std::vector<std::array<wxString, 3>> lines;
   ids.reserve(static_cast<size_t>(count));
@@ -453,7 +492,16 @@ void MainFrame::UpdateQueueUi() {
   if (fileOp_->cancelQueuedBtn) fileOp_->cancelQueuedBtn->Enable(count > 0);
   if (fileOp_->clearQueueBtn) fileOp_->clearQueueBtn->Enable(count > 0);
   fileOp_->queueList->SetItems(std::move(ids), std::move(lines));
+  if (selectedId) (void)fileOp_->queueList->SelectOpId(*selectedId);
+
+  const int sel = fileOp_->queueList->GetSelection();
+  const bool hasSel = sel != wxNOT_FOUND;
+  if (fileOp_->cancelQueuedBtn) fileOp_->cancelQueuedBtn->Enable(hasSel);
+  if (fileOp_->moveTopBtn) fileOp_->moveTopBtn->Enable(hasSel && sel > 0);
+  if (fileOp_->moveUpBtn) fileOp_->moveUpBtn->Enable(hasSel && sel > 0);
+  if (fileOp_->moveDownBtn) fileOp_->moveDownBtn->Enable(hasSel && sel != wxNOT_FOUND && (sel + 1) < count);
   fileOp_->dlg->Layout();
+  fileOp_->updatingQueueUi = false;
 }
 
 namespace {
@@ -1296,8 +1344,24 @@ void MainFrame::CopyMoveWithProgressInternal(const wxString& title,
   fileOp_->queueList = new QueueVListBox(fileOp_->queuePanel);
   queueSizer->Add(fileOp_->queueList, 1, wxEXPAND | wxALL, 10);
   auto* qBtns = new wxBoxSizer(wxHORIZONTAL);
+  const wxSize qIconSize(16, 16);
+  fileOp_->moveTopBtn = new wxBitmapButton(fileOp_->queuePanel,
+                                           wxID_ANY,
+                                           wxArtProvider::GetBitmap(wxART_GO_HOME, wxART_TOOLBAR, qIconSize));
+  fileOp_->moveUpBtn = new wxBitmapButton(fileOp_->queuePanel,
+                                          wxID_ANY,
+                                          wxArtProvider::GetBitmap(wxART_GO_UP, wxART_TOOLBAR, qIconSize));
+  fileOp_->moveDownBtn = new wxBitmapButton(fileOp_->queuePanel,
+                                            wxID_ANY,
+                                            wxArtProvider::GetBitmap(wxART_GO_DOWN, wxART_TOOLBAR, qIconSize));
+  fileOp_->moveTopBtn->SetToolTip("Move selected operation to top");
+  fileOp_->moveUpBtn->SetToolTip("Move selected operation up");
+  fileOp_->moveDownBtn->SetToolTip("Move selected operation down");
   fileOp_->cancelQueuedBtn = new wxButton(fileOp_->queuePanel, wxID_ANY, "Cancel Selected");
   fileOp_->clearQueueBtn = new wxButton(fileOp_->queuePanel, wxID_ANY, "Clear Queue");
+  qBtns->Add(fileOp_->moveTopBtn, 0, wxRIGHT, 6);
+  qBtns->Add(fileOp_->moveUpBtn, 0, wxRIGHT, 6);
+  qBtns->Add(fileOp_->moveDownBtn, 0, wxRIGHT, 10);
   qBtns->Add(fileOp_->cancelQueuedBtn, 0, wxRIGHT, 8);
   qBtns->Add(fileOp_->clearQueueBtn, 0);
   queueSizer->Add(qBtns, 0, wxALIGN_RIGHT | wxLEFT | wxRIGHT | wxBOTTOM, 10);
@@ -1324,7 +1388,52 @@ void MainFrame::CopyMoveWithProgressInternal(const wxString& title,
     UpdateQueueUi();
   });
   fileOp_->clearQueueBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { opQueue_.clear(); UpdateQueueUi(); });
-  InstallOutsideQueueDeselectHandlers(fileOp_->dlg, fileOp_->queueList, fileOp_->cancelQueuedBtn, fileOp_->clearQueueBtn);
+
+  auto moveSelected = [this](int direction) {
+    if (!fileOp_ || !fileOp_->queueList) return;
+    const auto idOpt = fileOp_->queueList->GetSelectedOpId();
+    if (!idOpt) return;
+    const std::uint64_t id = *idOpt;
+
+    size_t idx = 0;
+    bool found = false;
+    for (size_t i = 0; i < opQueue_.size(); i++) {
+      if (opQueue_[i].id == id) {
+        idx = i;
+        found = true;
+        break;
+      }
+    }
+    if (!found) return;
+
+    if (direction == -999) { // top
+      if (idx == 0) return;
+      auto op = std::move(opQueue_[idx]);
+      opQueue_.erase(opQueue_.begin() + static_cast<std::ptrdiff_t>(idx));
+      opQueue_.push_front(std::move(op));
+    } else if (direction < 0) { // up
+      if (idx == 0) return;
+      std::swap(opQueue_[idx], opQueue_[idx - 1]);
+    } else { // down
+      if (idx + 1 >= opQueue_.size()) return;
+      std::swap(opQueue_[idx], opQueue_[idx + 1]);
+    }
+    UpdateQueueUi();
+  };
+
+  fileOp_->moveTopBtn->Bind(wxEVT_BUTTON, [moveSelected](wxCommandEvent&) { moveSelected(-999); });
+  fileOp_->moveUpBtn->Bind(wxEVT_BUTTON, [moveSelected](wxCommandEvent&) { moveSelected(-1); });
+  fileOp_->moveDownBtn->Bind(wxEVT_BUTTON, [moveSelected](wxCommandEvent&) { moveSelected(1); });
+
+  fileOp_->queueList->Bind(wxEVT_LISTBOX, [this](wxCommandEvent&) { UpdateQueueUi(); });
+
+  InstallOutsideQueueDeselectHandlers(fileOp_->dlg,
+                                      fileOp_->queueList,
+                                      fileOp_->cancelQueuedBtn,
+                                      fileOp_->clearQueueBtn,
+                                      fileOp_->moveTopBtn,
+                                      fileOp_->moveUpBtn,
+                                      fileOp_->moveDownBtn);
 
   UpdateQueueUi(); // show Queue tab only when needed
 
@@ -1691,8 +1800,24 @@ void MainFrame::TrashWithProgressInternal(const std::vector<std::filesystem::pat
   fileOp_->queueList = new QueueVListBox(fileOp_->queuePanel);
   queueSizer->Add(fileOp_->queueList, 1, wxEXPAND | wxALL, 10);
   auto* qBtns = new wxBoxSizer(wxHORIZONTAL);
+  const wxSize qIconSize(16, 16);
+  fileOp_->moveTopBtn = new wxBitmapButton(fileOp_->queuePanel,
+                                           wxID_ANY,
+                                           wxArtProvider::GetBitmap(wxART_GO_HOME, wxART_TOOLBAR, qIconSize));
+  fileOp_->moveUpBtn = new wxBitmapButton(fileOp_->queuePanel,
+                                          wxID_ANY,
+                                          wxArtProvider::GetBitmap(wxART_GO_UP, wxART_TOOLBAR, qIconSize));
+  fileOp_->moveDownBtn = new wxBitmapButton(fileOp_->queuePanel,
+                                            wxID_ANY,
+                                            wxArtProvider::GetBitmap(wxART_GO_DOWN, wxART_TOOLBAR, qIconSize));
+  fileOp_->moveTopBtn->SetToolTip("Move selected operation to top");
+  fileOp_->moveUpBtn->SetToolTip("Move selected operation up");
+  fileOp_->moveDownBtn->SetToolTip("Move selected operation down");
   fileOp_->cancelQueuedBtn = new wxButton(fileOp_->queuePanel, wxID_ANY, "Cancel Selected");
   fileOp_->clearQueueBtn = new wxButton(fileOp_->queuePanel, wxID_ANY, "Clear Queue");
+  qBtns->Add(fileOp_->moveTopBtn, 0, wxRIGHT, 6);
+  qBtns->Add(fileOp_->moveUpBtn, 0, wxRIGHT, 6);
+  qBtns->Add(fileOp_->moveDownBtn, 0, wxRIGHT, 10);
   qBtns->Add(fileOp_->cancelQueuedBtn, 0, wxRIGHT, 8);
   qBtns->Add(fileOp_->clearQueueBtn, 0);
   queueSizer->Add(qBtns, 0, wxALIGN_RIGHT | wxLEFT | wxRIGHT | wxBOTTOM, 10);
@@ -1719,7 +1844,52 @@ void MainFrame::TrashWithProgressInternal(const std::vector<std::filesystem::pat
     UpdateQueueUi();
   });
   fileOp_->clearQueueBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { opQueue_.clear(); UpdateQueueUi(); });
-  InstallOutsideQueueDeselectHandlers(fileOp_->dlg, fileOp_->queueList, fileOp_->cancelQueuedBtn, fileOp_->clearQueueBtn);
+
+  auto moveSelected = [this](int direction) {
+    if (!fileOp_ || !fileOp_->queueList) return;
+    const auto idOpt = fileOp_->queueList->GetSelectedOpId();
+    if (!idOpt) return;
+    const std::uint64_t id = *idOpt;
+
+    size_t idx = 0;
+    bool found = false;
+    for (size_t i = 0; i < opQueue_.size(); i++) {
+      if (opQueue_[i].id == id) {
+        idx = i;
+        found = true;
+        break;
+      }
+    }
+    if (!found) return;
+
+    if (direction == -999) { // top
+      if (idx == 0) return;
+      auto op = std::move(opQueue_[idx]);
+      opQueue_.erase(opQueue_.begin() + static_cast<std::ptrdiff_t>(idx));
+      opQueue_.push_front(std::move(op));
+    } else if (direction < 0) { // up
+      if (idx == 0) return;
+      std::swap(opQueue_[idx], opQueue_[idx - 1]);
+    } else { // down
+      if (idx + 1 >= opQueue_.size()) return;
+      std::swap(opQueue_[idx], opQueue_[idx + 1]);
+    }
+    UpdateQueueUi();
+  };
+
+  fileOp_->moveTopBtn->Bind(wxEVT_BUTTON, [moveSelected](wxCommandEvent&) { moveSelected(-999); });
+  fileOp_->moveUpBtn->Bind(wxEVT_BUTTON, [moveSelected](wxCommandEvent&) { moveSelected(-1); });
+  fileOp_->moveDownBtn->Bind(wxEVT_BUTTON, [moveSelected](wxCommandEvent&) { moveSelected(1); });
+
+  fileOp_->queueList->Bind(wxEVT_LISTBOX, [this](wxCommandEvent&) { UpdateQueueUi(); });
+
+  InstallOutsideQueueDeselectHandlers(fileOp_->dlg,
+                                      fileOp_->queueList,
+                                      fileOp_->cancelQueuedBtn,
+                                      fileOp_->clearQueueBtn,
+                                      fileOp_->moveTopBtn,
+                                      fileOp_->moveUpBtn,
+                                      fileOp_->moveDownBtn);
 
   UpdateQueueUi(); // show Queue tab only when needed
 
@@ -1956,8 +2126,24 @@ void MainFrame::DeleteWithProgressInternal(const std::vector<std::filesystem::pa
   fileOp_->queueList = new QueueVListBox(fileOp_->queuePanel);
   queueSizer->Add(fileOp_->queueList, 1, wxEXPAND | wxALL, 10);
   auto* qBtns = new wxBoxSizer(wxHORIZONTAL);
+  const wxSize qIconSize(16, 16);
+  fileOp_->moveTopBtn = new wxBitmapButton(fileOp_->queuePanel,
+                                           wxID_ANY,
+                                           wxArtProvider::GetBitmap(wxART_GO_HOME, wxART_TOOLBAR, qIconSize));
+  fileOp_->moveUpBtn = new wxBitmapButton(fileOp_->queuePanel,
+                                          wxID_ANY,
+                                          wxArtProvider::GetBitmap(wxART_GO_UP, wxART_TOOLBAR, qIconSize));
+  fileOp_->moveDownBtn = new wxBitmapButton(fileOp_->queuePanel,
+                                            wxID_ANY,
+                                            wxArtProvider::GetBitmap(wxART_GO_DOWN, wxART_TOOLBAR, qIconSize));
+  fileOp_->moveTopBtn->SetToolTip("Move selected operation to top");
+  fileOp_->moveUpBtn->SetToolTip("Move selected operation up");
+  fileOp_->moveDownBtn->SetToolTip("Move selected operation down");
   fileOp_->cancelQueuedBtn = new wxButton(fileOp_->queuePanel, wxID_ANY, "Cancel Selected");
   fileOp_->clearQueueBtn = new wxButton(fileOp_->queuePanel, wxID_ANY, "Clear Queue");
+  qBtns->Add(fileOp_->moveTopBtn, 0, wxRIGHT, 6);
+  qBtns->Add(fileOp_->moveUpBtn, 0, wxRIGHT, 6);
+  qBtns->Add(fileOp_->moveDownBtn, 0, wxRIGHT, 10);
   qBtns->Add(fileOp_->cancelQueuedBtn, 0, wxRIGHT, 8);
   qBtns->Add(fileOp_->clearQueueBtn, 0);
   queueSizer->Add(qBtns, 0, wxALIGN_RIGHT | wxLEFT | wxRIGHT | wxBOTTOM, 10);
@@ -1984,7 +2170,52 @@ void MainFrame::DeleteWithProgressInternal(const std::vector<std::filesystem::pa
     UpdateQueueUi();
   });
   fileOp_->clearQueueBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { opQueue_.clear(); UpdateQueueUi(); });
-  InstallOutsideQueueDeselectHandlers(fileOp_->dlg, fileOp_->queueList, fileOp_->cancelQueuedBtn, fileOp_->clearQueueBtn);
+
+  auto moveSelected = [this](int direction) {
+    if (!fileOp_ || !fileOp_->queueList) return;
+    const auto idOpt = fileOp_->queueList->GetSelectedOpId();
+    if (!idOpt) return;
+    const std::uint64_t id = *idOpt;
+
+    size_t idx = 0;
+    bool found = false;
+    for (size_t i = 0; i < opQueue_.size(); i++) {
+      if (opQueue_[i].id == id) {
+        idx = i;
+        found = true;
+        break;
+      }
+    }
+    if (!found) return;
+
+    if (direction == -999) { // top
+      if (idx == 0) return;
+      auto op = std::move(opQueue_[idx]);
+      opQueue_.erase(opQueue_.begin() + static_cast<std::ptrdiff_t>(idx));
+      opQueue_.push_front(std::move(op));
+    } else if (direction < 0) { // up
+      if (idx == 0) return;
+      std::swap(opQueue_[idx], opQueue_[idx - 1]);
+    } else { // down
+      if (idx + 1 >= opQueue_.size()) return;
+      std::swap(opQueue_[idx], opQueue_[idx + 1]);
+    }
+    UpdateQueueUi();
+  };
+
+  fileOp_->moveTopBtn->Bind(wxEVT_BUTTON, [moveSelected](wxCommandEvent&) { moveSelected(-999); });
+  fileOp_->moveUpBtn->Bind(wxEVT_BUTTON, [moveSelected](wxCommandEvent&) { moveSelected(-1); });
+  fileOp_->moveDownBtn->Bind(wxEVT_BUTTON, [moveSelected](wxCommandEvent&) { moveSelected(1); });
+
+  fileOp_->queueList->Bind(wxEVT_LISTBOX, [this](wxCommandEvent&) { UpdateQueueUi(); });
+
+  InstallOutsideQueueDeselectHandlers(fileOp_->dlg,
+                                      fileOp_->queueList,
+                                      fileOp_->cancelQueuedBtn,
+                                      fileOp_->clearQueueBtn,
+                                      fileOp_->moveTopBtn,
+                                      fileOp_->moveUpBtn,
+                                      fileOp_->moveDownBtn);
 
   UpdateQueueUi(); // show Queue tab only when needed
 
@@ -2165,8 +2396,24 @@ void MainFrame::ExtractWithProgress(const std::vector<std::string>& argv,
   fileOp_->queueList = new QueueVListBox(fileOp_->queuePanel);
   queueSizer->Add(fileOp_->queueList, 1, wxEXPAND | wxALL, 10);
   auto* qBtns = new wxBoxSizer(wxHORIZONTAL);
+  const wxSize qIconSize(16, 16);
+  fileOp_->moveTopBtn = new wxBitmapButton(fileOp_->queuePanel,
+                                           wxID_ANY,
+                                           wxArtProvider::GetBitmap(wxART_GO_HOME, wxART_TOOLBAR, qIconSize));
+  fileOp_->moveUpBtn = new wxBitmapButton(fileOp_->queuePanel,
+                                          wxID_ANY,
+                                          wxArtProvider::GetBitmap(wxART_GO_UP, wxART_TOOLBAR, qIconSize));
+  fileOp_->moveDownBtn = new wxBitmapButton(fileOp_->queuePanel,
+                                            wxID_ANY,
+                                            wxArtProvider::GetBitmap(wxART_GO_DOWN, wxART_TOOLBAR, qIconSize));
+  fileOp_->moveTopBtn->SetToolTip("Move selected operation to top");
+  fileOp_->moveUpBtn->SetToolTip("Move selected operation up");
+  fileOp_->moveDownBtn->SetToolTip("Move selected operation down");
   fileOp_->cancelQueuedBtn = new wxButton(fileOp_->queuePanel, wxID_ANY, "Cancel Selected");
   fileOp_->clearQueueBtn = new wxButton(fileOp_->queuePanel, wxID_ANY, "Clear Queue");
+  qBtns->Add(fileOp_->moveTopBtn, 0, wxRIGHT, 6);
+  qBtns->Add(fileOp_->moveUpBtn, 0, wxRIGHT, 6);
+  qBtns->Add(fileOp_->moveDownBtn, 0, wxRIGHT, 10);
   qBtns->Add(fileOp_->cancelQueuedBtn, 0, wxRIGHT, 8);
   qBtns->Add(fileOp_->clearQueueBtn, 0);
   queueSizer->Add(qBtns, 0, wxALIGN_RIGHT | wxLEFT | wxRIGHT | wxBOTTOM, 10);
@@ -2194,7 +2441,51 @@ void MainFrame::ExtractWithProgress(const std::vector<std::string>& argv,
   });
   fileOp_->clearQueueBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { opQueue_.clear(); UpdateQueueUi(); });
 
-  InstallOutsideQueueDeselectHandlers(fileOp_->dlg, fileOp_->queueList, fileOp_->cancelQueuedBtn, fileOp_->clearQueueBtn);
+  auto moveSelected = [this](int direction) {
+    if (!fileOp_ || !fileOp_->queueList) return;
+    const auto idOpt = fileOp_->queueList->GetSelectedOpId();
+    if (!idOpt) return;
+    const std::uint64_t id = *idOpt;
+
+    size_t idx = 0;
+    bool found = false;
+    for (size_t i = 0; i < opQueue_.size(); i++) {
+      if (opQueue_[i].id == id) {
+        idx = i;
+        found = true;
+        break;
+      }
+    }
+    if (!found) return;
+
+    if (direction == -999) { // top
+      if (idx == 0) return;
+      auto op = std::move(opQueue_[idx]);
+      opQueue_.erase(opQueue_.begin() + static_cast<std::ptrdiff_t>(idx));
+      opQueue_.push_front(std::move(op));
+    } else if (direction < 0) { // up
+      if (idx == 0) return;
+      std::swap(opQueue_[idx], opQueue_[idx - 1]);
+    } else { // down
+      if (idx + 1 >= opQueue_.size()) return;
+      std::swap(opQueue_[idx], opQueue_[idx + 1]);
+    }
+    UpdateQueueUi();
+  };
+
+  fileOp_->moveTopBtn->Bind(wxEVT_BUTTON, [moveSelected](wxCommandEvent&) { moveSelected(-999); });
+  fileOp_->moveUpBtn->Bind(wxEVT_BUTTON, [moveSelected](wxCommandEvent&) { moveSelected(-1); });
+  fileOp_->moveDownBtn->Bind(wxEVT_BUTTON, [moveSelected](wxCommandEvent&) { moveSelected(1); });
+
+  fileOp_->queueList->Bind(wxEVT_LISTBOX, [this](wxCommandEvent&) { UpdateQueueUi(); });
+
+  InstallOutsideQueueDeselectHandlers(fileOp_->dlg,
+                                      fileOp_->queueList,
+                                      fileOp_->cancelQueuedBtn,
+                                      fileOp_->clearQueueBtn,
+                                      fileOp_->moveTopBtn,
+                                      fileOp_->moveUpBtn,
+                                      fileOp_->moveDownBtn);
 
   UpdateQueueUi(); // show Queue tab only when needed
 
