@@ -801,7 +801,7 @@ std::vector<FilePanel::Entry> ListGioLocation(const std::string& uri, std::strin
   GError* error = nullptr;
   GFileEnumerator* en = g_file_enumerate_children(
       file,
-      "standard::name,standard::display-name,standard::type,standard::size,standard::target-uri,time::modified",
+      "standard::name,standard::display-name,standard::edit-name,standard::type,standard::size,standard::target-uri,time::modified",
       G_FILE_QUERY_INFO_NONE,
       nullptr,
       &error);
@@ -829,6 +829,8 @@ std::vector<FilePanel::Entry> ListGioLocation(const std::string& uri, std::strin
 
     const char* name = g_file_info_get_name(info);
     const char* displayName = g_file_info_get_display_name(info);
+    const char* editName =
+        g_file_info_get_attribute_string(info, G_FILE_ATTRIBUTE_STANDARD_EDIT_NAME);
     const auto ftype = g_file_info_get_file_type(info);
     // Treat only known navigable container-like types as directories.
     // In particular, G_FILE_TYPE_SPECIAL is often not a directory and attempting to
@@ -861,9 +863,9 @@ std::vector<FilePanel::Entry> ListGioLocation(const std::string& uri, std::strin
     }
 
     entries.push_back(FilePanel::Entry{
-        // Some backends (notably Windows/SMB-style) can return a non-UI filename for standard::name
-        // (e.g., a short/8.3 alias). Use display name for rendering, but keep fullPath for actions.
-        .name = displayName ? displayName : (name ? name : ""),
+        // Prefer a user-facing label. Some SMB backends return 8.3 short names for standard::name.
+        // edit-name is often the best "typed" name; display-name is localized/presented.
+        .name = editName ? editName : (displayName ? displayName : (name ? name : "")),
         .isDir = isDir,
         .size = size,
         .modified = modified,
@@ -887,7 +889,7 @@ std::vector<FilePanel::Entry> ListGioLocation(const std::string& uri, std::strin
   // Prefer "gio list" for remote locations (smb://, sftp://, etc.).
   // We include --hidden to match local directory listing behavior.
   const std::string cmd =
-      "gio list --hidden -l -u -d -a standard::name,standard::display-name,time::modified " +
+      "gio list --hidden -l -u -d -a standard::name,standard::display-name,standard::edit-name,time::modified " +
       ShellQuote(uri) + " 2>&1";
 
   FILE* pipe = popen(cmd.c_str(), "r");
@@ -942,7 +944,8 @@ std::vector<FilePanel::Entry> ListGioLocation(const std::string& uri, std::strin
     std::string modified;
     if (cols.size() >= 4) {
       const auto& attrs = cols[3];
-      name = ExtractAttrValue(attrs, "standard::display-name", {"standard::name", "time::modified"});
+      name = ExtractAttrValue(attrs, "standard::edit-name", {"standard::display-name", "standard::name", "time::modified"});
+      if (name.empty()) name = ExtractAttrValue(attrs, "standard::display-name", {"standard::name", "time::modified"});
       if (name.empty()) name = ExtractAttrValue(attrs, "standard::name", {"time::modified"});
       const auto mod = ExtractAttrValue(attrs, "time::modified", {});
       try {
@@ -1070,7 +1073,7 @@ std::vector<FilePanel::Entry> ListDir(const fs::path& dir, std::string* errorMes
       GError* error = nullptr;
       GFileEnumerator* en = g_file_enumerate_children(
           file,
-          "standard::name,standard::display-name,standard::type,standard::size,time::modified",
+          "standard::name,standard::display-name,standard::edit-name,standard::type,standard::size,time::modified",
           G_FILE_QUERY_INFO_NONE,
           nullptr,
           &error);
@@ -1098,6 +1101,8 @@ std::vector<FilePanel::Entry> ListDir(const fs::path& dir, std::string* errorMes
           }
 
           const char* displayName = g_file_info_get_display_name(info);
+          const char* editName =
+              g_file_info_get_attribute_string(info, G_FILE_ATTRIBUTE_STANDARD_EDIT_NAME);
           const char* name = g_file_info_get_name(info);
 
           std::string fullPath;
@@ -1114,7 +1119,7 @@ std::vector<FilePanel::Entry> ListDir(const fs::path& dir, std::string* errorMes
           }
 
           entries.push_back(FilePanel::Entry{
-              .name = displayName ? displayName : (name ? name : ""),
+              .name = editName ? editName : (displayName ? displayName : (name ? name : "")),
               .isDir = isDir,
               .size = size,
               .modified = modified,
