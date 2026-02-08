@@ -37,6 +37,7 @@
 #include <wx/gauge.h>
 #include <wx/button.h>
 #include <wx/listbox.h>
+#include <wx/notebook.h>
 #include <wx/utils.h>
 #include <wx/scrolwin.h>
 
@@ -182,13 +183,18 @@ static wxString FormatHMS(std::chrono::seconds s) {
 
 struct MainFrame::FileOpSession final {
   wxDialog* dlg{nullptr};
+  wxNotebook* notebook{nullptr};
+  wxPanel* progressPanel{nullptr};
+  wxPanel* queuePanel{nullptr};
+  bool queueTabShown{false};
+
   wxStaticText* titleText{nullptr};
   wxStaticText* detailText{nullptr};
   wxGauge* gauge{nullptr};
   wxButton* cancelBtn{nullptr};
-  wxStaticBox* queueBox{nullptr};
-  wxScrolledWindow* queueScroll{nullptr};
-  wxBoxSizer* queueItemsSizer{nullptr};
+  wxListBox* queueList{nullptr};
+  std::vector<std::uint64_t> queueLineToOpId{};
+  wxButton* cancelQueuedBtn{nullptr};
   wxButton* clearQueueBtn{nullptr};
   wxTimer timer;
   int timerId{wxID_ANY};
@@ -206,69 +212,120 @@ struct MainFrame::FileOpSession final {
 };
 
 void MainFrame::UpdateQueueUi() {
-  if (!fileOp_ || !fileOp_->dlg || !fileOp_->queueScroll || !fileOp_->queueItemsSizer) return;
+  if (!fileOp_ || !fileOp_->dlg || !fileOp_->notebook || !fileOp_->queuePanel) return;
 
-  auto describe = [](const QueuedOp& op) -> wxString {
+  auto describeLines = [this](const QueuedOp& op) -> std::array<wxString, 3> {
+    auto itemsSummary = [this](const std::vector<std::filesystem::path>& sources) -> wxString {
+      for (const auto& p : sources) {
+        if (LooksLikeUriPath(p)) {
+          return wxString::Format("%zu item(s)", sources.size());
+        }
+      }
+      size_t files = 0;
+      size_t dirs = 0;
+      for (const auto& p : sources) {
+        if (p.empty()) continue;
+        if (IsDirectoryAny(p)) dirs++;
+        else files++;
+      }
+      if (files == 0 && dirs == 0) return "0 items";
+      if (files == 0) return wxString::Format("%zu folder(s)", dirs);
+      if (dirs == 0) return wxString::Format("%zu file(s)", files);
+      return wxString::Format("%zu folder(s), %zu file(s)", dirs, files);
+    };
+
+    auto commonParent = [](const std::vector<std::filesystem::path>& sources) -> wxString {
+      auto parentFor = [](const std::filesystem::path& p) -> std::string {
+        const auto s = p.string();
+        if (s.find("://") != std::string::npos) {
+          if (s == "file://") return s;
+          std::string t = s;
+          while (t.size() > 1 && t.back() == '/') t.pop_back();
+          const auto pos = t.find_last_of('/');
+          return pos == std::string::npos ? t : t.substr(0, pos);
+        }
+        return p.parent_path().string();
+      };
+
+      std::optional<std::string> parent;
+      for (const auto& p : sources) {
+        if (p.empty()) continue;
+        const auto par = parentFor(p);
+        if (!parent) parent = par;
+        else if (*parent != par) return "multiple locations";
+      }
+      if (!parent) return "";
+      return wxString::FromUTF8(parent->c_str());
+    };
+
     switch (op.kind) {
       case OpKind::CopyMove: {
         const wxString verb = op.move ? "Move" : "Copy";
-        const wxString dst = wxString::FromUTF8(op.dstDir.string());
-        return wxString::Format("%s %zu item(s) → %s", verb.c_str(), op.sources.size(), dst.c_str());
+        const wxString items = itemsSummary(op.sources);
+        const wxString from = commonParent(op.sources);
+        const wxString to = wxString::FromUTF8(op.dstDir.string());
+        return {wxString::Format("%s: %s", verb.c_str(), items.c_str()),
+                wxString::Format("From: %s", from.c_str()),
+                wxString::Format("To: %s", to.c_str())};
       }
       case OpKind::Trash:
-        return wxString::Format("Trash %zu item(s)", op.sources.size());
+        return {wxString::Format("Trash: %s", itemsSummary(op.sources).c_str()),
+                wxString::Format("From: %s", commonParent(op.sources).c_str()),
+                "To: Trash"};
       case OpKind::Delete:
-        return wxString::Format("Delete %zu item(s)", op.sources.size());
+        return {wxString::Format("Delete: %s", itemsSummary(op.sources).c_str()),
+                wxString::Format("From: %s", commonParent(op.sources).c_str()),
+                "To: Permanently delete"};
       case OpKind::Extract: {
-        const wxString cmd = op.argv.empty() ? "extract" : wxString::FromUTF8(op.argv[0]);
-        return wxString::Format("Extract (%s)", cmd.c_str());
+        wxString from;
+        if (op.argv.size() >= 2) from = wxString::FromUTF8(op.argv.back());
+        const wxString to = wxString::FromUTF8(op.refreshDir.string());
+        return {wxString::Format("Extract: %s", op.title.c_str()),
+                wxString::Format("From: %s", from.c_str()),
+                wxString::Format("To: %s", to.c_str())};
       }
     }
-    return "Operation";
+    return {"Operation", "From:", "To:"};
   };
 
-  fileOp_->queueScroll->Freeze();
-  fileOp_->queueItemsSizer->Clear(/*delete_windows=*/true);
-
   const int count = static_cast<int>(opQueue_.size());
+  if (count <= 0) {
+    if (fileOp_->queueTabShown) {
+      const int page = fileOp_->notebook->FindPage(fileOp_->queuePanel);
+      if (page != wxNOT_FOUND) fileOp_->notebook->RemovePage(static_cast<size_t>(page));
+      fileOp_->queueTabShown = false;
+    }
+    return;
+  }
+
+  const wxString tabLabel = wxString::Format("Queue (%d)", count);
+  if (!fileOp_->queueTabShown) {
+    fileOp_->notebook->AddPage(fileOp_->queuePanel, tabLabel, /*select=*/false);
+    fileOp_->queueTabShown = true;
+  } else {
+    const int page = fileOp_->notebook->FindPage(fileOp_->queuePanel);
+    if (page != wxNOT_FOUND) fileOp_->notebook->SetPageText(static_cast<size_t>(page), tabLabel);
+  }
+
+  if (!fileOp_->queueList) return;
+  fileOp_->queueList->Freeze();
+  fileOp_->queueList->Clear();
+  fileOp_->queueLineToOpId.clear();
+
   for (int i = 0; i < count; i++) {
     const auto& op = opQueue_[static_cast<size_t>(i)];
-    auto* row = new wxPanel(fileOp_->queueScroll, wxID_ANY);
-    auto* hs = new wxBoxSizer(wxHORIZONTAL);
-    row->SetSizer(hs);
-
-    auto* vs = new wxBoxSizer(wxVERTICAL);
-    auto* title = new wxStaticText(row, wxID_ANY, describe(op));
-    const wxString status = (i == 0) ? "Waiting..." : "Queued...";
-    auto* st = new wxStaticText(row, wxID_ANY, status);
-    vs->Add(title, 0, wxBOTTOM, 2);
-    vs->Add(st, 0);
-    hs->Add(vs, 1, wxEXPAND | wxRIGHT, 8);
-
-    auto* cancel = new wxButton(row, wxID_ANY, "Cancel");
-    const std::uint64_t id = op.id;
-    cancel->Bind(wxEVT_BUTTON, [this, id](wxCommandEvent&) {
-      for (auto it = opQueue_.begin(); it != opQueue_.end(); ++it) {
-        if (it->id == id) {
-          opQueue_.erase(it);
-          break;
-        }
-      }
-      UpdateQueueUi();
-    });
-    hs->Add(cancel, 0, wxALIGN_CENTER_VERTICAL);
-
-    fileOp_->queueItemsSizer->Add(row, 0, wxEXPAND | wxALL, 4);
+    const auto lines = describeLines(op);
+    for (const auto& line : lines) {
+      fileOp_->queueList->Append(line);
+      fileOp_->queueLineToOpId.push_back(op.id);
+    }
+    fileOp_->queueList->Append("");
+    fileOp_->queueLineToOpId.push_back(op.id);
   }
 
-  if (fileOp_->queueBox) {
-    fileOp_->queueBox->SetLabel(count > 0 ? wxString::Format("Queue (%d)", count) : "Queue");
-  }
+  if (fileOp_->cancelQueuedBtn) fileOp_->cancelQueuedBtn->Enable(count > 0);
   if (fileOp_->clearQueueBtn) fileOp_->clearQueueBtn->Enable(count > 0);
-
-  fileOp_->queueScroll->FitInside();
-  fileOp_->queueScroll->Layout();
-  fileOp_->queueScroll->Thaw();
+  fileOp_->queueList->Thaw();
   fileOp_->dlg->Layout();
 }
 
@@ -1088,32 +1145,36 @@ void MainFrame::CopyMoveWithProgressInternal(const wxString& title,
   auto* root = new wxBoxSizer(wxVERTICAL);
   fileOp_->dlg->SetSizer(root);
 
-  fileOp_->titleText = new wxStaticText(fileOp_->dlg, wxID_ANY, move ? "Moving..." : "Copying...");
-  fileOp_->detailText = new wxStaticText(fileOp_->dlg, wxID_ANY, "Preparing...");
-  fileOp_->gauge = new wxGauge(fileOp_->dlg, wxID_ANY, fileOp_->range);
-  fileOp_->cancelBtn = new wxButton(fileOp_->dlg, wxID_CANCEL, "Cancel");
+  fileOp_->notebook = new wxNotebook(fileOp_->dlg, wxID_ANY);
+  root->Add(fileOp_->notebook, 1, wxEXPAND | wxALL, 10);
 
-  root->Add(fileOp_->titleText, 0, wxEXPAND | wxALL, 10);
-  root->Add(fileOp_->detailText, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
-  root->Add(fileOp_->gauge, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+  fileOp_->progressPanel = new wxPanel(fileOp_->notebook, wxID_ANY);
+  auto* progressSizer = new wxBoxSizer(wxVERTICAL);
+  fileOp_->progressPanel->SetSizer(progressSizer);
 
-  auto* queueSizer = new wxStaticBoxSizer(wxVERTICAL, fileOp_->dlg, "Queue");
-  fileOp_->queueBox = queueSizer->GetStaticBox();
-  fileOp_->queueScroll = new wxScrolledWindow(fileOp_->dlg, wxID_ANY, wxDefaultPosition, wxDefaultSize,
-                                              wxVSCROLL);
-  fileOp_->queueScroll->SetScrollRate(0, 10);
-  fileOp_->queueItemsSizer = new wxBoxSizer(wxVERTICAL);
-  fileOp_->queueScroll->SetSizer(fileOp_->queueItemsSizer);
-  queueSizer->Add(fileOp_->queueScroll, 1, wxEXPAND | wxALL, 8);
+  fileOp_->titleText = new wxStaticText(fileOp_->progressPanel, wxID_ANY, move ? "Moving..." : "Copying...");
+  fileOp_->detailText = new wxStaticText(fileOp_->progressPanel, wxID_ANY, "Preparing...");
+  fileOp_->gauge = new wxGauge(fileOp_->progressPanel, wxID_ANY, fileOp_->range);
 
+  progressSizer->Add(fileOp_->titleText, 0, wxEXPAND | wxALL, 10);
+  progressSizer->Add(fileOp_->detailText, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+  progressSizer->Add(fileOp_->gauge, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+
+  fileOp_->notebook->AddPage(fileOp_->progressPanel, "Progress", /*select=*/true);
+
+  fileOp_->queuePanel = new wxPanel(fileOp_->notebook, wxID_ANY);
+  auto* queueSizer = new wxBoxSizer(wxVERTICAL);
+  fileOp_->queuePanel->SetSizer(queueSizer);
+  fileOp_->queueList = new wxListBox(fileOp_->queuePanel, wxID_ANY);
+  queueSizer->Add(fileOp_->queueList, 1, wxEXPAND | wxALL, 10);
   auto* qBtns = new wxBoxSizer(wxHORIZONTAL);
-  qBtns->AddStretchSpacer(1);
-  fileOp_->clearQueueBtn = new wxButton(fileOp_->dlg, wxID_ANY, "Clear Queue");
+  fileOp_->cancelQueuedBtn = new wxButton(fileOp_->queuePanel, wxID_ANY, "Cancel Selected");
+  fileOp_->clearQueueBtn = new wxButton(fileOp_->queuePanel, wxID_ANY, "Clear Queue");
+  qBtns->Add(fileOp_->cancelQueuedBtn, 0, wxRIGHT, 8);
   qBtns->Add(fileOp_->clearQueueBtn, 0);
-  queueSizer->Add(qBtns, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
+  queueSizer->Add(qBtns, 0, wxALIGN_RIGHT | wxLEFT | wxRIGHT | wxBOTTOM, 10);
 
-  root->Add(queueSizer, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
-
+  fileOp_->cancelBtn = new wxButton(fileOp_->dlg, wxID_CANCEL, "Cancel");
   auto* btns = new wxBoxSizer(wxHORIZONTAL);
   btns->AddStretchSpacer(1);
   btns->Add(fileOp_->cancelBtn, 0);
@@ -1121,11 +1182,22 @@ void MainFrame::CopyMoveWithProgressInternal(const wxString& title,
   fileOp_->dlg->Layout();
   fileOp_->dlg->Show();
 
-  fileOp_->clearQueueBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
-    opQueue_.clear();
+  fileOp_->cancelQueuedBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+    if (!fileOp_ || !fileOp_->queueList) return;
+    const int sel = fileOp_->queueList->GetSelection();
+    if (sel == wxNOT_FOUND) return;
+    if (sel < 0 || static_cast<size_t>(sel) >= fileOp_->queueLineToOpId.size()) return;
+    const std::uint64_t id = fileOp_->queueLineToOpId[static_cast<size_t>(sel)];
+    for (auto it = opQueue_.begin(); it != opQueue_.end(); ++it) {
+      if (it->id == id) {
+        opQueue_.erase(it);
+        break;
+      }
+    }
     UpdateQueueUi();
   });
-  UpdateQueueUi();
+  fileOp_->clearQueueBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { opQueue_.clear(); UpdateQueueUi(); });
+  UpdateQueueUi(); // show Queue tab only when needed
 
   // wxTimer events are delivered to the timer owner (not the wxTimer object).
   // Bind them on the dialog so updates continue even while the main window is used.
@@ -1466,32 +1538,36 @@ void MainFrame::TrashWithProgressInternal(const std::vector<std::filesystem::pat
   auto* root = new wxBoxSizer(wxVERTICAL);
   fileOp_->dlg->SetSizer(root);
 
-  fileOp_->titleText = new wxStaticText(fileOp_->dlg, wxID_ANY, "Trashing...");
-  fileOp_->detailText = new wxStaticText(fileOp_->dlg, wxID_ANY, "Preparing...");
-  fileOp_->gauge = new wxGauge(fileOp_->dlg, wxID_ANY, fileOp_->range);
-  fileOp_->cancelBtn = new wxButton(fileOp_->dlg, wxID_CANCEL, "Cancel");
+  fileOp_->notebook = new wxNotebook(fileOp_->dlg, wxID_ANY);
+  root->Add(fileOp_->notebook, 1, wxEXPAND | wxALL, 10);
 
-  root->Add(fileOp_->titleText, 0, wxEXPAND | wxALL, 10);
-  root->Add(fileOp_->detailText, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
-  root->Add(fileOp_->gauge, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+  fileOp_->progressPanel = new wxPanel(fileOp_->notebook, wxID_ANY);
+  auto* progressSizer = new wxBoxSizer(wxVERTICAL);
+  fileOp_->progressPanel->SetSizer(progressSizer);
 
-  auto* queueSizer = new wxStaticBoxSizer(wxVERTICAL, fileOp_->dlg, "Queue");
-  fileOp_->queueBox = queueSizer->GetStaticBox();
-  fileOp_->queueScroll = new wxScrolledWindow(fileOp_->dlg, wxID_ANY, wxDefaultPosition, wxDefaultSize,
-                                              wxVSCROLL);
-  fileOp_->queueScroll->SetScrollRate(0, 10);
-  fileOp_->queueItemsSizer = new wxBoxSizer(wxVERTICAL);
-  fileOp_->queueScroll->SetSizer(fileOp_->queueItemsSizer);
-  queueSizer->Add(fileOp_->queueScroll, 1, wxEXPAND | wxALL, 8);
+  fileOp_->titleText = new wxStaticText(fileOp_->progressPanel, wxID_ANY, "Trashing...");
+  fileOp_->detailText = new wxStaticText(fileOp_->progressPanel, wxID_ANY, "Preparing...");
+  fileOp_->gauge = new wxGauge(fileOp_->progressPanel, wxID_ANY, fileOp_->range);
 
+  progressSizer->Add(fileOp_->titleText, 0, wxEXPAND | wxALL, 10);
+  progressSizer->Add(fileOp_->detailText, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+  progressSizer->Add(fileOp_->gauge, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+
+  fileOp_->notebook->AddPage(fileOp_->progressPanel, "Progress", /*select=*/true);
+
+  fileOp_->queuePanel = new wxPanel(fileOp_->notebook, wxID_ANY);
+  auto* queueSizer = new wxBoxSizer(wxVERTICAL);
+  fileOp_->queuePanel->SetSizer(queueSizer);
+  fileOp_->queueList = new wxListBox(fileOp_->queuePanel, wxID_ANY);
+  queueSizer->Add(fileOp_->queueList, 1, wxEXPAND | wxALL, 10);
   auto* qBtns = new wxBoxSizer(wxHORIZONTAL);
-  qBtns->AddStretchSpacer(1);
-  fileOp_->clearQueueBtn = new wxButton(fileOp_->dlg, wxID_ANY, "Clear Queue");
+  fileOp_->cancelQueuedBtn = new wxButton(fileOp_->queuePanel, wxID_ANY, "Cancel Selected");
+  fileOp_->clearQueueBtn = new wxButton(fileOp_->queuePanel, wxID_ANY, "Clear Queue");
+  qBtns->Add(fileOp_->cancelQueuedBtn, 0, wxRIGHT, 8);
   qBtns->Add(fileOp_->clearQueueBtn, 0);
-  queueSizer->Add(qBtns, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
+  queueSizer->Add(qBtns, 0, wxALIGN_RIGHT | wxLEFT | wxRIGHT | wxBOTTOM, 10);
 
-  root->Add(queueSizer, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
-
+  fileOp_->cancelBtn = new wxButton(fileOp_->dlg, wxID_CANCEL, "Cancel");
   auto* btns = new wxBoxSizer(wxHORIZONTAL);
   btns->AddStretchSpacer(1);
   btns->Add(fileOp_->cancelBtn, 0);
@@ -1499,11 +1575,22 @@ void MainFrame::TrashWithProgressInternal(const std::vector<std::filesystem::pat
   fileOp_->dlg->Layout();
   fileOp_->dlg->Show();
 
-  fileOp_->clearQueueBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
-    opQueue_.clear();
+  fileOp_->cancelQueuedBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+    if (!fileOp_ || !fileOp_->queueList) return;
+    const int sel = fileOp_->queueList->GetSelection();
+    if (sel == wxNOT_FOUND) return;
+    if (sel < 0 || static_cast<size_t>(sel) >= fileOp_->queueLineToOpId.size()) return;
+    const std::uint64_t id = fileOp_->queueLineToOpId[static_cast<size_t>(sel)];
+    for (auto it = opQueue_.begin(); it != opQueue_.end(); ++it) {
+      if (it->id == id) {
+        opQueue_.erase(it);
+        break;
+      }
+    }
     UpdateQueueUi();
   });
-  UpdateQueueUi();
+  fileOp_->clearQueueBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { opQueue_.clear(); UpdateQueueUi(); });
+  UpdateQueueUi(); // show Queue tab only when needed
 
   fileOp_->timerId = wxWindow::NewControlId();
   fileOp_->timer.SetOwner(fileOp_->dlg, fileOp_->timerId);
@@ -1714,32 +1801,36 @@ void MainFrame::DeleteWithProgressInternal(const std::vector<std::filesystem::pa
   auto* root = new wxBoxSizer(wxVERTICAL);
   fileOp_->dlg->SetSizer(root);
 
-  fileOp_->titleText = new wxStaticText(fileOp_->dlg, wxID_ANY, "Deleting...");
-  fileOp_->detailText = new wxStaticText(fileOp_->dlg, wxID_ANY, "Preparing...");
-  fileOp_->gauge = new wxGauge(fileOp_->dlg, wxID_ANY, fileOp_->range);
-  fileOp_->cancelBtn = new wxButton(fileOp_->dlg, wxID_CANCEL, "Cancel");
+  fileOp_->notebook = new wxNotebook(fileOp_->dlg, wxID_ANY);
+  root->Add(fileOp_->notebook, 1, wxEXPAND | wxALL, 10);
 
-  root->Add(fileOp_->titleText, 0, wxEXPAND | wxALL, 10);
-  root->Add(fileOp_->detailText, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
-  root->Add(fileOp_->gauge, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+  fileOp_->progressPanel = new wxPanel(fileOp_->notebook, wxID_ANY);
+  auto* progressSizer = new wxBoxSizer(wxVERTICAL);
+  fileOp_->progressPanel->SetSizer(progressSizer);
 
-  auto* queueSizer = new wxStaticBoxSizer(wxVERTICAL, fileOp_->dlg, "Queue");
-  fileOp_->queueBox = queueSizer->GetStaticBox();
-  fileOp_->queueScroll = new wxScrolledWindow(fileOp_->dlg, wxID_ANY, wxDefaultPosition, wxDefaultSize,
-                                              wxVSCROLL);
-  fileOp_->queueScroll->SetScrollRate(0, 10);
-  fileOp_->queueItemsSizer = new wxBoxSizer(wxVERTICAL);
-  fileOp_->queueScroll->SetSizer(fileOp_->queueItemsSizer);
-  queueSizer->Add(fileOp_->queueScroll, 1, wxEXPAND | wxALL, 8);
+  fileOp_->titleText = new wxStaticText(fileOp_->progressPanel, wxID_ANY, "Deleting...");
+  fileOp_->detailText = new wxStaticText(fileOp_->progressPanel, wxID_ANY, "Preparing...");
+  fileOp_->gauge = new wxGauge(fileOp_->progressPanel, wxID_ANY, fileOp_->range);
 
+  progressSizer->Add(fileOp_->titleText, 0, wxEXPAND | wxALL, 10);
+  progressSizer->Add(fileOp_->detailText, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+  progressSizer->Add(fileOp_->gauge, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+
+  fileOp_->notebook->AddPage(fileOp_->progressPanel, "Progress", /*select=*/true);
+
+  fileOp_->queuePanel = new wxPanel(fileOp_->notebook, wxID_ANY);
+  auto* queueSizer = new wxBoxSizer(wxVERTICAL);
+  fileOp_->queuePanel->SetSizer(queueSizer);
+  fileOp_->queueList = new wxListBox(fileOp_->queuePanel, wxID_ANY);
+  queueSizer->Add(fileOp_->queueList, 1, wxEXPAND | wxALL, 10);
   auto* qBtns = new wxBoxSizer(wxHORIZONTAL);
-  qBtns->AddStretchSpacer(1);
-  fileOp_->clearQueueBtn = new wxButton(fileOp_->dlg, wxID_ANY, "Clear Queue");
+  fileOp_->cancelQueuedBtn = new wxButton(fileOp_->queuePanel, wxID_ANY, "Cancel Selected");
+  fileOp_->clearQueueBtn = new wxButton(fileOp_->queuePanel, wxID_ANY, "Clear Queue");
+  qBtns->Add(fileOp_->cancelQueuedBtn, 0, wxRIGHT, 8);
   qBtns->Add(fileOp_->clearQueueBtn, 0);
-  queueSizer->Add(qBtns, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
+  queueSizer->Add(qBtns, 0, wxALIGN_RIGHT | wxLEFT | wxRIGHT | wxBOTTOM, 10);
 
-  root->Add(queueSizer, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
-
+  fileOp_->cancelBtn = new wxButton(fileOp_->dlg, wxID_CANCEL, "Cancel");
   auto* btns = new wxBoxSizer(wxHORIZONTAL);
   btns->AddStretchSpacer(1);
   btns->Add(fileOp_->cancelBtn, 0);
@@ -1747,11 +1838,22 @@ void MainFrame::DeleteWithProgressInternal(const std::vector<std::filesystem::pa
   fileOp_->dlg->Layout();
   fileOp_->dlg->Show();
 
-  fileOp_->clearQueueBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
-    opQueue_.clear();
+  fileOp_->cancelQueuedBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+    if (!fileOp_ || !fileOp_->queueList) return;
+    const int sel = fileOp_->queueList->GetSelection();
+    if (sel == wxNOT_FOUND) return;
+    if (sel < 0 || static_cast<size_t>(sel) >= fileOp_->queueLineToOpId.size()) return;
+    const std::uint64_t id = fileOp_->queueLineToOpId[static_cast<size_t>(sel)];
+    for (auto it = opQueue_.begin(); it != opQueue_.end(); ++it) {
+      if (it->id == id) {
+        opQueue_.erase(it);
+        break;
+      }
+    }
     UpdateQueueUi();
   });
-  UpdateQueueUi();
+  fileOp_->clearQueueBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { opQueue_.clear(); UpdateQueueUi(); });
+  UpdateQueueUi(); // show Queue tab only when needed
 
   fileOp_->timerId = wxWindow::NewControlId();
   fileOp_->timer.SetOwner(fileOp_->dlg, fileOp_->timerId);
@@ -1906,32 +2008,36 @@ void MainFrame::ExtractWithProgress(const std::vector<std::string>& argv,
   auto* root = new wxBoxSizer(wxVERTICAL);
   fileOp_->dlg->SetSizer(root);
 
-  fileOp_->titleText = new wxStaticText(fileOp_->dlg, wxID_ANY, "Extracting...");
-  fileOp_->detailText = new wxStaticText(fileOp_->dlg, wxID_ANY, "Preparing...");
-  fileOp_->gauge = new wxGauge(fileOp_->dlg, wxID_ANY, 100);
-  fileOp_->cancelBtn = new wxButton(fileOp_->dlg, wxID_CANCEL, "Cancel");
+  fileOp_->notebook = new wxNotebook(fileOp_->dlg, wxID_ANY);
+  root->Add(fileOp_->notebook, 1, wxEXPAND | wxALL, 10);
 
-  root->Add(fileOp_->titleText, 0, wxEXPAND | wxALL, 10);
-  root->Add(fileOp_->detailText, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
-  root->Add(fileOp_->gauge, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+  fileOp_->progressPanel = new wxPanel(fileOp_->notebook, wxID_ANY);
+  auto* progressSizer = new wxBoxSizer(wxVERTICAL);
+  fileOp_->progressPanel->SetSizer(progressSizer);
 
-  auto* queueSizer = new wxStaticBoxSizer(wxVERTICAL, fileOp_->dlg, "Queue");
-  fileOp_->queueBox = queueSizer->GetStaticBox();
-  fileOp_->queueScroll = new wxScrolledWindow(fileOp_->dlg, wxID_ANY, wxDefaultPosition, wxDefaultSize,
-                                              wxVSCROLL);
-  fileOp_->queueScroll->SetScrollRate(0, 10);
-  fileOp_->queueItemsSizer = new wxBoxSizer(wxVERTICAL);
-  fileOp_->queueScroll->SetSizer(fileOp_->queueItemsSizer);
-  queueSizer->Add(fileOp_->queueScroll, 1, wxEXPAND | wxALL, 8);
+  fileOp_->titleText = new wxStaticText(fileOp_->progressPanel, wxID_ANY, "Extracting...");
+  fileOp_->detailText = new wxStaticText(fileOp_->progressPanel, wxID_ANY, "Preparing...");
+  fileOp_->gauge = new wxGauge(fileOp_->progressPanel, wxID_ANY, 100);
 
+  progressSizer->Add(fileOp_->titleText, 0, wxEXPAND | wxALL, 10);
+  progressSizer->Add(fileOp_->detailText, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+  progressSizer->Add(fileOp_->gauge, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+
+  fileOp_->notebook->AddPage(fileOp_->progressPanel, "Progress", /*select=*/true);
+
+  fileOp_->queuePanel = new wxPanel(fileOp_->notebook, wxID_ANY);
+  auto* queueSizer = new wxBoxSizer(wxVERTICAL);
+  fileOp_->queuePanel->SetSizer(queueSizer);
+  fileOp_->queueList = new wxListBox(fileOp_->queuePanel, wxID_ANY);
+  queueSizer->Add(fileOp_->queueList, 1, wxEXPAND | wxALL, 10);
   auto* qBtns = new wxBoxSizer(wxHORIZONTAL);
-  qBtns->AddStretchSpacer(1);
-  fileOp_->clearQueueBtn = new wxButton(fileOp_->dlg, wxID_ANY, "Clear Queue");
+  fileOp_->cancelQueuedBtn = new wxButton(fileOp_->queuePanel, wxID_ANY, "Cancel Selected");
+  fileOp_->clearQueueBtn = new wxButton(fileOp_->queuePanel, wxID_ANY, "Clear Queue");
+  qBtns->Add(fileOp_->cancelQueuedBtn, 0, wxRIGHT, 8);
   qBtns->Add(fileOp_->clearQueueBtn, 0);
-  queueSizer->Add(qBtns, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
+  queueSizer->Add(qBtns, 0, wxALIGN_RIGHT | wxLEFT | wxRIGHT | wxBOTTOM, 10);
 
-  root->Add(queueSizer, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
-
+  fileOp_->cancelBtn = new wxButton(fileOp_->dlg, wxID_CANCEL, "Cancel");
   auto* btns = new wxBoxSizer(wxHORIZONTAL);
   btns->AddStretchSpacer(1);
   btns->Add(fileOp_->cancelBtn, 0);
@@ -1939,11 +2045,22 @@ void MainFrame::ExtractWithProgress(const std::vector<std::string>& argv,
   fileOp_->dlg->Layout();
   fileOp_->dlg->Show();
 
-  fileOp_->clearQueueBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
-    opQueue_.clear();
+  fileOp_->cancelQueuedBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+    if (!fileOp_ || !fileOp_->queueList) return;
+    const int sel = fileOp_->queueList->GetSelection();
+    if (sel == wxNOT_FOUND) return;
+    if (sel < 0 || static_cast<size_t>(sel) >= fileOp_->queueLineToOpId.size()) return;
+    const std::uint64_t id = fileOp_->queueLineToOpId[static_cast<size_t>(sel)];
+    for (auto it = opQueue_.begin(); it != opQueue_.end(); ++it) {
+      if (it->id == id) {
+        opQueue_.erase(it);
+        break;
+      }
+    }
     UpdateQueueUi();
   });
-  UpdateQueueUi();
+  fileOp_->clearQueueBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { opQueue_.clear(); UpdateQueueUi(); });
+  UpdateQueueUi(); // show Queue tab only when needed
 
   fileOp_->timerId = wxWindow::NewControlId();
   fileOp_->timer.SetOwner(fileOp_->dlg, fileOp_->timerId);
