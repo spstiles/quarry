@@ -861,11 +861,16 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
     }
 
     wxString remaining = "Remaining: --:--:--";
+    wxString speed = "Speed: -- MB/s";
     if (fileOp_->configured && totalBytes > 0 && bytesDone > 0) {
       const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
           std::chrono::steady_clock::now() - fileOp_->start);
       const auto elapsedSec = std::max<long long>(1, elapsed.count());
-      const double rate = static_cast<double>(bytesDone) / static_cast<double>(elapsedSec);
+      const double bytesPerSec = static_cast<double>(bytesDone) / static_cast<double>(elapsedSec);
+      const double mbPerSec = bytesPerSec / (1024.0 * 1024.0);
+      speed = wxString::Format("Speed: %.1f MB/s", mbPerSec);
+
+      const double rate = bytesPerSec;
       if (rate > 1.0) {
         const auto left = static_cast<double>(totalBytes > bytesDone ? (totalBytes - bytesDone) : 0);
         const auto remSec = static_cast<long long>(left / rate);
@@ -876,8 +881,8 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
     if (canceling) {
       fileOp_->titleText->SetLabel("Canceling...");
     }
-    if (!label.empty()) fileOp_->detailText->SetLabel(label + "\n" + remaining);
-    else fileOp_->detailText->SetLabel(remaining);
+    if (!label.empty()) fileOp_->detailText->SetLabel(label + "\n" + speed + "   " + remaining);
+    else fileOp_->detailText->SetLabel(speed + "   " + remaining);
 
     if (fileOp_->dlg) {
       fileOp_->dlg->Layout();
