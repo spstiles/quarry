@@ -1010,6 +1010,17 @@ std::string GetRowName(wxDataViewListCtrl* list, unsigned int row) {
   return v.GetString().ToStdString();
 }
 
+wxString GetRowNameWx(wxDataViewListCtrl* list, unsigned int row) {
+  wxVariant v;
+  list->GetValue(v, row, COL_NAME);
+  if (v.GetType() == "wxDataViewIconText") {
+    wxDataViewIconText it;
+    it << v;
+    return it.GetText();
+  }
+  return v.GetString();
+}
+
 void SetRowName(wxDataViewListCtrl* list, unsigned int row, const std::string& name, bool isDir) {
   const auto artId = isDir ? wxART_FOLDER : wxART_NORMAL_FILE;
   const auto bundle = wxArtProvider::GetBitmapBundle(artId, wxART_OTHER, wxSize(16, 16));
@@ -1182,16 +1193,20 @@ void WxProcessDeleter::operator()(wxProcess* p) const { delete p; }
 
 #ifdef QUARRY_USE_GIO
 static OpResult GioRenameInPlace(const std::string& srcUriOrPath,
-                                const std::string& newNameUtf8,
+                                const wxString& newNameWx,
                                 const std::string& mountUri,
                                 wxWindow* parentForAuth) {
   (void)parentForAuth;
 
   auto attempt = [&]() -> std::pair<bool, wxString> {
+    const wxScopedCharBuffer newNameBuf = newNameWx.ToUTF8();
+    if (!newNameBuf.data()) return {false, "Invalid UTF-8 name."};
+    if (!g_utf8_validate(newNameBuf.data(), -1, nullptr)) return {false, "Invalid UTF-8 name."};
+
     GFile* src = g_file_new_for_commandline_arg(srcUriOrPath.c_str());
     if (!src) return {false, "Invalid source."};
     GError* err = nullptr;
-    GFile* renamed = g_file_set_display_name(src, newNameUtf8.c_str(), /*cancellable=*/nullptr, &err);
+    GFile* renamed = g_file_set_display_name(src, newNameBuf.data(), /*cancellable=*/nullptr, &err);
     g_object_unref(src);
     if (!renamed) {
       const wxString msg = err && err->message ? wxString::FromUTF8(err->message) : "Rename failed.";
@@ -2336,7 +2351,15 @@ void FilePanel::OnListValueChanged(wxDataViewEvent& event) {
   if (row == wxNOT_FOUND) return;
   if (row < 0 || static_cast<size_t>(row) >= currentEntries_.size()) return;
 
-  const auto newName = GetRowName(list_, static_cast<unsigned int>(row));
+  const wxString newNameWx = GetRowNameWx(list_, static_cast<unsigned int>(row));
+  const wxScopedCharBuffer newNameBuf = newNameWx.ToUTF8();
+  if (!newNameBuf.data() || (listingMode_ == ListingMode::Gio && !g_utf8_validate(newNameBuf.data(), -1, nullptr))) {
+    wxMessageBox("Invalid UTF-8 name.", "Rename", wxOK | wxICON_WARNING, DialogParent());
+    const auto& e = currentEntries_[static_cast<size_t>(row)];
+    SetRowName(list_, static_cast<unsigned int>(row), e.name, e.isDir);
+    return;
+  }
+  const std::string newName = newNameBuf.data() ? std::string(newNameBuf.data()) : std::string{};
   const auto oldName = currentEntries_[row].name;
   const bool renamedDir = currentEntries_[row].isDir;
 
@@ -2356,7 +2379,7 @@ void FilePanel::OnListValueChanged(wxDataViewEvent& event) {
   if (isGio) {
 #ifdef QUARRY_USE_GIO
     const std::string mountUri = (listingMode_ == ListingMode::Gio) ? currentDir_.string() : std::string{};
-    const auto res = GioRenameInPlace(oldStr, newName, mountUri, DialogParent());
+    const auto res = GioRenameInPlace(oldStr, newNameWx, mountUri, DialogParent());
     if (!res.ok) {
       wxMessageBox(wxString::Format("Rename failed:\n\n%s", res.message.c_str()),
                    "Rename",
