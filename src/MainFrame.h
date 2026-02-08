@@ -11,6 +11,10 @@ class wxSplitterWindow;
 class MainFrame final : public wxFrame {
 public:
   MainFrame();
+  void StartFileOperation(const wxString& title,
+                          const std::vector<std::filesystem::path>& sources,
+                          const std::filesystem::path& dstDir,
+                          bool move);
 
 private:
   enum class ActivePane { Top, Bottom };

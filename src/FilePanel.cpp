@@ -1,5 +1,6 @@
 #include "FilePanel.h"
 
+#include "MainFrame.h"
 #include "NavIcons.h"
 #include "util.h"
 
@@ -2364,69 +2365,17 @@ void FilePanel::PasteIntoCurrentDir() {
   const bool isMove = g_clipboard->mode == AppClipboard::Mode::Cut;
   const auto title = isMove ? "Paste (Move)" : "Paste (Copy)";
 
-  wxProgressDialog progress(title,
-                            "Preparing...",
-                            static_cast<int>(g_clipboard->paths.size()),
-                            this,
-                            wxPD_APP_MODAL | wxPD_CAN_ABORT | wxPD_AUTO_HIDE | wxPD_ELAPSED_TIME);
-
-  bool cancelAll = false;
-  for (size_t i = 0; i < g_clipboard->paths.size(); i++) {
-    const auto& src = g_clipboard->paths[i];
-    if (!PathExistsAny(src)) continue;
-
-    auto dst = JoinDirAndNameAny(currentDir_, src.filename().string());
-    if (!progress.Update(static_cast<int>(i), src.filename().string())) break;
-
-    bool skipItem = false;
-    for (;;) {
-      if (!PathExistsAny(dst)) break;
-
-      const auto choice = PromptExists(this, dst);
-      if (choice == ExistsChoice::Skip) {
-        skipItem = true;
-        break;
-      }
-      if (choice == ExistsChoice::Cancel) {
-        cancelAll = true;
-        break;
-      }
-      if (choice == ExistsChoice::Rename) {
-        wxTextEntryDialog nameDlg(this, "New name:", "Rename", dst.filename().string());
-        if (nameDlg.ShowModal() != wxID_OK) {
-          cancelAll = true;
-          break;
-        }
-        dst = JoinDirAndNameAny(currentDir_, nameDlg.GetValue().ToStdString());
-        continue;
-      }
-      break; // Overwrite
-    }
-
-    if (cancelAll) break;
-    if (skipItem) continue;
-
-    const auto result = isMove ? MovePath(src, dst) : CopyPathRecursive(src, dst);
-    if (!result.ok) {
-      const wxString action = isMove ? "Move" : "Copy";
-      wxMessageDialog dlg(this,
-                          wxString::Format("%s failed:\n\n%s\n\nContinue?",
-                                           action.c_str(),
-                                           result.message.c_str()),
-                          title,
-                          wxYES_NO | wxNO_DEFAULT | wxICON_ERROR);
-      dlg.SetYesNoLabels("Continue", "Cancel");
-      if (dlg.ShowModal() != wxID_YES) break;
-    }
+  auto* tlp = wxGetTopLevelParent(this);
+  auto* frame = dynamic_cast<MainFrame*>(tlp);
+  if (!frame) {
+    wxMessageBox("Paste is not available here.", "Quarry", wxOK | wxICON_INFORMATION, this);
+    return;
   }
 
-  // If we cut, clear clipboard after paste attempt (common file manager behavior).
-  if (isMove) g_clipboard.reset();
+  frame->StartFileOperation(title, g_clipboard->paths, currentDir_, isMove);
 
-  const bool treeChanged = true; // files or dirs might have been added/removed
-  RefreshAll();
-  RefreshTree();
-  NotifyDirContentsChanged(treeChanged);
+  // If we cut, clear clipboard after starting the move (prevents repeat pastes).
+  if (isMove) g_clipboard.reset();
 }
 
 void FilePanel::TrashSelection() {

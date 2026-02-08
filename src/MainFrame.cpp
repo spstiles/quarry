@@ -383,6 +383,13 @@ MainFrame::MainFrame()
   SetActivePane(ActivePane::Top);
 }
 
+void MainFrame::StartFileOperation(const wxString& title,
+                                   const std::vector<std::filesystem::path>& sources,
+                                   const std::filesystem::path& dstDir,
+                                   bool move) {
+  CopyMoveWithProgress(title, sources, dstDir, move);
+}
+
 void MainFrame::BuildMenu() {
   auto* fileMenu = new wxMenu();
   fileMenu->Append(ID_ConnectToServer, "Connect to Server...\tCtrl+L");
