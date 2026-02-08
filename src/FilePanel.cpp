@@ -2311,7 +2311,7 @@ void FilePanel::CutSelection() {
 
 void FilePanel::PasteIntoCurrentDir() {
   if (!g_clipboard || g_clipboard->paths.empty()) return;
-  if (listingMode_ != ListingMode::Directory) {
+  if (listingMode_ != ListingMode::Directory && listingMode_ != ListingMode::Gio) {
     wxMessageBox("Paste is not available here.", "Quarry", wxOK | wxICON_INFORMATION, this);
     return;
   }
@@ -2329,15 +2329,14 @@ void FilePanel::PasteIntoCurrentDir() {
   bool cancelAll = false;
   for (size_t i = 0; i < g_clipboard->paths.size(); i++) {
     const auto& src = g_clipboard->paths[i];
-    if (!fs::exists(src)) continue;
+    if (!PathExistsAny(src)) continue;
 
-    auto dst = currentDir_ / src.filename();
+    auto dst = JoinDirAndNameAny(currentDir_, src.filename().string());
     if (!progress.Update(static_cast<int>(i), src.filename().string())) break;
 
     bool skipItem = false;
     for (;;) {
-      std::error_code existsEc;
-      if (!fs::exists(dst, existsEc)) break;
+      if (!PathExistsAny(dst)) break;
 
       const auto choice = PromptExists(this, dst);
       if (choice == ExistsChoice::Skip) {
@@ -2354,7 +2353,7 @@ void FilePanel::PasteIntoCurrentDir() {
           cancelAll = true;
           break;
         }
-        dst = currentDir_ / nameDlg.GetValue().ToStdString();
+        dst = JoinDirAndNameAny(currentDir_, nameDlg.GetValue().ToStdString());
         continue;
       }
       break; // Overwrite
@@ -3023,15 +3022,16 @@ void FilePanel::ShowListContextMenu(wxDataViewEvent& event) {
 
   const auto selected = GetSelectedPaths();
   const bool hasSelection = !selected.empty();
+  const bool allowCopyPaste = listingMode_ == ListingMode::Directory || listingMode_ == ListingMode::Gio;
   const bool allowFsOps = listingMode_ == ListingMode::Directory;
   menu.Enable(ID_CTX_OPEN, hasSelection);
-  menu.Enable(ID_CTX_COPY, allowFsOps && hasSelection);
-  menu.Enable(ID_CTX_CUT, allowFsOps && hasSelection);
+  menu.Enable(ID_CTX_COPY, allowCopyPaste && hasSelection);
+  menu.Enable(ID_CTX_CUT, allowCopyPaste && hasSelection);
   menu.Enable(ID_CTX_RENAME, allowFsOps && selected.size() == 1);
   menu.Enable(ID_CTX_NEW_FOLDER, allowFsOps);
   menu.Enable(ID_CTX_TRASH, allowFsOps && hasSelection);
   menu.Enable(ID_CTX_DELETE_PERM, allowFsOps && hasSelection);
-  menu.Enable(ID_CTX_PASTE, allowFsOps && g_clipboard && !g_clipboard->paths.empty());
+  menu.Enable(ID_CTX_PASTE, allowCopyPaste && g_clipboard && !g_clipboard->paths.empty());
 
   menu.Bind(wxEVT_MENU, [this](wxCommandEvent&) { OpenSelection(); }, ID_CTX_OPEN);
   menu.Bind(wxEVT_MENU, [this](wxCommandEvent&) { CopySelection(); }, ID_CTX_COPY);
