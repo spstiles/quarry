@@ -26,7 +26,7 @@ add_executable(quarry
 
 target_include_directories(quarry PRIVATE src)
 target_link_libraries(quarry PRIVATE ${wxWidgets_LIBRARIES})
-target_compile_definitions(quarry PRIVATE QUARRY_VERSION=\"1.0.0\")
+target_compile_definitions(quarry PRIVATE QUARRY_VERSION=\"1.1.0\")
 
 if(GIO_FOUND)
   target_compile_definitions(quarry PRIVATE QUARRY_USE_GIO=1)
