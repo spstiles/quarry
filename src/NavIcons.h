@@ -8,9 +8,9 @@ enum class NavIcon {
   Back,
   Forward,
   Up,
+  Top,
   Refresh,
   Home,
 };
 
 wxBitmapBundle MakeNavIconBundle(NavIcon icon, const wxSize& size, const wxColour& color);
-

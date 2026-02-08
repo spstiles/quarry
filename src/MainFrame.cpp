@@ -1,6 +1,7 @@
 #include "MainFrame.h"
 
 #include "Connections.h"
+#include "NavIcons.h"
 #include "util.h"
 
 #include <filesystem>
@@ -1345,9 +1346,11 @@ void MainFrame::CopyMoveWithProgressInternal(const wxString& title,
   queueSizer->Add(fileOp_->queueList, 1, wxEXPAND | wxALL, 10);
   auto* qBtns = new wxBoxSizer(wxHORIZONTAL);
   const wxSize qIconSize(16, 16);
-  fileOp_->moveTopBtn = new wxBitmapButton(fileOp_->queuePanel,
-                                           wxID_ANY,
-                                           wxArtProvider::GetBitmap(wxART_GO_HOME, wxART_TOOLBAR, qIconSize));
+  const wxColour qIconColor = wxSystemSettings::GetColour(wxSYS_COLOUR_BTNTEXT);
+  fileOp_->moveTopBtn =
+      new wxBitmapButton(fileOp_->queuePanel,
+                         wxID_ANY,
+                         MakeNavIconBundle(NavIcon::Top, qIconSize, qIconColor).GetBitmap(qIconSize));
   fileOp_->moveUpBtn = new wxBitmapButton(fileOp_->queuePanel,
                                           wxID_ANY,
                                           wxArtProvider::GetBitmap(wxART_GO_UP, wxART_TOOLBAR, qIconSize));
@@ -1801,9 +1804,11 @@ void MainFrame::TrashWithProgressInternal(const std::vector<std::filesystem::pat
   queueSizer->Add(fileOp_->queueList, 1, wxEXPAND | wxALL, 10);
   auto* qBtns = new wxBoxSizer(wxHORIZONTAL);
   const wxSize qIconSize(16, 16);
-  fileOp_->moveTopBtn = new wxBitmapButton(fileOp_->queuePanel,
-                                           wxID_ANY,
-                                           wxArtProvider::GetBitmap(wxART_GO_HOME, wxART_TOOLBAR, qIconSize));
+  const wxColour qIconColor = wxSystemSettings::GetColour(wxSYS_COLOUR_BTNTEXT);
+  fileOp_->moveTopBtn =
+      new wxBitmapButton(fileOp_->queuePanel,
+                         wxID_ANY,
+                         MakeNavIconBundle(NavIcon::Top, qIconSize, qIconColor).GetBitmap(qIconSize));
   fileOp_->moveUpBtn = new wxBitmapButton(fileOp_->queuePanel,
                                           wxID_ANY,
                                           wxArtProvider::GetBitmap(wxART_GO_UP, wxART_TOOLBAR, qIconSize));
@@ -2127,9 +2132,11 @@ void MainFrame::DeleteWithProgressInternal(const std::vector<std::filesystem::pa
   queueSizer->Add(fileOp_->queueList, 1, wxEXPAND | wxALL, 10);
   auto* qBtns = new wxBoxSizer(wxHORIZONTAL);
   const wxSize qIconSize(16, 16);
-  fileOp_->moveTopBtn = new wxBitmapButton(fileOp_->queuePanel,
-                                           wxID_ANY,
-                                           wxArtProvider::GetBitmap(wxART_GO_HOME, wxART_TOOLBAR, qIconSize));
+  const wxColour qIconColor = wxSystemSettings::GetColour(wxSYS_COLOUR_BTNTEXT);
+  fileOp_->moveTopBtn =
+      new wxBitmapButton(fileOp_->queuePanel,
+                         wxID_ANY,
+                         MakeNavIconBundle(NavIcon::Top, qIconSize, qIconColor).GetBitmap(qIconSize));
   fileOp_->moveUpBtn = new wxBitmapButton(fileOp_->queuePanel,
                                           wxID_ANY,
                                           wxArtProvider::GetBitmap(wxART_GO_UP, wxART_TOOLBAR, qIconSize));
@@ -2397,9 +2404,11 @@ void MainFrame::ExtractWithProgress(const std::vector<std::string>& argv,
   queueSizer->Add(fileOp_->queueList, 1, wxEXPAND | wxALL, 10);
   auto* qBtns = new wxBoxSizer(wxHORIZONTAL);
   const wxSize qIconSize(16, 16);
-  fileOp_->moveTopBtn = new wxBitmapButton(fileOp_->queuePanel,
-                                           wxID_ANY,
-                                           wxArtProvider::GetBitmap(wxART_GO_HOME, wxART_TOOLBAR, qIconSize));
+  const wxColour qIconColor = wxSystemSettings::GetColour(wxSYS_COLOUR_BTNTEXT);
+  fileOp_->moveTopBtn =
+      new wxBitmapButton(fileOp_->queuePanel,
+                         wxID_ANY,
+                         MakeNavIconBundle(NavIcon::Top, qIconSize, qIconColor).GetBitmap(qIconSize));
   fileOp_->moveUpBtn = new wxBitmapButton(fileOp_->queuePanel,
                                           wxID_ANY,
                                           wxArtProvider::GetBitmap(wxART_GO_UP, wxART_TOOLBAR, qIconSize));

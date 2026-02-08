@@ -13,6 +13,9 @@ const char* SvgFor(NavIcon icon) {
       return R"svg(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#000" d="M8.59 16.59 10 18l6-6-6-6-1.41 1.41L13.17 12z"/></svg>)svg";
     case NavIcon::Up:
       return R"svg(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#000" d="M7.41 15.41 12 10.83l4.59 4.58L18 14l-6-6-6 6z"/></svg>)svg";
+    case NavIcon::Top:
+      // Up arrow with a horizontal bar at the top (move-to-top).
+      return R"svg(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#000" d="M4 4h16v2H4zM7.41 17.41 12 12.83l4.59 4.58L18 16l-6-6-6 6z"/></svg>)svg";
     case NavIcon::Refresh:
       return R"svg(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#000" d="M17.65 6.35A7.95 7.95 0 0 0 12 4V1L7 6l5 5V7a5 5 0 1 1-5 5H5a7 7 0 1 0 12.65-5.65z"/></svg>)svg";
     case NavIcon::Home:
@@ -49,4 +52,3 @@ wxBitmapBundle MakeNavIconBundle(NavIcon icon, const wxSize& size, const wxColou
   const auto bmp = bundle.GetBitmap(sizeDef);
   return wxBitmapBundle::FromBitmap(TintMonochrome(bmp, color));
 }
-
