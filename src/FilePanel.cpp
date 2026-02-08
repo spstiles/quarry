@@ -828,6 +828,7 @@ std::vector<FilePanel::Entry> ListGioLocation(const std::string& uri, std::strin
     }
 
     const char* name = g_file_info_get_name(info);
+    const char* displayName = g_file_info_get_display_name(info);
     const auto ftype = g_file_info_get_file_type(info);
     // Treat only known navigable container-like types as directories.
     // In particular, G_FILE_TYPE_SPECIAL is often not a directory and attempting to
@@ -860,7 +861,9 @@ std::vector<FilePanel::Entry> ListGioLocation(const std::string& uri, std::strin
     }
 
     entries.push_back(FilePanel::Entry{
-        .name = name ? name : "",
+        // Some backends (notably Windows/SMB-style) can return a non-UI filename for standard::name
+        // (e.g., a short/8.3 alias). Use display name for rendering, but keep fullPath for actions.
+        .name = displayName ? displayName : (name ? name : ""),
         .isDir = isDir,
         .size = size,
         .modified = modified,
