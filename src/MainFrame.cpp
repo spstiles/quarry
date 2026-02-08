@@ -366,6 +366,7 @@ struct MainFrame::FileOpSession final {
   int range{100};
   bool configured{false};
   bool promptActive{false};
+  std::deque<std::pair<std::chrono::steady_clock::time_point, std::uintmax_t>> rateSamples{};
 
   explicit FileOpSession(wxEvtHandler* owner) : timer(owner) {}
 };
@@ -1691,10 +1692,30 @@ void MainFrame::CopyMoveWithProgressInternal(const wxString& title,
     wxString copied = "Copied: 0 B";
 
     if (bytesDone > 0) {
-      const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-          std::chrono::steady_clock::now() - fileOp_->start);
-      const auto elapsedSec = std::max<long long>(1, elapsed.count());
-      const double bytesPerSec = static_cast<double>(bytesDone) / static_cast<double>(elapsedSec);
+      const auto now = std::chrono::steady_clock::now();
+
+      // Smooth speed/remaining over a short window to avoid jittery UI.
+      // We use a simple average rate over ~1s rather than instantaneous samples.
+      fileOp_->rateSamples.emplace_back(now, bytesDone);
+      constexpr auto kWindow = std::chrono::milliseconds(1100);
+      while (fileOp_->rateSamples.size() > 2 &&
+             (now - fileOp_->rateSamples.front().first) > kWindow) {
+        fileOp_->rateSamples.pop_front();
+      }
+
+      double bytesPerSec = 0.0;
+      if (fileOp_->rateSamples.size() >= 2) {
+        const auto& first = fileOp_->rateSamples.front();
+        const auto& last = fileOp_->rateSamples.back();
+        const double dt = std::chrono::duration<double>(last.first - first.first).count();
+        const auto db = (last.second >= first.second) ? (last.second - first.second) : 0;
+        if (dt >= 0.10) bytesPerSec = static_cast<double>(db) / dt;
+      }
+      if (bytesPerSec <= 0.0) {
+        const double dt = std::max(0.10, std::chrono::duration<double>(now - fileOp_->start).count());
+        bytesPerSec = static_cast<double>(bytesDone) / dt;
+      }
+
       const double mbPerSec = bytesPerSec / (1024.0 * 1024.0);
       speed = wxString::Format("Speed: %.1f MB/s", mbPerSec);
       copied = "Copied: " + wxString::FromUTF8(HumanSize(bytesDone));
