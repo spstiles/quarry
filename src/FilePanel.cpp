@@ -2569,6 +2569,57 @@ static std::string UnescapeProcMountsField(std::string s) {
   return out;
 }
 
+static bool LooksPercentEncoded(const std::string& s) {
+  for (size_t i = 0; i + 2 < s.size(); i++) {
+    if (s[i] != '%') continue;
+    const auto a = static_cast<unsigned char>(s[i + 1]);
+    const auto b = static_cast<unsigned char>(s[i + 2]);
+    if (std::isxdigit(a) && std::isxdigit(b)) return true;
+  }
+  return false;
+}
+
+static std::optional<std::string> ReadTextFileTrim(const fs::path& p) {
+  std::ifstream f(p);
+  if (!f.is_open()) return std::nullopt;
+  std::string s;
+  std::getline(f, s);
+  while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || std::isspace(static_cast<unsigned char>(s.back())))) {
+    s.pop_back();
+  }
+  size_t start = 0;
+  while (start < s.size() && std::isspace(static_cast<unsigned char>(s[start]))) start++;
+  if (start > 0) s.erase(0, start);
+  if (s.empty()) return std::nullopt;
+  return s;
+}
+
+static std::optional<std::string> DeviceModelForDevPath(const std::string& devCanonPath) {
+  // Best-effort: use sysfs model/vendor for block devices like /dev/sdb1 -> sdb1.
+  const fs::path devPath(devCanonPath);
+  const auto name = devPath.filename().string();
+  if (name.empty()) return std::nullopt;
+
+  const fs::path sysBase = fs::path("/sys/class/block") / name / "device";
+  auto vendor = ReadTextFileTrim(sysBase / "vendor");
+  auto model = ReadTextFileTrim(sysBase / "model");
+
+  // Some setups may put model/vendor on the parent device.
+  if (!vendor && !model) {
+    vendor = ReadTextFileTrim(fs::path("/sys/class/block") / name / ".." / "device" / "vendor");
+    model = ReadTextFileTrim(fs::path("/sys/class/block") / name / ".." / "device" / "model");
+  }
+
+  std::string out;
+  if (vendor) out += *vendor;
+  if (model) {
+    if (!out.empty()) out += " ";
+    out += *model;
+  }
+  if (out.empty()) return std::nullopt;
+  return out;
+}
+
 static std::unordered_map<std::string, std::string> BuildDeviceLabelMap() {
   // Map canonical device node path (e.g. /dev/sdb1) -> volume label (from /dev/disk/by-label).
   std::unordered_map<std::string, std::string> out;
@@ -2578,8 +2629,9 @@ static std::unordered_map<std::string, std::string> BuildDeviceLabelMap() {
 
   for (const auto& ent : fs::directory_iterator(byLabel, ec)) {
     if (ec) break;
-    const auto label = ent.path().filename().string();
+    auto label = ent.path().filename().string();
     if (label.empty()) continue;
+    if (LooksPercentEncoded(label)) label = PercentDecode(label);
 
     ec.clear();
     const auto canon = fs::weakly_canonical(ent.path(), ec);
@@ -2642,6 +2694,9 @@ void FilePanel::PopulateDevices(const wxTreeItemId& devicesItem) {
       const auto itLabel = devLabels.find(itDev->second);
       if (itLabel != devLabels.end() && !itLabel->second.empty()) {
         display = itLabel->second;
+      } else {
+        // Fall back to a friendlier device model name if available.
+        if (const auto model = DeviceModelForDevPath(itDev->second)) display = *model;
       }
     }
     tree_->AppendItem(devicesItem,
