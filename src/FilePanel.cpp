@@ -2579,6 +2579,42 @@ static bool LooksPercentEncoded(const std::string& s) {
   return false;
 }
 
+static bool LooksUdevHexEscaped(const std::string& s) {
+  // udev often encodes label characters using \xNN sequences in /dev/disk/by-label symlink names.
+  for (size_t i = 0; i + 3 < s.size(); i++) {
+    if (s[i] != '\\' || s[i + 1] != 'x') continue;
+    const auto a = static_cast<unsigned char>(s[i + 2]);
+    const auto b = static_cast<unsigned char>(s[i + 3]);
+    if (std::isxdigit(a) && std::isxdigit(b)) return true;
+  }
+  return false;
+}
+
+static int HexNibble(unsigned char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+  if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+  return -1;
+}
+
+static std::string DecodeUdevHexEscapes(std::string s) {
+  std::string out;
+  out.reserve(s.size());
+  for (size_t i = 0; i < s.size(); i++) {
+    if (s[i] == '\\' && i + 3 < s.size() && s[i + 1] == 'x') {
+      const int hi = HexNibble(static_cast<unsigned char>(s[i + 2]));
+      const int lo = HexNibble(static_cast<unsigned char>(s[i + 3]));
+      if (hi >= 0 && lo >= 0) {
+        out.push_back(static_cast<char>((hi << 4) | lo));
+        i += 3;
+        continue;
+      }
+    }
+    out.push_back(s[i]);
+  }
+  return out;
+}
+
 static std::optional<std::string> ReadTextFileTrim(const fs::path& p) {
   std::ifstream f(p);
   if (!f.is_open()) return std::nullopt;
@@ -2631,6 +2667,7 @@ static std::unordered_map<std::string, std::string> BuildDeviceLabelMap() {
     if (ec) break;
     auto label = ent.path().filename().string();
     if (label.empty()) continue;
+    if (LooksUdevHexEscaped(label)) label = DecodeUdevHexEscapes(label);
     if (LooksPercentEncoded(label)) label = PercentDecode(label);
 
     ec.clear();
