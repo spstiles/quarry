@@ -1154,6 +1154,7 @@ void MainFrame::CopyMoveWithProgressInternal(const wxString& title,
 
   fileOp_->titleText = new wxStaticText(fileOp_->progressPanel, wxID_ANY, move ? "Moving..." : "Copying...");
   fileOp_->detailText = new wxStaticText(fileOp_->progressPanel, wxID_ANY, "Preparing...");
+  fileOp_->detailText->SetMinSize(wxSize(-1, fileOp_->detailText->GetCharHeight() * 2 + 8));
   fileOp_->gauge = new wxGauge(fileOp_->progressPanel, wxID_ANY, fileOp_->range);
 
   progressSizer->Add(fileOp_->titleText, 0, wxEXPAND | wxALL, 10);
@@ -1547,6 +1548,7 @@ void MainFrame::TrashWithProgressInternal(const std::vector<std::filesystem::pat
 
   fileOp_->titleText = new wxStaticText(fileOp_->progressPanel, wxID_ANY, "Trashing...");
   fileOp_->detailText = new wxStaticText(fileOp_->progressPanel, wxID_ANY, "Preparing...");
+  fileOp_->detailText->SetMinSize(wxSize(-1, fileOp_->detailText->GetCharHeight() * 2 + 8));
   fileOp_->gauge = new wxGauge(fileOp_->progressPanel, wxID_ANY, fileOp_->range);
 
   progressSizer->Add(fileOp_->titleText, 0, wxEXPAND | wxALL, 10);
@@ -1810,6 +1812,7 @@ void MainFrame::DeleteWithProgressInternal(const std::vector<std::filesystem::pa
 
   fileOp_->titleText = new wxStaticText(fileOp_->progressPanel, wxID_ANY, "Deleting...");
   fileOp_->detailText = new wxStaticText(fileOp_->progressPanel, wxID_ANY, "Preparing...");
+  fileOp_->detailText->SetMinSize(wxSize(-1, fileOp_->detailText->GetCharHeight() * 2 + 8));
   fileOp_->gauge = new wxGauge(fileOp_->progressPanel, wxID_ANY, fileOp_->range);
 
   progressSizer->Add(fileOp_->titleText, 0, wxEXPAND | wxALL, 10);
@@ -2017,6 +2020,7 @@ void MainFrame::ExtractWithProgress(const std::vector<std::string>& argv,
 
   fileOp_->titleText = new wxStaticText(fileOp_->progressPanel, wxID_ANY, "Extracting...");
   fileOp_->detailText = new wxStaticText(fileOp_->progressPanel, wxID_ANY, "Preparing...");
+  fileOp_->detailText->SetMinSize(wxSize(-1, fileOp_->detailText->GetCharHeight() * 2 + 8));
   fileOp_->gauge = new wxGauge(fileOp_->progressPanel, wxID_ANY, 100);
 
   progressSizer->Add(fileOp_->titleText, 0, wxEXPAND | wxALL, 10);
