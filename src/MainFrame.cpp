@@ -50,6 +50,19 @@ public:
   explicit QueueVListBox(wxWindow* parent)
       : wxVListBox(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_SIMPLE) {
     SetBackgroundStyle(wxBG_STYLE_PAINT);
+
+    auto clearIfEmptyClick = [this](wxMouseEvent& e) {
+      const int item = VirtualHitTest(e.GetY());
+      if (item == wxNOT_FOUND) {
+        if (GetSelection() != wxNOT_FOUND) {
+          SetSelection(wxNOT_FOUND);
+          RefreshAll();
+        }
+      }
+      e.Skip();
+    };
+    Bind(wxEVT_LEFT_DOWN, clearIfEmptyClick);
+    Bind(wxEVT_RIGHT_DOWN, clearIfEmptyClick);
   }
 
   void SetItems(std::vector<std::uint64_t> ids, std::vector<std::array<wxString, 3>> lines) {
