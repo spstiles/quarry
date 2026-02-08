@@ -57,6 +57,8 @@ constexpr int COL_TYPE = 2;
 constexpr int COL_MOD = 3;
 constexpr int COL_FULLPATH = 4;
 
+const wxDataFormat kQuarryPathListFormat("application/x-quarry-path-list");
+
 const fs::path kVirtualRecent{"recent://"};
 
 enum class TreeIcon : int {
@@ -1161,8 +1163,11 @@ void FilePanel::BuildLayout() {
 
 #if wxUSE_DRAG_AND_DROP
   // Enable internal DnD support for file-path payloads.
-  list_->EnableDragSource(wxDataFormat(wxDF_FILENAME));
-  list_->EnableDropTarget(wxDataFormat(wxDF_FILENAME));
+  list_->EnableDragSource(kQuarryPathListFormat);
+  wxVector<wxDataFormat> fmts;
+  fmts.push_back(kQuarryPathListFormat);
+  fmts.push_back(wxDataFormat(wxDF_FILENAME));
+  list_->EnableDropTargets(fmts);
 #endif
 
   statusText_ = new wxStaticText(listPane, wxID_ANY, "");
@@ -1255,20 +1260,42 @@ void FilePanel::BindEvents() {
   list_->Bind(wxEVT_DATAVIEW_ITEM_CONTEXT_MENU, [this](wxDataViewEvent& e) { ShowListContextMenu(e); });
 
   list_->Bind(wxEVT_DATAVIEW_ITEM_BEGIN_DRAG, [this](wxDataViewEvent& e) {
-    if (listingMode_ != ListingMode::Directory) return;
+    if (listingMode_ != ListingMode::Directory && listingMode_ != ListingMode::Gio) return;
     const auto paths = GetSelectedPaths();
     if (paths.empty()) return;
 
-    auto* data = new wxFileDataObject();
+    auto* composite = new wxDataObjectComposite();
+
+    // Internal format: newline-separated UTF-8 paths/URIs.
+    std::string payload;
+    payload.reserve(paths.size() * 64);
+    for (const auto& p : paths) {
+      const auto s = p.string();
+      if (s.empty()) continue;
+      payload.append(s);
+      payload.push_back('\n');
+    }
+    auto* custom = new wxCustomDataObject(kQuarryPathListFormat);
+    if (!payload.empty()) custom->SetData(payload.size(), payload.data());
+    composite->Add(custom, /*preferred=*/true);
+
+    // Also expose local files as wxDF_FILENAME when possible.
+    auto* files = new wxFileDataObject();
+    bool anyLocal = false;
     for (const auto& p : paths) {
       if (p.empty()) continue;
-      if (LooksLikeUriPath(p)) return; // no remote drag for now
-      data->AddFile(wxString::FromUTF8(p.string()));
+      if (LooksLikeUriPath(p)) continue;
+      files->AddFile(wxString::FromUTF8(p.string()));
+      anyLocal = true;
     }
-    if (data->GetFilenames().empty()) return;
+    if (anyLocal) {
+      composite->Add(files, /*preferred=*/false);
+    } else {
+      delete files;
+    }
 
     // Let wxDataView handle DnD (especially important on GTK).
-    e.SetDataObject(data);
+    e.SetDataObject(composite);
     e.SetDragFlags(wxDrag_AllowMove);
     e.SetDropEffect(wxDragCopy); // safer default
     e.Allow();
@@ -1276,9 +1303,10 @@ void FilePanel::BindEvents() {
 
   list_->Bind(wxEVT_DATAVIEW_ITEM_DROP_POSSIBLE, [this](wxDataViewEvent& e) {
     if (!onDropFiles_) return;
-    if (listingMode_ != ListingMode::Directory) return;
+    if (listingMode_ != ListingMode::Directory && listingMode_ != ListingMode::Gio) return;
     if (currentDir_.empty()) return;
-    if (e.GetDataFormat().GetType() != wxDF_FILENAME) return;
+    const auto t = e.GetDataFormat().GetType();
+    if (t != wxDF_FILENAME && e.GetDataFormat() != kQuarryPathListFormat) return;
 
     // Safer default: copy. Hold Shift to move.
     e.SetDropEffect(wxGetKeyState(WXK_SHIFT) ? wxDragMove : wxDragCopy);
@@ -1287,20 +1315,36 @@ void FilePanel::BindEvents() {
 
   list_->Bind(wxEVT_DATAVIEW_ITEM_DROP, [this](wxDataViewEvent& e) {
     if (!onDropFiles_) return;
-    if (listingMode_ != ListingMode::Directory) return;
+    if (listingMode_ != ListingMode::Directory && listingMode_ != ListingMode::Gio) return;
     if (currentDir_.empty()) return;
-    if (e.GetDataFormat().GetType() != wxDF_FILENAME) return;
-
-    wxFileDataObject data;
-    if (!data.SetData(e.GetDataSize(), e.GetDataBuffer())) return;
-
     std::vector<fs::path> paths;
-    paths.reserve(data.GetFilenames().size());
-    for (const auto& fn : data.GetFilenames()) {
-      const auto s = fn.ToStdString();
-      if (s.empty()) continue;
-      paths.emplace_back(s);
+
+    if (e.GetDataFormat() == kQuarryPathListFormat) {
+      wxCustomDataObject data(kQuarryPathListFormat);
+      if (!data.SetData(e.GetDataSize(), e.GetDataBuffer())) return;
+      const auto* buf = static_cast<const char*>(data.GetData());
+      const auto len = data.GetSize();
+      if (!buf || len == 0) return;
+      std::string s(buf, buf + len);
+      std::istringstream in(s);
+      std::string line;
+      while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        paths.emplace_back(line);
+      }
+    } else if (e.GetDataFormat().GetType() == wxDF_FILENAME) {
+      wxFileDataObject data;
+      if (!data.SetData(e.GetDataSize(), e.GetDataBuffer())) return;
+      paths.reserve(data.GetFilenames().size());
+      for (const auto& fn : data.GetFilenames()) {
+        const auto s = fn.ToStdString();
+        if (s.empty()) continue;
+        paths.emplace_back(s);
+      }
+    } else {
+      return;
     }
+
     if (paths.empty()) return;
 
     // Safer default: copy. Hold Shift to move.
