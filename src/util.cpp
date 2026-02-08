@@ -11,12 +11,350 @@
 #include <wx/thread.h>
 #include <wx/utils.h>
 
+#ifdef QUARRY_USE_GIO
+#include <gio/gio.h>
+#endif
+
 namespace fs = std::filesystem;
 
 namespace {
 OpResult CanceledResult() { return {.ok = false, .message = "Canceled"}; }
 
 bool IsCanceled(const CancelFn& shouldCancel) { return shouldCancel && shouldCancel(); }
+
+bool LooksLikeUriString(const std::string& s) {
+  const auto pos = s.find("://");
+  return pos != std::string::npos && pos > 0;
+}
+
+#ifdef QUARRY_USE_GIO
+struct GioProgressCtx {
+  const CancelFn* shouldCancel{nullptr};
+  const CopyProgressFn* onProgress{nullptr};
+  const CopyBytesProgressFn* onBytes{nullptr};
+  std::uintmax_t lastBytes{0};
+  std::string label{};
+};
+
+void GioProgressCallback(goffset current_num_bytes,
+                         goffset total_num_bytes,
+                         gpointer user_data) {
+  (void)total_num_bytes;
+  auto* ctx = static_cast<GioProgressCtx*>(user_data);
+  if (!ctx) return;
+  const std::uintmax_t cur = current_num_bytes > 0 ? static_cast<std::uintmax_t>(current_num_bytes) : 0;
+  if (cur >= ctx->lastBytes) {
+    const auto delta = cur - ctx->lastBytes;
+    ctx->lastBytes = cur;
+    if (ctx->onBytes && *ctx->onBytes) (*ctx->onBytes)(delta);
+  }
+  if (ctx->onProgress && *ctx->onProgress && !ctx->label.empty()) {
+    (*ctx->onProgress)(fs::path(ctx->label));
+  }
+}
+
+OpResult GioDeleteRecursive(GFile* file, GCancellable* cancellable) {
+  if (!file) return {.ok = false, .message = "Invalid source."};
+
+  GError* err = nullptr;
+  const auto type = g_file_query_file_type(file, G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, cancellable);
+  if (type == G_FILE_TYPE_DIRECTORY) {
+    GError* enumErr = nullptr;
+    GFileEnumerator* en = g_file_enumerate_children(file,
+                                                    "standard::name,standard::type",
+                                                    G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS,
+                                                    cancellable,
+                                                    &enumErr);
+    if (!en) {
+      const wxString msg = enumErr ? wxString::FromUTF8(enumErr->message) : "Unable to enumerate directory.";
+      if (enumErr) g_error_free(enumErr);
+      return {.ok = false, .message = msg};
+    }
+
+    for (;;) {
+      if (g_cancellable_is_cancelled(cancellable)) {
+        g_object_unref(en);
+        return CanceledResult();
+      }
+      GError* nextErr = nullptr;
+      GFileInfo* info = g_file_enumerator_next_file(en, cancellable, &nextErr);
+      if (!info) {
+        if (nextErr) {
+          const wxString msg = wxString::FromUTF8(nextErr->message);
+          g_error_free(nextErr);
+          g_object_unref(en);
+          return {.ok = false, .message = msg};
+        }
+        break;
+      }
+
+      const char* name = g_file_info_get_name(info);
+      if (name && *name) {
+        GFile* child = g_file_get_child(file, name);
+        const auto res = GioDeleteRecursive(child, cancellable);
+        g_object_unref(child);
+        g_object_unref(info);
+        if (!res.ok) {
+          g_object_unref(en);
+          return res;
+        }
+      } else {
+        g_object_unref(info);
+      }
+    }
+
+    g_object_unref(en);
+  }
+
+  err = nullptr;
+  const gboolean ok = g_file_delete(file, cancellable, &err);
+  if (!ok) {
+    const wxString msg = err ? wxString::FromUTF8(err->message) : "Delete failed.";
+    if (err) g_error_free(err);
+    return {.ok = false, .message = msg};
+  }
+  return {.ok = true};
+}
+
+OpResult GioCopyRecursive(GFile* src,
+                          GFile* dst,
+                          GCancellable* cancellable,
+                          const CancelFn& shouldCancel,
+                          const CopyProgressFn& onProgress,
+                          const CopyBytesProgressFn& onBytes) {
+  if (!src || !dst) return {.ok = false, .message = "Invalid source or destination."};
+
+  if (IsCanceled(shouldCancel)) {
+    g_cancellable_cancel(cancellable);
+    return CanceledResult();
+  }
+
+  const auto type = g_file_query_file_type(src, G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, cancellable);
+  if (type == G_FILE_TYPE_DIRECTORY) {
+    GError* mkErr = nullptr;
+    (void)g_file_make_directory_with_parents(dst, cancellable, &mkErr);
+    if (mkErr) {
+      // Ignore "exists"; otherwise fail.
+      if (!g_error_matches(mkErr, G_IO_ERROR, G_IO_ERROR_EXISTS)) {
+        const wxString msg = wxString::FromUTF8(mkErr->message);
+        g_error_free(mkErr);
+        return {.ok = false, .message = msg};
+      }
+      g_error_free(mkErr);
+    }
+
+    GError* enumErr = nullptr;
+    GFileEnumerator* en = g_file_enumerate_children(src,
+                                                    "standard::name,standard::type",
+                                                    G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS,
+                                                    cancellable,
+                                                    &enumErr);
+    if (!en) {
+      const wxString msg = enumErr ? wxString::FromUTF8(enumErr->message) : "Unable to enumerate directory.";
+      if (enumErr) g_error_free(enumErr);
+      return {.ok = false, .message = msg};
+    }
+
+    for (;;) {
+      if (IsCanceled(shouldCancel) || g_cancellable_is_cancelled(cancellable)) {
+        g_cancellable_cancel(cancellable);
+        g_object_unref(en);
+        return CanceledResult();
+      }
+
+      GError* nextErr = nullptr;
+      GFileInfo* info = g_file_enumerator_next_file(en, cancellable, &nextErr);
+      if (!info) {
+        if (nextErr) {
+          const wxString msg = wxString::FromUTF8(nextErr->message);
+          g_error_free(nextErr);
+          g_object_unref(en);
+          return {.ok = false, .message = msg};
+        }
+        break;
+      }
+
+      const char* name = g_file_info_get_name(info);
+      const auto childType = g_file_info_get_file_type(info);
+      if (!name || !*name) {
+        g_object_unref(info);
+        continue;
+      }
+
+      GFile* sChild = g_file_get_child(src, name);
+      GFile* dChild = g_file_get_child(dst, name);
+
+      OpResult res;
+      if (childType == G_FILE_TYPE_DIRECTORY) {
+        res = GioCopyRecursive(sChild, dChild, cancellable, shouldCancel, onProgress, onBytes);
+      } else {
+        GioProgressCtx ctx;
+        ctx.shouldCancel = &shouldCancel;
+        ctx.onProgress = &onProgress;
+        ctx.onBytes = &onBytes;
+        ctx.lastBytes = 0;
+        ctx.label = name;
+
+        if (onProgress) onProgress(fs::path(name));
+
+        GError* copyErr = nullptr;
+        const gboolean ok = g_file_copy(sChild,
+                                        dChild,
+                                        static_cast<GFileCopyFlags>(G_FILE_COPY_OVERWRITE | G_FILE_COPY_NOFOLLOW_SYMLINKS),
+                                        cancellable,
+                                        GioProgressCallback,
+                                        &ctx,
+                                        &copyErr);
+        if (!ok) {
+          if (copyErr && g_error_matches(copyErr, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+            g_error_free(copyErr);
+            res = CanceledResult();
+          } else {
+            const wxString msg = copyErr ? wxString::FromUTF8(copyErr->message) : "Copy failed.";
+            if (copyErr) g_error_free(copyErr);
+            res = {.ok = false, .message = msg};
+          }
+        } else {
+          res = {.ok = true};
+        }
+      }
+
+      g_object_unref(sChild);
+      g_object_unref(dChild);
+      g_object_unref(info);
+
+      if (!res.ok) {
+        g_object_unref(en);
+        return res;
+      }
+    }
+
+    g_object_unref(en);
+    return {.ok = true};
+  }
+
+  GioProgressCtx ctx;
+  ctx.shouldCancel = &shouldCancel;
+  ctx.onProgress = &onProgress;
+  ctx.onBytes = &onBytes;
+  ctx.lastBytes = 0;
+  if (src) {
+    char* b = g_file_get_basename(src);
+    if (b) {
+      ctx.label = b;
+      g_free(b);
+    }
+  }
+  if (onProgress && !ctx.label.empty()) onProgress(fs::path(ctx.label));
+
+  GError* copyErr = nullptr;
+  const gboolean ok = g_file_copy(src,
+                                  dst,
+                                  static_cast<GFileCopyFlags>(G_FILE_COPY_OVERWRITE | G_FILE_COPY_NOFOLLOW_SYMLINKS),
+                                  cancellable,
+                                  GioProgressCallback,
+                                  &ctx,
+                                  &copyErr);
+  if (!ok) {
+    if (copyErr && g_error_matches(copyErr, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+      g_error_free(copyErr);
+      return CanceledResult();
+    }
+    const wxString msg = copyErr ? wxString::FromUTF8(copyErr->message) : "Copy failed.";
+    if (copyErr) g_error_free(copyErr);
+    return {.ok = false, .message = msg};
+  }
+  return {.ok = true};
+}
+
+OpResult GioMoveAny(const std::string& srcStr,
+                    const std::string& dstStr,
+                    const CancelFn& shouldCancel,
+                    const CopyProgressFn& onProgress,
+                    const CopyBytesProgressFn& onBytes) {
+  GCancellable* cancellable = g_cancellable_new();
+  GFile* src = g_file_new_for_commandline_arg(srcStr.c_str());
+  GFile* dst = g_file_new_for_commandline_arg(dstStr.c_str());
+
+  if (IsCanceled(shouldCancel)) {
+    g_cancellable_cancel(cancellable);
+    g_object_unref(src);
+    g_object_unref(dst);
+    g_object_unref(cancellable);
+    return CanceledResult();
+  }
+
+  GioProgressCtx ctx;
+  ctx.shouldCancel = &shouldCancel;
+  ctx.onProgress = &onProgress;
+  ctx.onBytes = &onBytes;
+  ctx.lastBytes = 0;
+
+  GError* moveErr = nullptr;
+  const gboolean ok = g_file_move(src,
+                                  dst,
+                                  static_cast<GFileCopyFlags>(G_FILE_COPY_OVERWRITE | G_FILE_COPY_NOFOLLOW_SYMLINKS),
+                                  cancellable,
+                                  GioProgressCallback,
+                                  &ctx,
+                                  &moveErr);
+  if (!ok) {
+    const bool cancelled = moveErr && g_error_matches(moveErr, G_IO_ERROR, G_IO_ERROR_CANCELLED);
+    const bool fallback = moveErr && (g_error_matches(moveErr, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED) ||
+                                      g_error_matches(moveErr, G_IO_ERROR, G_IO_ERROR_NOT_MOUNTED));
+    if (cancelled) {
+      g_error_free(moveErr);
+      g_object_unref(src);
+      g_object_unref(dst);
+      g_object_unref(cancellable);
+      return CanceledResult();
+    }
+
+    if (fallback) {
+      g_error_free(moveErr);
+      const auto copyRes = GioCopyRecursive(src, dst, cancellable, shouldCancel, onProgress, onBytes);
+      if (!copyRes.ok) {
+        g_object_unref(src);
+        g_object_unref(dst);
+        g_object_unref(cancellable);
+        return copyRes;
+      }
+      const auto delRes = GioDeleteRecursive(src, cancellable);
+      g_object_unref(src);
+      g_object_unref(dst);
+      g_object_unref(cancellable);
+      return delRes;
+    }
+
+    const wxString msg = moveErr ? wxString::FromUTF8(moveErr->message) : "Move failed.";
+    if (moveErr) g_error_free(moveErr);
+    g_object_unref(src);
+    g_object_unref(dst);
+    g_object_unref(cancellable);
+    return {.ok = false, .message = msg};
+  }
+
+  g_object_unref(src);
+  g_object_unref(dst);
+  g_object_unref(cancellable);
+  return {.ok = true};
+}
+
+OpResult GioCopyAny(const std::string& srcStr,
+                    const std::string& dstStr,
+                    const CancelFn& shouldCancel,
+                    const CopyProgressFn& onProgress,
+                    const CopyBytesProgressFn& onBytes) {
+  GCancellable* cancellable = g_cancellable_new();
+  GFile* src = g_file_new_for_commandline_arg(srcStr.c_str());
+  GFile* dst = g_file_new_for_commandline_arg(dstStr.c_str());
+  const auto res = GioCopyRecursive(src, dst, cancellable, shouldCancel, onProgress, onBytes);
+  g_object_unref(src);
+  g_object_unref(dst);
+  g_object_unref(cancellable);
+  return res;
+}
+#endif
 
 OpResult CopyRegularFileChunked(const fs::path& src,
                                 const fs::path& dst,
@@ -78,6 +416,16 @@ OpResult CopyPathRecursiveImpl(const fs::path& src,
                               const CancelFn& shouldCancel,
                               const CopyProgressFn& onProgress,
                               const CopyBytesProgressFn& onBytes) {
+  const auto srcStr0 = src.string();
+  const auto dstStr0 = dst.string();
+  if (LooksLikeUriString(srcStr0) || LooksLikeUriString(dstStr0)) {
+#ifdef QUARRY_USE_GIO
+    return GioCopyAny(srcStr0, dstStr0, shouldCancel, onProgress, onBytes);
+#else
+    return {.ok = false, .message = "Network copy is not available (built without GIO)."};
+#endif
+  }
+
   std::error_code ec;
 
   // Avoid pathological case: copying a directory into itself/subdirectory.
@@ -259,6 +607,16 @@ OpResult MovePath(const fs::path& src,
                   const CancelFn& shouldCancel,
                   const CopyProgressFn& onProgress,
                   const CopyBytesProgressFn& onBytes) {
+  const auto srcStr0 = src.string();
+  const auto dstStr0 = dst.string();
+  if (LooksLikeUriString(srcStr0) || LooksLikeUriString(dstStr0)) {
+#ifdef QUARRY_USE_GIO
+    return GioMoveAny(srcStr0, dstStr0, shouldCancel, onProgress, onBytes);
+#else
+    return {.ok = false, .message = "Network move is not available (built without GIO)."};
+#endif
+  }
+
   std::error_code ec;
   fs::rename(src, dst, ec);
   if (!ec) return {.ok = true};
@@ -271,6 +629,59 @@ OpResult MovePath(const fs::path& src,
   const auto delRes = DeletePath(src);
   if (!delRes.ok) return delRes;
   return {.ok = true};
+}
+
+bool PathExistsAny(const fs::path& p) {
+  const auto s = p.string();
+  if (LooksLikeUriString(s)) {
+#ifdef QUARRY_USE_GIO
+    GFile* f = g_file_new_for_commandline_arg(s.c_str());
+    const gboolean ok = g_file_query_exists(f, nullptr);
+    g_object_unref(f);
+    return ok != 0;
+#else
+    return false;
+#endif
+  }
+  std::error_code ec;
+  return fs::exists(p, ec);
+}
+
+bool IsDirectoryAny(const fs::path& p) {
+  const auto s = p.string();
+  if (LooksLikeUriString(s)) {
+#ifdef QUARRY_USE_GIO
+    GFile* f = g_file_new_for_commandline_arg(s.c_str());
+    const auto type = g_file_query_file_type(f, G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, nullptr);
+    g_object_unref(f);
+    return type == G_FILE_TYPE_DIRECTORY;
+#else
+    return false;
+#endif
+  }
+  std::error_code ec;
+  return fs::is_directory(p, ec);
+}
+
+fs::path JoinDirAndNameAny(const fs::path& dir, const std::string& name) {
+  const auto base = dir.string();
+  if (LooksLikeUriString(base)) {
+#ifdef QUARRY_USE_GIO
+    GFile* d = g_file_new_for_commandline_arg(base.c_str());
+    GFile* c = g_file_get_child(d, name.c_str());
+    char* uri = g_file_get_uri(c);
+    fs::path out = uri ? fs::path(uri) : fs::path(base + "/" + name);
+    if (uri) g_free(uri);
+    g_object_unref(c);
+    g_object_unref(d);
+    return out;
+#else
+    if (base.empty()) return fs::path(name);
+    if (base.back() == '/') return fs::path(base + name);
+    return fs::path(base + "/" + name);
+#endif
+  }
+  return dir / fs::path(name);
 }
 
 OpResult DeletePath(const fs::path& src) {

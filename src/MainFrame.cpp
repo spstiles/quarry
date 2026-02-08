@@ -533,21 +533,9 @@ void MainFrame::TransferDroppedPaths(FilePanel* target,
   if (sources.empty()) return;
 
   const auto dstDir = target->GetDirectoryPath();
-  std::error_code ec;
-  if (dstDir.empty() || !std::filesystem::exists(dstDir, ec) || !std::filesystem::is_directory(dstDir, ec)) {
-    wxMessageBox("Drop target is not a local directory.", "Quarry", wxOK | wxICON_WARNING, this);
+  if (dstDir.empty() || !PathExistsAny(dstDir) || !IsDirectoryAny(dstDir)) {
+    wxMessageBox("Drop target is not a directory.", "Quarry", wxOK | wxICON_WARNING, this);
     return;
-  }
-
-  // Validate sources are local filesystem paths.
-  for (const auto& p : sources) {
-    if (p.empty()) return;
-    const auto s = p.string();
-    if (s.find("://") != std::string::npos) {
-      wxMessageBox("Drag-and-drop from remote locations is not supported yet.", "Quarry",
-                   wxOK | wxICON_INFORMATION, this);
-      return;
-    }
   }
 
   CopyMoveWithProgress(move ? "Move" : "Copy", sources, dstDir, move);
@@ -567,25 +555,8 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
     return;
   }
 
-  if (LooksLikeUriPath(dstDir)) {
-    wxMessageBox("Copy/Move to remote locations is not supported yet.", "Quarry",
-                 wxOK | wxICON_INFORMATION, this);
-    return;
-  }
-
-  // Validate sources are local filesystem paths.
-  for (const auto& p : sources) {
-    if (p.empty()) return;
-    if (LooksLikeUriPath(p)) {
-      wxMessageBox("Copy/Move from remote locations is not supported yet.", "Quarry",
-                   wxOK | wxICON_INFORMATION, this);
-      return;
-    }
-  }
-
-  std::error_code ec;
-  if (dstDir.empty() || !std::filesystem::exists(dstDir, ec) || !std::filesystem::is_directory(dstDir, ec)) {
-    wxMessageBox("Destination is not a local directory.", "Quarry", wxOK | wxICON_WARNING, this);
+  if (dstDir.empty() || !PathExistsAny(dstDir) || !IsDirectoryAny(dstDir)) {
+    wxMessageBox("Destination is not a directory.", "Quarry", wxOK | wxICON_WARNING, this);
     return;
   }
 
@@ -602,13 +573,11 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
   fileOp_->state = std::make_shared<AsyncFileOpState>();
 
   {
-    std::error_code isDirEc;
     for (const auto& p : sources) {
-      if (std::filesystem::is_directory(p, isDirEc) && !isDirEc) {
+      if (IsDirectoryAny(p)) {
         fileOp_->state->hasDir = true;
         break;
       }
-      isDirEc.clear();
     }
   }
 
@@ -662,7 +631,16 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
       state->currentLabel = "Scanning: " + label;
     };
 
-    const auto total = EstimateTotalBytes(sources, shouldCancel, scanProgress);
+    // Only scan local sources for total bytes; for remote sources, just show speed and unknown remaining.
+    std::uintmax_t total = 0;
+    bool canScan = true;
+    for (const auto& p : sources) {
+      if (LooksLikeUriPath(p)) {
+        canScan = false;
+        break;
+      }
+    }
+    if (canScan) total = EstimateTotalBytes(sources, shouldCancel, scanProgress);
     {
       std::lock_guard<std::mutex> lock(state->mu);
       state->totalBytes = total;
@@ -679,7 +657,7 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
       }
 
       workerEc.clear();
-      if (!std::filesystem::exists(src, workerEc)) {
+      if (!PathExistsAny(src)) {
         state->done.fetch_add(1);
         continue;
       }
@@ -689,14 +667,13 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
         state->currentLabel = src.filename().string();
       }
 
-      auto dst = dstDir / src.filename();
+      auto dst = JoinDirAndNameAny(dstDir, src.filename().string());
 
       // Conflict handling (delegated to UI thread).
       bool skipItem = false;
       for (;;) {
         if (state->cancelRequested.load()) break;
-        std::error_code existsEc;
-        if (!std::filesystem::exists(dst, existsEc)) break;
+        if (!PathExistsAny(dst)) break;
 
         std::unique_lock<std::mutex> lock(state->mu);
         state->prompt = AsyncFileOpPrompt{.kind = AsyncFileOpPrompt::Kind::Exists, .dst = dst};
@@ -722,7 +699,7 @@ void MainFrame::CopyMoveWithProgress(const wxString& title,
             state->cancelRequested.store(true);
             break;
           }
-          dst = dstDir / *reply.renameTo;
+          dst = JoinDirAndNameAny(dstDir, *reply.renameTo);
           continue;
         }
         break;  // Overwrite
