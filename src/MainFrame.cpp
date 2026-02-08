@@ -40,6 +40,78 @@
 #include <wx/notebook.h>
 #include <wx/utils.h>
 #include <wx/scrolwin.h>
+#include <wx/vlbox.h>
+#include <wx/settings.h>
+#include <wx/dc.h>
+
+namespace {
+class QueueVListBox final : public wxVListBox {
+public:
+  explicit QueueVListBox(wxWindow* parent)
+      : wxVListBox(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_SIMPLE) {
+    SetBackgroundStyle(wxBG_STYLE_PAINT);
+  }
+
+  void SetItems(std::vector<std::uint64_t> ids, std::vector<std::array<wxString, 3>> lines) {
+    ids_ = std::move(ids);
+    lines_ = std::move(lines);
+    SetItemCount(lines_.size());
+    RefreshAll();
+  }
+
+  std::optional<std::uint64_t> GetSelectedOpId() const {
+    const int sel = GetSelection();
+    if (sel == wxNOT_FOUND) return std::nullopt;
+    if (sel < 0 || static_cast<size_t>(sel) >= ids_.size()) return std::nullopt;
+    return ids_[static_cast<size_t>(sel)];
+  }
+
+protected:
+  wxCoord OnMeasureItem(size_t) const override {
+    const int ch = GetCharHeight();
+    const int padding = 8;
+    const int sep = 6;
+    return (ch * 3) + (padding * 2) + sep;
+  }
+
+  void OnDrawItem(wxDC& dc, const wxRect& rect, size_t n) const override {
+    if (n >= lines_.size()) return;
+
+    const bool isSel = static_cast<int>(n) == GetSelection();
+    const wxColour bg = isSel ? wxSystemSettings::GetColour(wxSYS_COLOUR_HIGHLIGHT)
+                              : GetBackgroundColour();
+    const wxColour fg = isSel ? wxSystemSettings::GetColour(wxSYS_COLOUR_HIGHLIGHTTEXT)
+                              : GetForegroundColour();
+
+    dc.SetBrush(wxBrush(bg));
+    dc.SetPen(*wxTRANSPARENT_PEN);
+    dc.DrawRectangle(rect);
+    dc.SetTextForeground(fg);
+
+    const int padding = 8;
+    int y = rect.y + padding;
+    const int x = rect.x + padding;
+    const int ch = GetCharHeight();
+
+    dc.DrawText(lines_[n][0], x, y);
+    y += ch;
+    dc.DrawText(lines_[n][1], x, y);
+    y += ch;
+    dc.DrawText(lines_[n][2], x, y);
+
+    if (n + 1 < lines_.size()) {
+      const wxColour line = wxSystemSettings::GetColour(wxSYS_COLOUR_BTNSHADOW);
+      dc.SetPen(wxPen(line));
+      const int yy = rect.y + rect.height - 4;
+      dc.DrawLine(rect.x + padding, yy, rect.x + rect.width - padding, yy);
+    }
+  }
+
+private:
+  std::vector<std::uint64_t> ids_{};
+  std::vector<std::array<wxString, 3>> lines_{};
+};
+} // namespace
 
 namespace {
 enum MenuId : int {
@@ -192,8 +264,7 @@ struct MainFrame::FileOpSession final {
   wxStaticText* detailText{nullptr};
   wxGauge* gauge{nullptr};
   wxButton* cancelBtn{nullptr};
-  wxListBox* queueList{nullptr};
-  std::vector<std::uint64_t> queueLineToOpId{};
+  QueueVListBox* queueList{nullptr};
   wxButton* cancelQueuedBtn{nullptr};
   wxButton* clearQueueBtn{nullptr};
   wxTimer timer;
@@ -308,24 +379,20 @@ void MainFrame::UpdateQueueUi() {
   }
 
   if (!fileOp_->queueList) return;
-  fileOp_->queueList->Freeze();
-  fileOp_->queueList->Clear();
-  fileOp_->queueLineToOpId.clear();
+  std::vector<std::uint64_t> ids;
+  std::vector<std::array<wxString, 3>> lines;
+  ids.reserve(static_cast<size_t>(count));
+  lines.reserve(static_cast<size_t>(count));
 
   for (int i = 0; i < count; i++) {
     const auto& op = opQueue_[static_cast<size_t>(i)];
-    const auto lines = describeLines(op);
-    for (const auto& line : lines) {
-      fileOp_->queueList->Append(line);
-      fileOp_->queueLineToOpId.push_back(op.id);
-    }
-    fileOp_->queueList->Append("");
-    fileOp_->queueLineToOpId.push_back(op.id);
+    ids.push_back(op.id);
+    lines.push_back(describeLines(op));
   }
 
   if (fileOp_->cancelQueuedBtn) fileOp_->cancelQueuedBtn->Enable(count > 0);
   if (fileOp_->clearQueueBtn) fileOp_->clearQueueBtn->Enable(count > 0);
-  fileOp_->queueList->Thaw();
+  fileOp_->queueList->SetItems(std::move(ids), std::move(lines));
   fileOp_->dlg->Layout();
 }
 
@@ -1166,7 +1233,7 @@ void MainFrame::CopyMoveWithProgressInternal(const wxString& title,
   fileOp_->queuePanel = new wxPanel(fileOp_->notebook, wxID_ANY);
   auto* queueSizer = new wxBoxSizer(wxVERTICAL);
   fileOp_->queuePanel->SetSizer(queueSizer);
-  fileOp_->queueList = new wxListBox(fileOp_->queuePanel, wxID_ANY);
+  fileOp_->queueList = new QueueVListBox(fileOp_->queuePanel);
   queueSizer->Add(fileOp_->queueList, 1, wxEXPAND | wxALL, 10);
   auto* qBtns = new wxBoxSizer(wxHORIZONTAL);
   fileOp_->cancelQueuedBtn = new wxButton(fileOp_->queuePanel, wxID_ANY, "Cancel Selected");
@@ -1185,10 +1252,9 @@ void MainFrame::CopyMoveWithProgressInternal(const wxString& title,
 
   fileOp_->cancelQueuedBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
     if (!fileOp_ || !fileOp_->queueList) return;
-    const int sel = fileOp_->queueList->GetSelection();
-    if (sel == wxNOT_FOUND) return;
-    if (sel < 0 || static_cast<size_t>(sel) >= fileOp_->queueLineToOpId.size()) return;
-    const std::uint64_t id = fileOp_->queueLineToOpId[static_cast<size_t>(sel)];
+    const auto idOpt = fileOp_->queueList->GetSelectedOpId();
+    if (!idOpt) return;
+    const std::uint64_t id = *idOpt;
     for (auto it = opQueue_.begin(); it != opQueue_.end(); ++it) {
       if (it->id == id) {
         opQueue_.erase(it);
@@ -1560,7 +1626,7 @@ void MainFrame::TrashWithProgressInternal(const std::vector<std::filesystem::pat
   fileOp_->queuePanel = new wxPanel(fileOp_->notebook, wxID_ANY);
   auto* queueSizer = new wxBoxSizer(wxVERTICAL);
   fileOp_->queuePanel->SetSizer(queueSizer);
-  fileOp_->queueList = new wxListBox(fileOp_->queuePanel, wxID_ANY);
+  fileOp_->queueList = new QueueVListBox(fileOp_->queuePanel);
   queueSizer->Add(fileOp_->queueList, 1, wxEXPAND | wxALL, 10);
   auto* qBtns = new wxBoxSizer(wxHORIZONTAL);
   fileOp_->cancelQueuedBtn = new wxButton(fileOp_->queuePanel, wxID_ANY, "Cancel Selected");
@@ -1579,10 +1645,9 @@ void MainFrame::TrashWithProgressInternal(const std::vector<std::filesystem::pat
 
   fileOp_->cancelQueuedBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
     if (!fileOp_ || !fileOp_->queueList) return;
-    const int sel = fileOp_->queueList->GetSelection();
-    if (sel == wxNOT_FOUND) return;
-    if (sel < 0 || static_cast<size_t>(sel) >= fileOp_->queueLineToOpId.size()) return;
-    const std::uint64_t id = fileOp_->queueLineToOpId[static_cast<size_t>(sel)];
+    const auto idOpt = fileOp_->queueList->GetSelectedOpId();
+    if (!idOpt) return;
+    const std::uint64_t id = *idOpt;
     for (auto it = opQueue_.begin(); it != opQueue_.end(); ++it) {
       if (it->id == id) {
         opQueue_.erase(it);
@@ -1824,7 +1889,7 @@ void MainFrame::DeleteWithProgressInternal(const std::vector<std::filesystem::pa
   fileOp_->queuePanel = new wxPanel(fileOp_->notebook, wxID_ANY);
   auto* queueSizer = new wxBoxSizer(wxVERTICAL);
   fileOp_->queuePanel->SetSizer(queueSizer);
-  fileOp_->queueList = new wxListBox(fileOp_->queuePanel, wxID_ANY);
+  fileOp_->queueList = new QueueVListBox(fileOp_->queuePanel);
   queueSizer->Add(fileOp_->queueList, 1, wxEXPAND | wxALL, 10);
   auto* qBtns = new wxBoxSizer(wxHORIZONTAL);
   fileOp_->cancelQueuedBtn = new wxButton(fileOp_->queuePanel, wxID_ANY, "Cancel Selected");
@@ -1843,10 +1908,9 @@ void MainFrame::DeleteWithProgressInternal(const std::vector<std::filesystem::pa
 
   fileOp_->cancelQueuedBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
     if (!fileOp_ || !fileOp_->queueList) return;
-    const int sel = fileOp_->queueList->GetSelection();
-    if (sel == wxNOT_FOUND) return;
-    if (sel < 0 || static_cast<size_t>(sel) >= fileOp_->queueLineToOpId.size()) return;
-    const std::uint64_t id = fileOp_->queueLineToOpId[static_cast<size_t>(sel)];
+    const auto idOpt = fileOp_->queueList->GetSelectedOpId();
+    if (!idOpt) return;
+    const std::uint64_t id = *idOpt;
     for (auto it = opQueue_.begin(); it != opQueue_.end(); ++it) {
       if (it->id == id) {
         opQueue_.erase(it);
@@ -2032,7 +2096,7 @@ void MainFrame::ExtractWithProgress(const std::vector<std::string>& argv,
   fileOp_->queuePanel = new wxPanel(fileOp_->notebook, wxID_ANY);
   auto* queueSizer = new wxBoxSizer(wxVERTICAL);
   fileOp_->queuePanel->SetSizer(queueSizer);
-  fileOp_->queueList = new wxListBox(fileOp_->queuePanel, wxID_ANY);
+  fileOp_->queueList = new QueueVListBox(fileOp_->queuePanel);
   queueSizer->Add(fileOp_->queueList, 1, wxEXPAND | wxALL, 10);
   auto* qBtns = new wxBoxSizer(wxHORIZONTAL);
   fileOp_->cancelQueuedBtn = new wxButton(fileOp_->queuePanel, wxID_ANY, "Cancel Selected");
@@ -2051,10 +2115,9 @@ void MainFrame::ExtractWithProgress(const std::vector<std::string>& argv,
 
   fileOp_->cancelQueuedBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
     if (!fileOp_ || !fileOp_->queueList) return;
-    const int sel = fileOp_->queueList->GetSelection();
-    if (sel == wxNOT_FOUND) return;
-    if (sel < 0 || static_cast<size_t>(sel) >= fileOp_->queueLineToOpId.size()) return;
-    const std::uint64_t id = fileOp_->queueLineToOpId[static_cast<size_t>(sel)];
+    const auto idOpt = fileOp_->queueList->GetSelectedOpId();
+    if (!idOpt) return;
+    const std::uint64_t id = *idOpt;
     for (auto it = opQueue_.begin(); it != opQueue_.end(); ++it) {
       if (it->id == id) {
         opQueue_.erase(it);
