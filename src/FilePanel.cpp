@@ -801,7 +801,7 @@ std::vector<FilePanel::Entry> ListGioLocation(const std::string& uri, std::strin
   GError* error = nullptr;
   GFileEnumerator* en = g_file_enumerate_children(
       file,
-      "standard::name,standard::type,standard::size,standard::target-uri,time::modified",
+      "standard::name,standard::display-name,standard::type,standard::size,standard::target-uri,time::modified",
       G_FILE_QUERY_INFO_NONE,
       nullptr,
       &error);
@@ -887,7 +887,8 @@ std::vector<FilePanel::Entry> ListGioLocation(const std::string& uri, std::strin
   // Prefer "gio list" for remote locations (smb://, sftp://, etc.).
   // We include --hidden to match local directory listing behavior.
   const std::string cmd =
-      "gio list --hidden -l -u -d -a standard::name,time::modified " + ShellQuote(uri) + " 2>&1";
+      "gio list --hidden -l -u -d -a standard::name,standard::display-name,time::modified " +
+      ShellQuote(uri) + " 2>&1";
 
   FILE* pipe = popen(cmd.c_str(), "r");
   if (!pipe) {
@@ -941,7 +942,8 @@ std::vector<FilePanel::Entry> ListGioLocation(const std::string& uri, std::strin
     std::string modified;
     if (cols.size() >= 4) {
       const auto& attrs = cols[3];
-      name = ExtractAttrValue(attrs, "standard::name", {"time::modified"});
+      name = ExtractAttrValue(attrs, "standard::display-name", {"standard::name", "time::modified"});
+      if (name.empty()) name = ExtractAttrValue(attrs, "standard::name", {"time::modified"});
       const auto mod = ExtractAttrValue(attrs, "time::modified", {});
       try {
         modified = FormatUnixSeconds(std::stoll(mod));
