@@ -52,8 +52,8 @@ namespace fs = std::filesystem;
 
 namespace {
 constexpr int COL_NAME = 0;
-constexpr int COL_TYPE = 1;
-constexpr int COL_SIZE = 2;
+constexpr int COL_SIZE = 1;
+constexpr int COL_TYPE = 2;
 constexpr int COL_MOD = 3;
 constexpr int COL_FULLPATH = 4;
 
@@ -1149,8 +1149,8 @@ void FilePanel::BuildLayout() {
   list_ = new wxDataViewListCtrl(listPane, wxID_ANY, wxDefaultPosition, wxDefaultSize,
                                 wxDV_ROW_LINES | wxDV_VERT_RULES | wxDV_MULTIPLE);
   list_->AppendIconTextColumn("Name", wxDATAVIEW_CELL_EDITABLE, 260, wxALIGN_LEFT);
-  list_->AppendTextColumn("Type", wxDATAVIEW_CELL_INERT, 70, wxALIGN_LEFT);
   list_->AppendTextColumn("Size", wxDATAVIEW_CELL_INERT, 90, wxALIGN_RIGHT);
+  list_->AppendTextColumn("Type", wxDATAVIEW_CELL_INERT, 70, wxALIGN_LEFT);
   list_->AppendTextColumn("Modified", wxDATAVIEW_CELL_INERT, 150, wxALIGN_LEFT);
   list_->AppendTextColumn("FullPath", wxDATAVIEW_CELL_INERT, 0, wxALIGN_LEFT, wxDATAVIEW_COL_HIDDEN);
   // Disable native wxDataViewListCtrl sorting; we manage sorting ourselves so we
