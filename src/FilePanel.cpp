@@ -2569,21 +2569,57 @@ static std::string UnescapeProcMountsField(std::string s) {
   return out;
 }
 
+static std::unordered_map<std::string, std::string> BuildDeviceLabelMap() {
+  // Map canonical device node path (e.g. /dev/sdb1) -> volume label (from /dev/disk/by-label).
+  std::unordered_map<std::string, std::string> out;
+  std::error_code ec;
+  const fs::path byLabel("/dev/disk/by-label");
+  if (!fs::exists(byLabel, ec) || !fs::is_directory(byLabel, ec)) return out;
+
+  for (const auto& ent : fs::directory_iterator(byLabel, ec)) {
+    if (ec) break;
+    const auto label = ent.path().filename().string();
+    if (label.empty()) continue;
+
+    ec.clear();
+    const auto canon = fs::weakly_canonical(ent.path(), ec);
+    if (ec) continue;
+
+    const auto key = canon.string();
+    if (key.empty()) continue;
+
+    // Keep first label seen for a device.
+    if (out.find(key) == out.end()) out.emplace(key, label);
+  }
+  return out;
+}
+
 void FilePanel::PopulateDevices(const wxTreeItemId& devicesItem) {
   if (!tree_ || !devicesItem.IsOk()) return;
   tree_->DeleteChildren(devicesItem);
+
+  const auto devLabels = BuildDeviceLabelMap();
 
   std::ifstream f("/proc/mounts");
   if (!f.is_open()) return;
 
   std::set<std::string> mountpoints;
+  std::unordered_map<std::string, std::string> mpToDev;
   std::string dev, mnt, type, opts;
   while (f >> dev >> mnt >> type >> opts) {
     std::string rest;
     std::getline(f, rest);
+    const auto devPath = UnescapeProcMountsField(dev);
     const auto mp = UnescapeProcMountsField(mnt);
     if (mp.empty()) continue;
     mountpoints.insert(mp);
+
+    if (!devPath.empty() && devPath.front() == '/') {
+      std::error_code ec;
+      const auto canon = fs::weakly_canonical(fs::path(devPath), ec);
+      if (!ec) mpToDev[mp] = canon.string();
+      else mpToDev[mp] = devPath;
+    }
   }
 
   const auto isInteresting = [](const std::string& mp) -> bool {
@@ -2597,10 +2633,19 @@ void FilePanel::PopulateDevices(const wxTreeItemId& devicesItem) {
   for (const auto& mp : mountpoints) {
     if (!isInteresting(mp)) continue;
     fs::path p(mp);
-    auto label = p.filename().string();
-    if (label.empty()) label = mp;
+    auto display = p.filename().string();
+    if (display.empty()) display = mp;
+
+    // Prefer a filesystem label if we can resolve one for this mountpoint.
+    const auto itDev = mpToDev.find(mp);
+    if (itDev != mpToDev.end()) {
+      const auto itLabel = devLabels.find(itDev->second);
+      if (itLabel != devLabels.end() && !itLabel->second.empty()) {
+        display = itLabel->second;
+      }
+    }
     tree_->AppendItem(devicesItem,
-                      wxString::FromUTF8(label),
+                      wxString::FromUTF8(display),
                       static_cast<int>(TreeIcon::Drive),
                       -1,
                       new TreeNodeData(p));
