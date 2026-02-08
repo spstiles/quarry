@@ -772,6 +772,17 @@ OpResult TrashPath(const fs::path& src, const CancelFn& shouldCancel) {
   // Prefer gio's native trash API when available (works for local and some remote mounts).
   if (IsCanceled(shouldCancel)) return CanceledResult();
 
+  if (LooksLikeUriString(srcStr)) {
+    const auto pos = srcStr.find("://");
+    const std::string scheme = pos == std::string::npos ? std::string{} : srcStr.substr(0, pos);
+    std::string lower;
+    lower.reserve(scheme.size());
+    for (unsigned char c : scheme) lower.push_back(static_cast<char>(std::tolower(c)));
+    if (!lower.empty() && lower != "file") {
+      return {.ok = false, .message = "Trash is not supported for remote connections."};
+    }
+  }
+
   GCancellable* cancellable = g_cancellable_new();
   std::atomic_bool done{false};
   std::thread cancelWatcher;

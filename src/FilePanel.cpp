@@ -2670,12 +2670,6 @@ void FilePanel::TrashSelection() {
   const auto paths = GetSelectedPaths();
   if (paths.empty()) return;
 
-  const auto message = wxString::Format("Move %zu item(s) to Trash?", paths.size());
-  if (wxMessageBox(message, "Trash", wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION, DialogParent()) !=
-      wxYES) {
-    return;
-  }
-
   auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(DialogParent()));
   if (!frame) {
     wxMessageBox("Trash is not available here.", "Quarry", wxOK | wxICON_INFORMATION, DialogParent());
@@ -2688,15 +2682,6 @@ void FilePanel::TrashSelection() {
 void FilePanel::DeleteSelectionPermanent() {
   const auto paths = GetSelectedPaths();
   if (paths.empty()) return;
-
-  const auto message = wxString::Format(
-      "Permanently delete %zu item(s)?\n\nThis cannot be undone.", paths.size());
-  if (wxMessageBox(message,
-                   "Delete",
-                   wxYES_NO | wxNO_DEFAULT | wxICON_WARNING,
-                   DialogParent()) != wxYES) {
-    return;
-  }
 
   auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(DialogParent()));
   if (!frame) {
