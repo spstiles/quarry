@@ -168,6 +168,7 @@ private:
   long long renameArmedAtMs_{0};
   bool allowInlineEdit_{false};
   bool suppressNextContextMenu_{false};
+  bool renameHandling_{false};
 
   wxTreeItemId hiddenRoot_{};
   wxTreeItemId computerRoot_{};

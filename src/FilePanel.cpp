@@ -1190,36 +1190,16 @@ static OpResult GioRenameInPlace(const std::string& srcUriOrPath,
   auto attempt = [&]() -> std::pair<bool, wxString> {
     GFile* src = g_file_new_for_commandline_arg(srcUriOrPath.c_str());
     if (!src) return {false, "Invalid source."};
-    GFile* parent = g_file_get_parent(src);
-    if (!parent) {
-      g_object_unref(src);
-      return {false, "Unable to rename this item."};
-    }
-
-    GFile* dst = g_file_get_child(parent, newNameUtf8.c_str());
-    if (!dst) {
-      g_object_unref(parent);
-      g_object_unref(src);
-      return {false, "Invalid destination name."};
-    }
-
     GError* err = nullptr;
-    const gboolean ok = g_file_move(src,
-                                    dst,
-                                    static_cast<GFileCopyFlags>(G_FILE_COPY_NONE),
-                                    /*cancellable=*/nullptr,
-                                    /*progress_callback=*/nullptr,
-                                    /*progress_data=*/nullptr,
-                                    &err);
-    g_object_unref(dst);
-    g_object_unref(parent);
+    GFile* renamed = g_file_set_display_name(src, newNameUtf8.c_str(), /*cancellable=*/nullptr, &err);
     g_object_unref(src);
-    if (!ok) {
+    if (!renamed) {
       const wxString msg = err && err->message ? wxString::FromUTF8(err->message) : "Rename failed.";
       const bool notMounted = err && g_error_matches(err, G_IO_ERROR, G_IO_ERROR_NOT_MOUNTED);
       if (err) g_error_free(err);
       return {notMounted, msg};
     }
+    g_object_unref(renamed);
     return {false, ""};
   };
 
@@ -2335,6 +2315,13 @@ void FilePanel::ShowProperties() {
 
 void FilePanel::OnListValueChanged(wxDataViewEvent& event) {
   if (event.GetColumn() != COL_NAME) return;
+  if (renameHandling_) return;
+  renameHandling_ = true;
+  struct Guard {
+    bool* flag;
+    ~Guard() { *flag = false; }
+  } guard{&renameHandling_};
+
   if (listingMode_ != ListingMode::Directory && listingMode_ != ListingMode::Gio) {
     // Disallow rename in virtual views.
     const int row = list_->ItemToRow(event.GetItem());
