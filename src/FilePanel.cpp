@@ -2168,21 +2168,21 @@ void FilePanel::Populate(const std::vector<Entry>& entries) {
   list_->Freeze();
   list_->DeleteAllItems();
 
-  for (const auto& e : entries) {
-    wxVector<wxVariant> cols;
-    const auto artId = e.isDir ? wxART_FOLDER : wxART_NORMAL_FILE;
-    const auto bundle = wxArtProvider::GetBitmapBundle(artId, wxART_OTHER, wxSize(16, 16));
-    wxDataViewIconText iconText(wxString::FromUTF8(e.name), bundle);
-    wxVariant nameVar;
-    nameVar << iconText;
-    cols.push_back(nameVar);
-    cols.push_back(wxVariant(e.isDir ? "Dir" : "File"));
-    cols.push_back(wxVariant(e.isDir ? "" : HumanSize(e.size)));
-    cols.push_back(wxVariant(e.modified));
-    const auto full = !e.fullPath.empty() ? e.fullPath : (currentDir_ / e.name).string();
-    cols.push_back(wxVariant(full));
-    list_->AppendItem(cols);
-  }
+	  for (const auto& e : entries) {
+	    wxVector<wxVariant> cols;
+	    const auto artId = e.isDir ? wxART_FOLDER : wxART_NORMAL_FILE;
+	    const auto bundle = wxArtProvider::GetBitmapBundle(artId, wxART_OTHER, wxSize(16, 16));
+	    wxDataViewIconText iconText(wxString::FromUTF8(e.name), bundle);
+	    wxVariant nameVar;
+	    nameVar << iconText;
+	    cols.push_back(nameVar);
+	    cols.push_back(wxVariant(e.isDir ? "" : HumanSize(e.size)));
+	    cols.push_back(wxVariant(e.isDir ? "Dir" : "File"));
+	    cols.push_back(wxVariant(e.modified));
+	    const auto full = !e.fullPath.empty() ? e.fullPath : (currentDir_ / e.name).string();
+	    cols.push_back(wxVariant(full));
+	    list_->AppendItem(cols);
+	  }
   list_->Thaw();
 }
 
