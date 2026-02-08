@@ -7,19 +7,19 @@
 #include <vector>
 
 #include <wx/dataview.h>
-#include <wx/panel.h>
 #include <wx/treectrl.h>
 
 class wxButton;
 class wxDataViewListCtrl;
 class wxDataViewEvent;
 class wxTextCtrl;
-class wxSplitterWindow;
 class wxStaticText;
 class wxBitmapButton;
+class wxPanel;
 class wxTreeCtrl;
+class wxWindow;
 
-class FilePanel final : public wxPanel {
+class FilePanel final {
 public:
   struct Entry {
     std::string name;
@@ -29,7 +29,10 @@ public:
     std::string fullPath;
   };
 
-  explicit FilePanel(wxWindow* parent);
+  FilePanel(wxWindow* sidebarParent, wxWindow* listParent);
+
+  wxWindow* SidebarWindow() const;
+  wxWindow* ListWindow() const;
 
   void SetDirectory(const std::string& path);
   std::filesystem::path GetDirectoryPath() const;
@@ -71,7 +74,7 @@ private:
   enum class ListingMode { Directory, Recent, Gio };
   enum class SortColumn { Name, Type, Size, Modified };
 
-  void BuildLayout();
+  void BuildLayout(wxWindow* sidebarParent, wxWindow* listParent);
   void BindEvents();
   void NavigateToTextPath();
   void OpenSelectedIfDir(wxDataViewEvent& event);
@@ -108,7 +111,10 @@ private:
 
   void SetStatus(const wxString& message);
   void Populate(const std::vector<Entry>& entries);
+  wxWindow* DialogParent() const;
 
+  wxPanel* sidebarRoot_{nullptr};
+  wxPanel* listRoot_{nullptr};
   wxTextCtrl* pathCtrl_{nullptr};
   wxBitmapButton* backBtn_{nullptr};
   wxBitmapButton* forwardBtn_{nullptr};
@@ -116,7 +122,6 @@ private:
   wxBitmapButton* refreshBtn_{nullptr};
   wxBitmapButton* homeBtn_{nullptr};
   wxButton* goBtn_{nullptr};
-  wxSplitterWindow* split_{nullptr};
   wxTreeCtrl* tree_{nullptr};
   wxDataViewListCtrl* list_{nullptr};
   wxStaticText* statusText_{nullptr};

@@ -1,12 +1,12 @@
 #pragma once
 
 #include "FilePanel.h"
+#include "QuadSplitter.h"
 
 #include <wx/frame.h>
 
 #include <memory>
-
-class wxSplitterWindow;
+#include <string>
 
 class MainFrame final : public wxFrame {
 public:
@@ -22,6 +22,8 @@ private:
   void BuildMenu();
   void BuildLayout();
   void BindEvents();
+  void InitPanelsIfNeeded();
+  void BindPanelEvents();
 
   FilePanel* GetActivePanel() const;
   FilePanel* GetInactivePanel() const;
@@ -51,8 +53,12 @@ private:
   struct FileOpSession;
   std::unique_ptr<FileOpSession> fileOp_{};
 
-  wxSplitterWindow* splitter_{nullptr};
-  FilePanel* top_{nullptr};
-  FilePanel* bottom_{nullptr};
+  QuadSplitter* quad_{nullptr};
+  std::unique_ptr<FilePanel> top_{};
+  std::unique_ptr<FilePanel> bottom_{};
   ActivePane activePane_{ActivePane::Top};
+
+  bool panelsInitialized_{false};
+  std::string pendingTopDir_{};
+  std::string pendingBottomDir_{};
 };

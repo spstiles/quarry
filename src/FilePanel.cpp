@@ -1090,30 +1090,45 @@ void FilePanel::SeedMountCredentials(const std::string& uri,
 #endif
 }
 
-FilePanel::FilePanel(wxWindow* parent) : wxPanel(parent, wxID_ANY) { BuildLayout(); }
+FilePanel::FilePanel(wxWindow* sidebarParent, wxWindow* listParent) {
+  BuildLayout(sidebarParent, listParent);
+}
+
+wxWindow* FilePanel::SidebarWindow() const { return sidebarRoot_; }
+
+wxWindow* FilePanel::ListWindow() const { return listRoot_; }
+
+wxWindow* FilePanel::DialogParent() const {
+  if (listRoot_) return listRoot_;
+  return sidebarRoot_;
+}
 
 void FilePanel::BindDropFiles(
     std::function<void(const std::vector<std::filesystem::path>& paths, bool move)> onDrop) {
   onDropFiles_ = std::move(onDrop);
 }
 
-void FilePanel::BuildLayout() {
-  split_ = new wxSplitterWindow(this, wxID_ANY);
-  split_->SetSashGravity(0.0);
-  split_->SetMinimumPaneSize(160);
+void FilePanel::BuildLayout(wxWindow* sidebarParent, wxWindow* listParent) {
+  sidebarRoot_ = new wxPanel(sidebarParent, wxID_ANY);
+  listRoot_ = new wxPanel(listParent, wxID_ANY);
 
-  tree_ = new wxTreeCtrl(split_,
-                         wxID_ANY,
-                         wxDefaultPosition,
-                         wxDefaultSize,
-                         wxTR_HAS_BUTTONS | wxTR_LINES_AT_ROOT | wxTR_HIDE_ROOT | wxTR_DEFAULT_STYLE);
+  // Sidebar tree should behave like a modern file-manager sidebar (Nemo/Dolphin):
+  // no connector "branch" lines and full-row highlight.
+  const long treeStyle =
+      wxTR_HIDE_ROOT | wxTR_HAS_BUTTONS | wxTR_NO_LINES | wxTR_FULL_ROW_HIGHLIGHT;
+  tree_ = new wxTreeCtrl(sidebarRoot_, wxID_ANY, wxDefaultPosition, wxDefaultSize, treeStyle);
 
-  auto* listPane = new wxPanel(split_, wxID_ANY);
+  auto* sidebarSizer = new wxBoxSizer(wxVERTICAL);
+  sidebarSizer->Add(tree_, 1, wxEXPAND | wxALL, 6);
+  sidebarRoot_->SetSizer(sidebarSizer);
+  sidebarRoot_->SetMinSize(wxSize(160, 140));
+  tree_->SetMinSize(wxSize(160, 140));
+
   auto* listSizer = new wxBoxSizer(wxVERTICAL);
 
   auto* listToolbar = new wxBoxSizer(wxHORIZONTAL);
-  pathCtrl_ = new wxTextCtrl(listPane, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, wxTE_PROCESS_ENTER);
-  goBtn_ = new wxButton(listPane, wxID_ANY, "Go");
+  pathCtrl_ = new wxTextCtrl(listRoot_, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, wxTE_PROCESS_ENTER);
+  goBtn_ = new wxButton(listRoot_, wxID_ANY, "Go");
 
   // Match button height to the address bar height, but give the buttons a bit
   // of extra width so GTK theme padding/borders don't crop the icons.
@@ -1123,7 +1138,7 @@ void FilePanel::BuildLayout() {
 
   const auto mkBtn = [&](const wxArtID& id, const wxString& tooltip) -> wxBitmapButton* {
     // placeholder, bitmap set below via UpdateNavIcons()
-    auto* btn = new wxBitmapButton(listPane, wxID_ANY, wxNullBitmap);
+    auto* btn = new wxBitmapButton(listRoot_, wxID_ANY, wxNullBitmap);
     btn->SetToolTip(tooltip);
     btn->SetBitmapMargins(2, 2);
     btn->SetMinSize(wxSize(toolbarHeight + 6, toolbarHeight));
@@ -1149,7 +1164,7 @@ void FilePanel::BuildLayout() {
   listToolbar->Add(goBtn_, 0, wxEXPAND);
   listSizer->Add(listToolbar, 0, wxEXPAND | wxALL, 8);
 
-  list_ = new wxDataViewListCtrl(listPane, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+  list_ = new wxDataViewListCtrl(listRoot_, wxID_ANY, wxDefaultPosition, wxDefaultSize,
                                 wxDV_ROW_LINES | wxDV_VERT_RULES | wxDV_MULTIPLE);
   list_->AppendIconTextColumn("Name", wxDATAVIEW_CELL_EDITABLE, 260, wxALIGN_LEFT);
   list_->AppendTextColumn("Size", wxDATAVIEW_CELL_INERT, 90, wxALIGN_RIGHT);
@@ -1171,16 +1186,17 @@ void FilePanel::BuildLayout() {
   list_->EnableDropTargets(fmts);
 #endif
 
-  statusText_ = new wxStaticText(listPane, wxID_ANY, "");
+  statusText_ = new wxStaticText(listRoot_, wxID_ANY, "");
   listSizer->Add(list_, 1, wxEXPAND | wxLEFT | wxRIGHT, 8);
   listSizer->Add(statusText_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM | wxTOP, 8);
-  listPane->SetSizer(listSizer);
-
-  split_->SplitVertically(tree_, listPane, 320);
-
-  auto* sizer = new wxBoxSizer(wxVERTICAL);
-  sizer->Add(split_, 1, wxEXPAND);
-  SetSizer(sizer);
+  listRoot_->SetSizer(listSizer);
+  list_->SetMinSize(wxSize(220, 140));
+  // Avoid GTK negative-allocation warnings by preventing the list view area
+  // from being resized smaller than the toolbar + status line can support.
+  const int toolbarMinH = toolbarHeight + 16;
+  const int statusMinH = statusText_->GetBestSize().y + 16;
+  const int listMinH = std::max(140, toolbarMinH + statusMinH + 40);
+  listRoot_->SetMinSize(wxSize(220, listMinH));
 
   BindEvents();
   UpdateStatusText();
@@ -1397,7 +1413,7 @@ void FilePanel::BindEvents() {
     }
 
     const long long now = wxGetLocalTimeMillis().GetValue();
-    const int dclickMs = wxSystemSettings::GetMetric(wxSYS_DCLICK_MSEC, this);
+    const int dclickMs = wxSystemSettings::GetMetric(wxSYS_DCLICK_MSEC, DialogParent());
 
     // If this item was already armed and the second click isn't within the
     // double-click interval, initiate rename.
@@ -1443,11 +1459,16 @@ void FilePanel::BindEvents() {
     });
   }
 
-  Bind(wxEVT_SYS_COLOUR_CHANGED, [this](wxSysColourChangedEvent& e) {
-    UpdateActiveVisuals();
-    UpdateNavIcons();
-    e.Skip();
-  });
+  auto bindSysColor = [this](wxWindow* w) {
+    if (!w) return;
+    w->Bind(wxEVT_SYS_COLOUR_CHANGED, [this](wxSysColourChangedEvent& e) {
+      UpdateActiveVisuals();
+      UpdateNavIcons();
+      e.Skip();
+    });
+  };
+  bindSysColor(listRoot_);
+  bindSysColor(sidebarRoot_);
 }
 
 void FilePanel::UpdateNavIcons() {
@@ -1731,7 +1752,7 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
         }
 
         if (scheme == "smb" && IsBareSchemeUri(dirStr)) {
-          wxTextEntryDialog dlg(this,
+          wxTextEntryDialog dlg(DialogParent(),
                                 "Enter an SMB URI (example: smb://server/share):",
                                 "Connect to Windows Share");
           dlg.SetValue("smb://");
@@ -1774,7 +1795,7 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
         }
 
         std::string err;
-        auto entries = ListGioLocation(effectiveUri, &err, this);
+        auto entries = ListGioLocation(effectiveUri, &err, DialogParent());
         if (!err.empty()) {
           const bool maybeNeedsMount =
               scheme == "network" || scheme == "smb" ||
@@ -1783,9 +1804,9 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
 
           if (maybeNeedsMount) {
             std::string mountErr;
-            if (GioMountLocation(effectiveUri, &mountErr, this)) {
+            if (GioMountLocation(effectiveUri, &mountErr, DialogParent())) {
               err.clear();
-              entries = ListGioLocation(effectiveUri, &err, this);
+              entries = ListGioLocation(effectiveUri, &err, DialogParent());
             } else if (!mountErr.empty()) {
               err = err.empty() ? mountErr : (err + "\n\nMount attempt: " + mountErr);
             }
@@ -1805,7 +1826,7 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
                                         dirWx.c_str(),
                                         errWx.c_str(),
                                         help.c_str()),
-                       "Quarry", wxOK | wxICON_ERROR, this);
+                       "Quarry", wxOK | wxICON_ERROR, DialogParent());
           return false;
         }
 
@@ -1870,7 +1891,7 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
   if (!fs::exists(resolved, ec) || !fs::is_directory(resolved, ec)) {
     const wxString resolvedWx = wxString::FromUTF8(resolved.string());
     wxMessageBox(wxString::Format("Not a directory:\n\n%s", resolvedWx.c_str()), "Quarry",
-                 wxOK | wxICON_WARNING, this);
+                 wxOK | wxICON_WARNING, DialogParent());
     return false;
   }
 
@@ -1886,7 +1907,7 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
     wxMessageBox(wxString::Format("Unable to list directory:\n\n%s\n\n%s",
                                   dirWx.c_str(),
                                   errWx.c_str()),
-                 "Quarry", wxOK | wxICON_ERROR, this);
+                 "Quarry", wxOK | wxICON_ERROR, DialogParent());
   }
   SortEntries(entries);
   Populate(entries);
@@ -1954,7 +1975,7 @@ void FilePanel::ShowProperties() {
   if (selected.empty()) return;
   if (selected.size() > 1) {
     wxMessageBox(wxString::Format("%zu items selected.", selected.size()),
-                 "Properties", wxOK | wxICON_INFORMATION, this);
+                 "Properties", wxOK | wxICON_INFORMATION, DialogParent());
     return;
   }
 
@@ -1972,7 +1993,7 @@ void FilePanel::ShowProperties() {
     msg << "Size: " << HumanSize(size) << "\n";
   }
 
-  wxMessageBox(msg, "Properties", wxOK | wxICON_INFORMATION, this);
+  wxMessageBox(msg, "Properties", wxOK | wxICON_INFORMATION, DialogParent());
 }
 
 void FilePanel::OnListValueChanged(wxDataViewEvent& event) {
@@ -1998,7 +2019,7 @@ void FilePanel::OnListValueChanged(wxDataViewEvent& event) {
   if (newName == oldName) return;
 
   if (newName.empty() || newName.find('/') != std::string::npos) {
-    wxMessageBox("Invalid name.", "Rename", wxOK | wxICON_WARNING, this);
+    wxMessageBox("Invalid name.", "Rename", wxOK | wxICON_WARNING, DialogParent());
     SetRowName(list_, static_cast<unsigned int>(row), oldName, renamedDir);
     return;
   }
@@ -2008,7 +2029,7 @@ void FilePanel::OnListValueChanged(wxDataViewEvent& event) {
   if (ec) {
     const wxString errWx = wxString::FromUTF8(ec.message());
     wxMessageBox(wxString::Format("Rename failed:\n\n%s", errWx.c_str()), "Rename",
-                 wxOK | wxICON_ERROR, this);
+                 wxOK | wxICON_ERROR, DialogParent());
     SetRowName(list_, static_cast<unsigned int>(row), oldName, renamedDir);
     return;
   }
@@ -2319,13 +2340,17 @@ void FilePanel::BeginInlineRename() {
 
 void FilePanel::CreateFolder() {
   if (listingMode_ != ListingMode::Directory) {
-    wxMessageBox("Create Folder is not available here.", "Quarry", wxOK | wxICON_INFORMATION, this);
+    wxMessageBox("Create Folder is not available here.",
+                 "Quarry",
+                 wxOK | wxICON_INFORMATION,
+                 DialogParent());
     return;
   }
-  const auto name = wxGetTextFromUser("Folder name:", "Create Folder", "", this).ToStdString();
+  const auto name =
+      wxGetTextFromUser("Folder name:", "Create Folder", "", DialogParent()).ToStdString();
   if (name.empty()) return;
   if (name.find('/') != std::string::npos) {
-    wxMessageBox("Invalid folder name.", "Create Folder", wxOK | wxICON_WARNING, this);
+    wxMessageBox("Invalid folder name.", "Create Folder", wxOK | wxICON_WARNING, DialogParent());
     return;
   }
 
@@ -2334,7 +2359,7 @@ void FilePanel::CreateFolder() {
   if (ec) {
     const wxString errWx = wxString::FromUTF8(ec.message());
     wxMessageBox(wxString::Format("Create folder failed:\n\n%s", errWx.c_str()), "Create Folder",
-                 wxOK | wxICON_ERROR, this);
+                 wxOK | wxICON_ERROR, DialogParent());
     return;
   }
   RefreshAll();
@@ -2357,7 +2382,7 @@ void FilePanel::CutSelection() {
 void FilePanel::PasteIntoCurrentDir() {
   if (!g_clipboard || g_clipboard->paths.empty()) return;
   if (listingMode_ != ListingMode::Directory && listingMode_ != ListingMode::Gio) {
-    wxMessageBox("Paste is not available here.", "Quarry", wxOK | wxICON_INFORMATION, this);
+    wxMessageBox("Paste is not available here.", "Quarry", wxOK | wxICON_INFORMATION, DialogParent());
     return;
   }
   if (currentDir_.empty()) return;
@@ -2365,10 +2390,10 @@ void FilePanel::PasteIntoCurrentDir() {
   const bool isMove = g_clipboard->mode == AppClipboard::Mode::Cut;
   const auto title = isMove ? "Paste (Move)" : "Paste (Copy)";
 
-  auto* tlp = wxGetTopLevelParent(this);
+  auto* tlp = wxGetTopLevelParent(DialogParent());
   auto* frame = dynamic_cast<MainFrame*>(tlp);
   if (!frame) {
-    wxMessageBox("Paste is not available here.", "Quarry", wxOK | wxICON_INFORMATION, this);
+    wxMessageBox("Paste is not available here.", "Quarry", wxOK | wxICON_INFORMATION, DialogParent());
     return;
   }
 
@@ -2383,14 +2408,17 @@ void FilePanel::TrashSelection() {
   if (paths.empty()) return;
 
   const auto message = wxString::Format("Move %zu item(s) to Trash?", paths.size());
-  if (wxMessageBox(message, "Trash", wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION, this) != wxYES) {
+  if (wxMessageBox(message,
+                   "Trash",
+                   wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION,
+                   DialogParent()) != wxYES) {
     return;
   }
 
   wxProgressDialog progress("Trashing",
                             "Preparing...",
                             static_cast<int>(paths.size()),
-                            this,
+                            DialogParent(),
                             wxPD_APP_MODAL | wxPD_CAN_ABORT | wxPD_AUTO_HIDE | wxPD_ELAPSED_TIME);
 
   for (size_t i = 0; i < paths.size(); i++) {
@@ -2399,7 +2427,7 @@ void FilePanel::TrashSelection() {
 
     const auto result = TrashPath(src);
     if (!result.ok) {
-      wxMessageDialog dlg(this,
+      wxMessageDialog dlg(DialogParent(),
                           wxString::Format("Trash failed:\n\n%s\n\nContinue?", result.message.c_str()),
                           "Trash failed",
                           wxYES_NO | wxNO_DEFAULT | wxICON_ERROR);
@@ -2420,14 +2448,17 @@ void FilePanel::DeleteSelectionPermanent() {
 
   const auto message = wxString::Format(
       "Permanently delete %zu item(s)?\n\nThis cannot be undone.", paths.size());
-  if (wxMessageBox(message, "Delete", wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this) != wxYES) {
+  if (wxMessageBox(message,
+                   "Delete",
+                   wxYES_NO | wxNO_DEFAULT | wxICON_WARNING,
+                   DialogParent()) != wxYES) {
     return;
   }
 
   wxProgressDialog progress("Deleting",
                             "Preparing...",
                             static_cast<int>(paths.size()),
-                            this,
+                            DialogParent(),
                             wxPD_APP_MODAL | wxPD_CAN_ABORT | wxPD_AUTO_HIDE | wxPD_ELAPSED_TIME);
 
   for (size_t i = 0; i < paths.size(); i++) {
@@ -2436,7 +2467,7 @@ void FilePanel::DeleteSelectionPermanent() {
 
     const auto result = DeletePath(src);
     if (!result.ok) {
-      wxMessageDialog dlg(this,
+      wxMessageDialog dlg(DialogParent(),
                           wxString::Format("Delete failed:\n\n%s\n\nContinue?", result.message.c_str()),
                           "Delete failed",
                           wxYES_NO | wxNO_DEFAULT | wxICON_ERROR);
@@ -3036,7 +3067,7 @@ void FilePanel::ShowListContextMenu(wxDataViewEvent& event) {
   menu.Bind(wxEVT_MENU, [this](wxCommandEvent&) { DeleteSelectionPermanent(); }, ID_CTX_DELETE_PERM);
   menu.Bind(wxEVT_MENU, [this](wxCommandEvent&) { ShowProperties(); }, ID_CTX_PROPERTIES);
 
-  PopupMenu(&menu);
+  list_->PopupMenu(&menu);
 }
 
 bool FilePanel::AnySelectedDirs() const {

@@ -18,6 +18,7 @@ add_executable(quarry
   src/main.cpp
   src/MainFrame.cpp
   src/FilePanel.cpp
+  src/QuadSplitter.cpp
   src/NavIcons.cpp
   src/util.cpp
 )

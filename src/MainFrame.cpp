@@ -375,12 +375,13 @@ MainFrame::MainFrame()
   BindEvents();
 
   const auto home = wxGetHomeDir().ToStdString();
-  top_->SetDirectory(home);
-  bottom_->SetDirectory(home);
+  pendingTopDir_ = home;
+  pendingBottomDir_ = home;
 
   SetMinSize(wxSize(900, 500));
 
-  SetActivePane(ActivePane::Top);
+  // Panels are initialized after the window is shown to avoid GTK warnings
+  // caused by laying out scrolled windows at transient tiny sizes during startup.
 }
 
 void MainFrame::StartFileOperation(const wxString& title,
@@ -414,16 +415,10 @@ void MainFrame::BuildMenu() {
 }
 
 void MainFrame::BuildLayout() {
-  splitter_ = new wxSplitterWindow(this, wxID_ANY);
-  splitter_->SetSashGravity(0.5);
-  splitter_->SetMinimumPaneSize(260);
-
-  top_ = new FilePanel(splitter_);
-  bottom_ = new FilePanel(splitter_);
-  splitter_->SplitHorizontally(top_, bottom_);
+  quad_ = new QuadSplitter(this, wxID_ANY);
 
   auto* sizer = new wxBoxSizer(wxVERTICAL);
-  sizer->Add(splitter_, 1, wxEXPAND);
+  sizer->Add(quad_, 1, wxEXPAND);
   SetSizer(sizer);
 }
 
@@ -445,24 +440,21 @@ void MainFrame::BindEvents() {
     e.Skip();
   });
 
-  top_->BindFocusEvents([this]() { SetActivePane(ActivePane::Top); });
-  bottom_->BindFocusEvents([this]() { SetActivePane(ActivePane::Bottom); });
-
-  top_->BindDropFiles([this](const std::vector<std::filesystem::path>& paths, bool move) {
-    TransferDroppedPaths(top_, paths, move);
+  Bind(wxEVT_SHOW, [this](wxShowEvent& e) {
+    e.Skip();
+    if (!e.IsShown()) return;
+    CallAfter([this]() { InitPanelsIfNeeded(); });
   });
-  bottom_->BindDropFiles([this](const std::vector<std::filesystem::path>& paths, bool move) {
-    TransferDroppedPaths(bottom_, paths, move);
-  });
-
-  auto onDirChanged = [this](const std::filesystem::path& dir, bool treeChanged) {
-    RefreshPanelsShowing(dir, treeChanged);
-  };
-  top_->BindDirContentsChanged(onDirChanged);
-  bottom_->BindDirContentsChanged(onDirChanged);
 
   // Key navigation that should work regardless of which child has focus.
   Bind(wxEVT_CHAR_HOOK, [this](wxKeyEvent& e) {
+    InitPanelsIfNeeded();
+    auto* active = GetActivePanel();
+    if (!active) {
+      e.Skip();
+      return;
+    }
+
     auto isTextInputFocused = []() -> bool {
       wxWindow* w = wxWindow::FindFocus();
       while (w) {
@@ -480,15 +472,15 @@ void MainFrame::BindEvents() {
 
     if (key == WXK_TAB && !e.ControlDown() && !e.AltDown()) {
       SetActivePane(activePane_ == ActivePane::Top ? ActivePane::Bottom : ActivePane::Top);
-      GetActivePanel()->FocusPrimary();
+      if (auto* a = GetActivePanel()) a->FocusPrimary();
       return;
     }
     if (key == WXK_RETURN || key == WXK_NUMPAD_ENTER) {
-      GetActivePanel()->OpenSelection();
+      active->OpenSelection();
       return;
     }
     if (key == WXK_BACK) {
-      GetActivePanel()->NavigateUp();
+      active->NavigateUp();
       return;
     }
     if (key == WXK_F5) {
@@ -531,6 +523,52 @@ void MainFrame::BindEvents() {
   wxAcceleratorEntry entries[1];
   entries[0].Set(wxACCEL_CTRL, (int)'Q', wxID_EXIT);
   SetAcceleratorTable(wxAcceleratorTable(1, entries));
+}
+
+void MainFrame::InitPanelsIfNeeded() {
+  if (panelsInitialized_) return;
+  if (!quad_) return;
+
+  // Only initialize once the frame has a non-trivial size.
+  const auto cs = quad_->GetClientSize();
+  if (cs.x <= 0 || cs.y <= 0) return;
+
+  panelsInitialized_ = true;
+
+  top_ = std::make_unique<FilePanel>(quad_, quad_);
+  bottom_ = std::make_unique<FilePanel>(quad_, quad_);
+  quad_->SetWindows(top_->SidebarWindow(),
+                    top_->ListWindow(),
+                    bottom_->SidebarWindow(),
+                    bottom_->ListWindow());
+
+  BindPanelEvents();
+
+  if (!pendingTopDir_.empty()) top_->SetDirectory(pendingTopDir_);
+  if (!pendingBottomDir_.empty()) bottom_->SetDirectory(pendingBottomDir_);
+
+  SetActivePane(activePane_);
+  Layout();
+}
+
+void MainFrame::BindPanelEvents() {
+  if (!top_ || !bottom_) return;
+
+  top_->BindFocusEvents([this]() { SetActivePane(ActivePane::Top); });
+  bottom_->BindFocusEvents([this]() { SetActivePane(ActivePane::Bottom); });
+
+  top_->BindDropFiles([this](const std::vector<std::filesystem::path>& paths, bool move) {
+    TransferDroppedPaths(top_.get(), paths, move);
+  });
+  bottom_->BindDropFiles([this](const std::vector<std::filesystem::path>& paths, bool move) {
+    TransferDroppedPaths(bottom_.get(), paths, move);
+  });
+
+  auto onDirChanged = [this](const std::filesystem::path& dir, bool treeChanged) {
+    RefreshPanelsShowing(dir, treeChanged);
+  };
+  top_->BindDirContentsChanged(onDirChanged);
+  bottom_->BindDirContentsChanged(onDirChanged);
 }
 
 void MainFrame::TransferDroppedPaths(FilePanel* target,
@@ -912,21 +950,24 @@ void MainFrame::RefreshPanelsShowing(const std::filesystem::path& dir, bool tree
 }
 
 FilePanel* MainFrame::GetActivePanel() const {
-  return activePane_ == ActivePane::Top ? top_ : bottom_;
+  return activePane_ == ActivePane::Top ? top_.get() : bottom_.get();
 }
 
 FilePanel* MainFrame::GetInactivePanel() const {
-  return activePane_ == ActivePane::Top ? bottom_ : top_;
+  return activePane_ == ActivePane::Top ? bottom_.get() : top_.get();
 }
 
 void MainFrame::OnQuit(wxCommandEvent&) { Close(true); }
 
 void MainFrame::OnRefresh(wxCommandEvent&) {
-  top_->RefreshListing();
-  bottom_->RefreshListing();
+  InitPanelsIfNeeded();
+  if (top_) top_->RefreshListing();
+  if (bottom_) bottom_->RefreshListing();
 }
 
 void MainFrame::OnConnectToServer(wxCommandEvent&) {
+  InitPanelsIfNeeded();
+  if (!top_ || !bottom_) return;
   const auto params = ShowConnectDialog(this);
   if (!params) return;
 
@@ -940,11 +981,15 @@ void MainFrame::OnConnectToServer(wxCommandEvent&) {
                                           /*rememberForever=*/params->rememberPassword);
   }
 
-  GetActivePanel()->SetDirectory(uri);
-  GetActivePanel()->FocusPrimary();
+  if (auto* active = GetActivePanel()) {
+    active->SetDirectory(uri);
+    active->FocusPrimary();
+  }
 }
 
 void MainFrame::OnCopy(wxCommandEvent&) {
+  InitPanelsIfNeeded();
+  if (!top_ || !bottom_) return;
   auto* from = GetActivePanel();
   auto* to = GetInactivePanel();
 
@@ -956,6 +1001,8 @@ void MainFrame::OnCopy(wxCommandEvent&) {
 }
 
 void MainFrame::OnMove(wxCommandEvent&) {
+  InitPanelsIfNeeded();
+  if (!top_ || !bottom_) return;
   auto* from = GetActivePanel();
   auto* to = GetInactivePanel();
 
@@ -967,6 +1014,8 @@ void MainFrame::OnMove(wxCommandEvent&) {
 }
 
 void MainFrame::OnDelete(wxCommandEvent&) {
+  InitPanelsIfNeeded();
+  if (!top_ || !bottom_) return;
   auto* from = GetActivePanel();
   const auto sources = from->GetSelectedPaths();
   if (sources.empty()) return;
@@ -1026,6 +1075,8 @@ void MainFrame::OnDelete(wxCommandEvent&) {
 }
 
 void MainFrame::OnDeletePermanent(wxCommandEvent&) {
+  InitPanelsIfNeeded();
+  if (!top_ || !bottom_) return;
   auto* from = GetActivePanel();
   const auto sources = from->GetSelectedPaths();
   if (sources.empty()) return;
@@ -1069,9 +1120,13 @@ void MainFrame::OnDeletePermanent(wxCommandEvent&) {
 }
 
 void MainFrame::OnRename(wxCommandEvent&) {
+  InitPanelsIfNeeded();
+  if (!top_ || !bottom_) return;
   GetActivePanel()->BeginInlineRename();
 }
 
 void MainFrame::OnMkDir(wxCommandEvent&) {
+  InitPanelsIfNeeded();
+  if (!top_ || !bottom_) return;
   GetActivePanel()->CreateFolder();
 }
