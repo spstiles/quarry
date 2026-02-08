@@ -992,6 +992,7 @@ bool GioMountLocation(const std::string& uri, std::string* err, wxWindow*) {
   }
   return true;
 }
+
 #endif
 
 std::string GetRowName(wxDataViewListCtrl* list, unsigned int row) {
@@ -1000,8 +1001,12 @@ std::string GetRowName(wxDataViewListCtrl* list, unsigned int row) {
   if (v.GetType() == "wxDataViewIconText") {
     wxDataViewIconText it;
     it << v;
+    const wxScopedCharBuffer b = it.GetText().ToUTF8();
+    if (b.data()) return std::string(b.data());
     return it.GetText().ToStdString();
   }
+  const wxScopedCharBuffer b = v.GetString().ToUTF8();
+  if (b.data()) return std::string(b.data());
   return v.GetString().ToStdString();
 }
 
@@ -1174,6 +1179,67 @@ std::vector<FilePanel::Entry> ListDir(const fs::path& dir, std::string* errorMes
 } // namespace
 
 void WxProcessDeleter::operator()(wxProcess* p) const { delete p; }
+
+#ifdef QUARRY_USE_GIO
+static OpResult GioRenameInPlace(const std::string& srcUriOrPath,
+                                const std::string& newNameUtf8,
+                                const std::string& mountUri,
+                                wxWindow* parentForAuth) {
+  (void)parentForAuth;
+
+  auto attempt = [&]() -> std::pair<bool, wxString> {
+    GFile* src = g_file_new_for_commandline_arg(srcUriOrPath.c_str());
+    if (!src) return {false, "Invalid source."};
+    GFile* parent = g_file_get_parent(src);
+    if (!parent) {
+      g_object_unref(src);
+      return {false, "Unable to rename this item."};
+    }
+
+    GFile* dst = g_file_get_child(parent, newNameUtf8.c_str());
+    if (!dst) {
+      g_object_unref(parent);
+      g_object_unref(src);
+      return {false, "Invalid destination name."};
+    }
+
+    GError* err = nullptr;
+    const gboolean ok = g_file_move(src,
+                                    dst,
+                                    static_cast<GFileCopyFlags>(G_FILE_COPY_NONE),
+                                    /*cancellable=*/nullptr,
+                                    /*progress_callback=*/nullptr,
+                                    /*progress_data=*/nullptr,
+                                    &err);
+    g_object_unref(dst);
+    g_object_unref(parent);
+    g_object_unref(src);
+    if (!ok) {
+      const wxString msg = err && err->message ? wxString::FromUTF8(err->message) : "Rename failed.";
+      const bool notMounted = err && g_error_matches(err, G_IO_ERROR, G_IO_ERROR_NOT_MOUNTED);
+      if (err) g_error_free(err);
+      return {notMounted, msg};
+    }
+    return {false, ""};
+  };
+
+  const auto [notMounted, msg] = attempt();
+  if (msg.empty()) return {.ok = true};
+
+  if (notMounted && !mountUri.empty()) {
+    const wxString cmd0 = "gio";
+    const wxString cmd1 = "mount";
+    const wxString cmd2 = wxString::FromUTF8(mountUri);
+    const wxChar* const argv[] = {cmd0.wc_str(), cmd1.wc_str(), cmd2.wc_str(), nullptr};
+    (void)wxExecute(argv, wxEXEC_SYNC);
+    const auto [_, msg2] = attempt();
+    if (msg2.empty()) return {.ok = true};
+    return {.ok = false, .message = msg2};
+  }
+
+  return {.ok = false, .message = msg};
+}
+#endif
 
 void FilePanel::SeedMountCredentials(const std::string& uri,
                                      const std::string& username,
@@ -2269,7 +2335,7 @@ void FilePanel::ShowProperties() {
 
 void FilePanel::OnListValueChanged(wxDataViewEvent& event) {
   if (event.GetColumn() != COL_NAME) return;
-  if (listingMode_ != ListingMode::Directory) {
+  if (listingMode_ != ListingMode::Directory && listingMode_ != ListingMode::Gio) {
     // Disallow rename in virtual views.
     const int row = list_->ItemToRow(event.GetItem());
     if (row != wxNOT_FOUND && row >= 0 && static_cast<size_t>(row) < currentEntries_.size()) {
@@ -2295,19 +2361,46 @@ void FilePanel::OnListValueChanged(wxDataViewEvent& event) {
     return;
   }
 
-  fs::path oldPath;
-  if (!currentEntries_[row].fullPath.empty()) oldPath = fs::path(currentEntries_[row].fullPath);
-  else oldPath = currentDir_ / oldName;
-  const fs::path newPath = oldPath.parent_path() / fs::path(newName);
+  const std::string oldStr =
+      !currentEntries_[row].fullPath.empty() ? currentEntries_[row].fullPath
+                                             : (currentDir_ / oldName).string();
+  const bool isGio = listingMode_ == ListingMode::Gio || LooksLikeUri(oldStr);
 
-  std::error_code ec;
-  fs::rename(oldPath, newPath, ec);
-  if (ec) {
-    const wxString errWx = wxString::FromUTF8(ec.message());
-    wxMessageBox(wxString::Format("Rename failed:\n\n%s", errWx.c_str()), "Rename",
-                 wxOK | wxICON_ERROR, DialogParent());
+  if (isGio) {
+#ifdef QUARRY_USE_GIO
+    const std::string mountUri = (listingMode_ == ListingMode::Gio) ? currentDir_.string() : std::string{};
+    const auto res = GioRenameInPlace(oldStr, newName, mountUri, DialogParent());
+    if (!res.ok) {
+      wxMessageBox(wxString::Format("Rename failed:\n\n%s", res.message.c_str()),
+                   "Rename",
+                   wxOK | wxICON_ERROR,
+                   DialogParent());
+      SetRowName(list_, static_cast<unsigned int>(row), oldName, renamedDir);
+      return;
+    }
+#else
+    wxMessageBox("Rename is not available here (built without GIO).",
+                 "Rename",
+                 wxOK | wxICON_INFORMATION,
+                 DialogParent());
     SetRowName(list_, static_cast<unsigned int>(row), oldName, renamedDir);
     return;
+#endif
+  } else {
+    fs::path oldPath;
+    if (!currentEntries_[row].fullPath.empty()) oldPath = fs::path(currentEntries_[row].fullPath);
+    else oldPath = currentDir_ / oldName;
+    const fs::path newPath = oldPath.parent_path() / fs::path(newName);
+
+    std::error_code ec;
+    fs::rename(oldPath, newPath, ec);
+    if (ec) {
+      const wxString errWx = wxString::FromUTF8(ec.message());
+      wxMessageBox(wxString::Format("Rename failed:\n\n%s", errWx.c_str()), "Rename",
+                   wxOK | wxICON_ERROR, DialogParent());
+      SetRowName(list_, static_cast<unsigned int>(row), oldName, renamedDir);
+      return;
+    }
   }
 
   RefreshAll();
@@ -2606,7 +2699,12 @@ std::vector<fs::path> FilePanel::GetSelectedPaths() const {
 }
 
 void FilePanel::BeginInlineRename() {
-  if (listingMode_ != ListingMode::Directory) return;
+  if (listingMode_ != ListingMode::Directory && listingMode_ != ListingMode::Gio) return;
+  if (listingMode_ == ListingMode::Gio) {
+    const std::string uri = currentDir_.string();
+    const bool allowRemoteOps = !uri.empty() && !IsBareSchemeUri(uri) && UriScheme(uri) != "network";
+    if (!allowRemoteOps) return;
+  }
   wxDataViewItemArray items;
   list_->GetSelections(items);
   if (items.size() != 1) return;
@@ -3401,13 +3499,16 @@ void FilePanel::ShowListContextMenu(const wxDataViewItem& contextItem,
   const bool single = selected.size() == 1;
   const bool allowCopyPaste = listingMode_ == ListingMode::Directory || listingMode_ == ListingMode::Gio;
   const bool allowFsOps = listingMode_ == ListingMode::Directory;
+  bool allowRemoteOps = false;
   bool allowCreateFolder = listingMode_ == ListingMode::Directory;
   bool allowTrashDelete = listingMode_ == ListingMode::Directory;
+  bool allowRename = listingMode_ == ListingMode::Directory;
   if (listingMode_ == ListingMode::Gio) {
     const std::string uri = currentDir_.string();
-    const bool allowRemoteOps = !uri.empty() && !IsBareSchemeUri(uri) && UriScheme(uri) != "network";
+    allowRemoteOps = !uri.empty() && !IsBareSchemeUri(uri) && UriScheme(uri) != "network";
     allowCreateFolder = allowRemoteOps;
     allowTrashDelete = allowRemoteOps;
+    allowRename = allowRemoteOps;
   }
   const bool canExtract = allowFsOps && single && IsExtractableArchivePath(selected[0]);
   const bool canSaveShare = (listingMode_ == ListingMode::Gio) && single;
@@ -3418,7 +3519,7 @@ void FilePanel::ShowListContextMenu(const wxDataViewItem& contextItem,
   menu.Enable(ID_CTX_SAVE_CONNECTION, canSaveShare);
   menu.Enable(ID_CTX_COPY, allowCopyPaste && hasSelection);
   menu.Enable(ID_CTX_CUT, allowCopyPaste && hasSelection);
-  menu.Enable(ID_CTX_RENAME, allowFsOps && single);
+  menu.Enable(ID_CTX_RENAME, allowRename && single);
   menu.Enable(ID_CTX_NEW_FOLDER, allowCreateFolder && isBackgroundContext);
   menu.Enable(ID_CTX_TRASH, allowTrashDelete && hasSelection);
   menu.Enable(ID_CTX_DELETE_PERM, allowTrashDelete && hasSelection);
