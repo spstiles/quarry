@@ -1060,6 +1060,81 @@ static std::optional<AppClipboard> g_clipboard;
 std::vector<FilePanel::Entry> ListDir(const fs::path& dir, std::string* errorMessage) {
   std::vector<FilePanel::Entry> entries;
 
+#ifdef QUARRY_USE_GIO
+  // Prefer GIO for local directory listing when available. It provides a user-facing
+  // display name that matches what other file managers show (and can differ from
+  // the raw filesystem name on some mounts).
+  {
+    GFile* file = g_file_new_for_path(dir.string().c_str());
+    if (file) {
+      GError* error = nullptr;
+      GFileEnumerator* en = g_file_enumerate_children(
+          file,
+          "standard::name,standard::display-name,standard::type,standard::size,time::modified",
+          G_FILE_QUERY_INFO_NONE,
+          nullptr,
+          &error);
+
+      if (en) {
+        for (;;) {
+          GError* nextErr = nullptr;
+          GFileInfo* info = g_file_enumerator_next_file(en, nullptr, &nextErr);
+          if (!info) {
+            if (nextErr) g_error_free(nextErr);
+            break;
+          }
+
+          const auto ftype = g_file_info_get_file_type(info);
+          const bool isDir = ftype == G_FILE_TYPE_DIRECTORY || ftype == G_FILE_TYPE_MOUNTABLE ||
+                             ftype == G_FILE_TYPE_SHORTCUT;
+
+          std::uintmax_t size = 0;
+          if (!isDir) size = static_cast<std::uintmax_t>(g_file_info_get_size(info));
+
+          std::string modified;
+          if (GDateTime* dt = g_file_info_get_modification_date_time(info)) {
+            const gint64 unixSec = g_date_time_to_unix(dt);
+            modified = FormatUnixSeconds(static_cast<long long>(unixSec));
+          }
+
+          const char* displayName = g_file_info_get_display_name(info);
+          const char* name = g_file_info_get_name(info);
+
+          std::string fullPath;
+          if (name && *name) {
+            if (GFile* child = g_file_get_child(file, name)) {
+              if (char* p = g_file_get_path(child)) {
+                fullPath = p;
+                g_free(p);
+              } else {
+                fullPath = (dir / fs::path(name)).string();
+              }
+              g_object_unref(child);
+            }
+          }
+
+          entries.push_back(FilePanel::Entry{
+              .name = displayName ? displayName : (name ? name : ""),
+              .isDir = isDir,
+              .size = size,
+              .modified = modified,
+              .fullPath = fullPath,
+          });
+
+          g_object_unref(info);
+        }
+
+        g_object_unref(en);
+        g_object_unref(file);
+        return entries;
+      }
+
+      if (error) g_error_free(error);
+      g_object_unref(file);
+    }
+  }
+#endif
+
   std::error_code ec;
   fs::directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec);
   if (ec) {
@@ -2215,8 +2290,13 @@ void FilePanel::OnListValueChanged(wxDataViewEvent& event) {
     return;
   }
 
+  fs::path oldPath;
+  if (!currentEntries_[row].fullPath.empty()) oldPath = fs::path(currentEntries_[row].fullPath);
+  else oldPath = currentDir_ / oldName;
+  const fs::path newPath = oldPath.parent_path() / fs::path(newName);
+
   std::error_code ec;
-  fs::rename(currentDir_ / oldName, currentDir_ / newName, ec);
+  fs::rename(oldPath, newPath, ec);
   if (ec) {
     const wxString errWx = wxString::FromUTF8(ec.message());
     wxMessageBox(wxString::Format("Rename failed:\n\n%s", errWx.c_str()), "Rename",
