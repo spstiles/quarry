@@ -1342,7 +1342,19 @@ void FilePanel::BuildLayout(wxWindow* sidebarParent, wxWindow* listParent) {
   auto* listSizer = new wxBoxSizer(wxVERTICAL);
 
   auto* listToolbar = new wxBoxSizer(wxHORIZONTAL);
-  pathCtrl_ = new wxTextCtrl(listRoot_, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, wxTE_PROCESS_ENTER);
+  addressRoot_ = new wxPanel(listRoot_, wxID_ANY);
+  auto* addressSizer = new wxBoxSizer(wxHORIZONTAL);
+
+  breadcrumbRoot_ = new wxPanel(addressRoot_, wxID_ANY);
+  breadcrumbSizer_ = new wxBoxSizer(wxHORIZONTAL);
+  breadcrumbRoot_->SetSizer(breadcrumbSizer_);
+
+  pathCtrl_ = new wxTextCtrl(addressRoot_, wxID_ANY, "", wxDefaultPosition, wxDefaultSize,
+                            wxTE_PROCESS_ENTER);
+  addressSizer->Add(breadcrumbRoot_, 1, wxEXPAND);
+  addressSizer->Add(pathCtrl_, 1, wxEXPAND);
+  addressRoot_->SetSizer(addressSizer);
+
   goBtn_ = new wxButton(listRoot_, wxID_ANY, "Go");
 
   // Match button height to the address bar height, but give the buttons a bit
@@ -1375,7 +1387,7 @@ void FilePanel::BuildLayout(wxWindow* sidebarParent, wxWindow* listParent) {
   listToolbar->Add(upBtn_, 0, wxEXPAND | wxRIGHT, 4);
   listToolbar->Add(refreshBtn_, 0, wxEXPAND | wxRIGHT, 4);
   listToolbar->Add(homeBtn_, 0, wxEXPAND | wxRIGHT, 8);
-  listToolbar->Add(pathCtrl_, 1, wxEXPAND | wxRIGHT, 6);
+  listToolbar->Add(addressRoot_, 1, wxEXPAND | wxRIGHT, 6);
   listToolbar->Add(goBtn_, 0, wxEXPAND);
   listSizer->Add(listToolbar, 0, wxEXPAND | wxALL, 8);
 
@@ -1420,6 +1432,7 @@ void FilePanel::BuildLayout(wxWindow* sidebarParent, wxWindow* listParent) {
   UpdateSortIndicators();
   BuildComputerTree();
   SyncTreeToCurrentDir();
+  UpdateAddressBar();
 }
 
 void FilePanel::BindEvents() {
@@ -1428,8 +1441,21 @@ void FilePanel::BindEvents() {
   upBtn_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { NavigateUp(); });
   refreshBtn_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { RefreshListing(); });
   homeBtn_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { GoHome(); });
-  goBtn_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { NavigateToTextPath(); });
+  goBtn_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+    if (addressEditMode_) NavigateToTextPath();
+    else EnterAddressEditMode();
+  });
   pathCtrl_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent&) { NavigateToTextPath(); });
+  pathCtrl_->Bind(wxEVT_KILL_FOCUS, [this](wxFocusEvent& e) {
+    ExitAddressEditMode();
+    e.Skip();
+  });
+  if (breadcrumbRoot_) {
+    breadcrumbRoot_->Bind(wxEVT_LEFT_DCLICK, [this](wxMouseEvent& e) {
+      EnterAddressEditMode();
+      e.Skip();
+    });
+  }
 
   list_->Bind(wxEVT_DATAVIEW_ITEM_ACTIVATED, [this](wxDataViewEvent& e) { OpenSelectedIfDir(e); });
   list_->Bind(wxEVT_DATAVIEW_ITEM_START_EDITING, [this](wxDataViewEvent& e) {
@@ -1810,6 +1836,162 @@ void FilePanel::UpdateNavIcons() {
   if (homeBtn_) homeBtn_->SetBitmap(MakeNavIconBundle(NavIcon::Home, iconSize, color));
 }
 
+void FilePanel::EnterAddressEditMode() {
+  if (addressEditMode_) return;
+  addressEditMode_ = true;
+
+  if (breadcrumbRoot_) breadcrumbRoot_->Hide();
+  if (pathCtrl_) pathCtrl_->Show();
+  if (goBtn_) goBtn_->SetLabel("Go");
+
+  if (addressRoot_) addressRoot_->Layout();
+  if (listRoot_) listRoot_->Layout();
+
+  if (pathCtrl_) {
+    pathCtrl_->SetFocus();
+    pathCtrl_->SelectAll();
+  }
+}
+
+void FilePanel::ExitAddressEditMode() {
+  if (!addressEditMode_) return;
+  addressEditMode_ = false;
+
+  if (pathCtrl_) pathCtrl_->Hide();
+  if (breadcrumbRoot_) breadcrumbRoot_->Show();
+  if (goBtn_) goBtn_->SetLabel("Edit");
+
+  if (addressRoot_) addressRoot_->Layout();
+  if (listRoot_) listRoot_->Layout();
+}
+
+void FilePanel::UpdateAddressBar() {
+  if (!breadcrumbRoot_ || !breadcrumbSizer_) return;
+
+  // Default to breadcrumb mode.
+  ExitAddressEditMode();
+
+  struct Crumb {
+    std::string label;
+    fs::path target;
+    bool editOnly{false};
+  };
+
+  std::vector<Crumb> crumbs;
+  crumbs.reserve(16);
+
+  const auto add = [&](std::string label, fs::path target) {
+    if (label.empty()) return;
+    crumbs.push_back(Crumb{.label = std::move(label), .target = std::move(target), .editOnly = false});
+  };
+
+  if (listingMode_ == ListingMode::Recent) {
+    add("Recent", kVirtualRecent);
+  } else if (listingMode_ == ListingMode::Gio) {
+    const std::string uri = currentDir_.string();
+    const auto scheme = UriScheme(uri);
+    const auto pos = uri.find("://");
+    if (!scheme.empty() && pos != std::string::npos) {
+      size_t start = pos + 3;
+      while (start < uri.size() && uri[start] == '/') start++;
+      size_t authEnd = uri.find('/', start);
+      if (authEnd == std::string::npos) authEnd = uri.size();
+      const std::string authority = uri.substr(start, authEnd - start);
+      const std::string rootTarget = scheme + "://" + authority + "/";
+
+      const std::string host = UriAuthorityHost(uri);
+      std::string rootLabel = host.empty() ? authority : host;
+      if (scheme == "afp") rootLabel = host.empty() ? authority : (host + "(AFP)");
+      if (scheme == "sftp") rootLabel = host.empty() ? authority : (host + "(SSH)");
+      add(rootLabel.empty() ? (scheme + "://") : rootLabel, fs::path(rootTarget));
+
+      std::string prefix = rootTarget;
+      if (authEnd < uri.size()) {
+        std::string rest = uri.substr(authEnd + 1);
+        while (!rest.empty() && rest.back() == '/') rest.pop_back();
+
+        size_t i = 0;
+        while (i < rest.size()) {
+          const size_t j = rest.find('/', i);
+          const size_t end = (j == std::string::npos) ? rest.size() : j;
+          const std::string segRaw = rest.substr(i, end - i);
+          if (!segRaw.empty()) {
+            const std::string segLabel = PercentDecode(segRaw);
+            prefix += segRaw;
+            prefix += "/";
+            add(segLabel, fs::path(prefix));
+          }
+          if (j == std::string::npos) break;
+          i = j + 1;
+        }
+      }
+    }
+  } else {
+    const fs::path p = currentDir_;
+    if (!p.empty()) {
+      fs::path accum;
+      if (p.has_root_path()) {
+        accum = p.root_path();
+        std::string rootLabel = accum.string();
+        if (rootLabel.empty()) rootLabel = "/";
+        add(rootLabel, accum);
+      }
+
+      for (const auto& part : p.relative_path()) {
+        accum /= part;
+        add(part.string(), accum);
+      }
+    }
+  }
+
+  breadcrumbSizer_->Clear(/*delete_windows=*/true);
+
+  if (crumbs.empty()) {
+    breadcrumbRoot_->Layout();
+    return;
+  }
+
+  // Collapse very deep paths so the bar remains usable.
+  constexpr size_t kMaxCrumbs = 7;
+  if (crumbs.size() > kMaxCrumbs) {
+    std::vector<Crumb> trimmed;
+    trimmed.reserve(kMaxCrumbs);
+    trimmed.push_back(crumbs.front());
+    trimmed.push_back(Crumb{.label = "…", .target = fs::path{}, .editOnly = true});
+    const size_t tail = kMaxCrumbs - 2;
+    trimmed.insert(trimmed.end(), crumbs.end() - static_cast<std::ptrdiff_t>(tail), crumbs.end());
+    crumbs = std::move(trimmed);
+  }
+
+  const int h = pathCtrl_ ? pathCtrl_->GetBestSize().y : 28;
+
+  for (size_t idx = 0; idx < crumbs.size(); idx++) {
+    const auto& c = crumbs[idx];
+    auto* btn = new wxButton(breadcrumbRoot_, wxID_ANY, wxString::FromUTF8(c.label), wxDefaultPosition,
+                             wxDefaultSize, wxBU_EXACTFIT);
+    btn->SetMinSize(wxSize(-1, h));
+    btn->SetMaxSize(wxSize(-1, h));
+    if (c.editOnly) {
+      btn->SetToolTip("Edit path");
+      btn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { EnterAddressEditMode(); });
+    } else {
+      btn->SetToolTip(wxString::FromUTF8(c.target.string()));
+      btn->Bind(wxEVT_BUTTON, [this, target = c.target](wxCommandEvent&) {
+        NavigateTo(target, /*recordHistory=*/true);
+      });
+    }
+    breadcrumbSizer_->Add(btn, 0, wxALIGN_CENTER_VERTICAL);
+
+    if (idx + 1 < crumbs.size()) {
+      auto* sep = new wxStaticText(breadcrumbRoot_, wxID_ANY, wxString::FromUTF8("›"));
+      breadcrumbSizer_->Add(sep, 0, wxALIGN_CENTER_VERTICAL | wxLEFT | wxRIGHT, 6);
+    }
+  }
+
+  breadcrumbRoot_->Layout();
+  if (addressRoot_) addressRoot_->Layout();
+}
+
 void FilePanel::BindFocusEvents(std::function<void()> onFocus) { onFocus_ = std::move(onFocus); }
 
 void FilePanel::BindDirContentsChanged(
@@ -1918,7 +2100,9 @@ void FilePanel::UpdateActiveVisuals() {
 void FilePanel::NavigateToTextPath() {
   const auto text = pathCtrl_->GetValue().ToStdString();
   if (text.empty()) return;
-  NavigateTo(fs::path(text), /*recordHistory=*/true);
+  if (!LoadDirectory(fs::path(text))) return;
+  PushHistory(currentDir_);
+  UpdateNavButtons();
 }
 
 void FilePanel::OpenSelectedIfDir(wxDataViewEvent& event) {
@@ -2021,6 +2205,7 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
     listingMode_ = ListingMode::Recent;
     currentDir_ = kVirtualRecent;
     if (pathCtrl_) pathCtrl_->ChangeValue("Recent");
+    UpdateAddressBar();
 
     std::vector<Entry> entries;
     const auto recent = ReadRecentPaths(/*limit=*/200);
@@ -2095,6 +2280,7 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
         listingMode_ = ListingMode::Gio;
         currentDir_ = fs::path(effectiveUri);
         if (pathCtrl_) pathCtrl_->ChangeValue(currentDir_.string());
+        UpdateAddressBar();
 
         // Best-effort tree sync: highlight Network group.
         SyncTreeToCurrentDir();
@@ -2230,6 +2416,7 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
   currentDir_ = resolved;
   if (pathCtrl_) pathCtrl_->ChangeValue(currentDir_.string());
   SyncTreeToCurrentDir();
+  UpdateAddressBar();
 
   std::string err;
   auto entries = ListDir(currentDir_, &err);

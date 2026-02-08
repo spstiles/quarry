@@ -21,6 +21,7 @@ class wxPanel;
 class wxTreeCtrl;
 class wxWindow;
 class wxProcess;
+class wxSizer;
 
 struct WxProcessDeleter {
   void operator()(wxProcess* p) const;
@@ -133,8 +134,15 @@ private:
   void ExtractArchiveTo(const std::filesystem::path& archivePath, const std::filesystem::path& dstDir);
   bool HasCommand(const wxString& name) const;
 
+  void UpdateAddressBar();
+  void EnterAddressEditMode();
+  void ExitAddressEditMode();
+
   wxPanel* sidebarRoot_{nullptr};
   wxPanel* listRoot_{nullptr};
+  wxPanel* addressRoot_{nullptr};
+  wxPanel* breadcrumbRoot_{nullptr};
+  wxSizer* breadcrumbSizer_{nullptr};
   wxTextCtrl* pathCtrl_{nullptr};
   wxBitmapButton* backBtn_{nullptr};
   wxBitmapButton* forwardBtn_{nullptr};
@@ -169,6 +177,7 @@ private:
   bool allowInlineEdit_{false};
   bool suppressNextContextMenu_{false};
   bool renameHandling_{false};
+  bool addressEditMode_{true};
 
   wxTreeItemId hiddenRoot_{};
   wxTreeItemId computerRoot_{};
