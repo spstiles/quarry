@@ -3816,12 +3816,18 @@ void FilePanel::MakeBootableUsbStick(const fs::path& isoPath) {
   }
 
   if (HasCommand("mintstick")) {
+    // Mintstick needs a mode; for burning an ISO use: mintstick -m iso -i <path>
     const wxString cmd0 = "mintstick";
-    const wxChar* const argv[] = {cmd0.wc_str(), nullptr};
-    (void)wxExecute(argv, wxEXEC_ASYNC);
-    wxMessageBox(wxString::Format("Started mintstick.\n\nSelect the ISO:\n%s",
-                                  isoWx.c_str()),
-                 "Quarry", wxOK | wxICON_INFORMATION, DialogParent());
+    const wxString cmd1 = "-m";
+    const wxString cmd2 = "iso";
+    const wxString cmd3 = "-i";
+    const wxString cmd4 = isoWx;
+    const wxChar* const argv[] = {cmd0.wc_str(), cmd1.wc_str(), cmd2.wc_str(), cmd3.wc_str(),
+                                  cmd4.wc_str(), nullptr};
+    if (wxExecute(argv, wxEXEC_ASYNC) == 0) {
+      wxMessageBox("Failed to start mintstick.", "Quarry", wxOK | wxICON_ERROR, DialogParent());
+      return;
+    }
     return;
   }
 
