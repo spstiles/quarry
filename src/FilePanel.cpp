@@ -1355,6 +1355,7 @@ void FilePanel::BuildLayout(wxWindow* sidebarParent, wxWindow* listParent) {
       fsWatchPending_ = false;
       if (listingMode_ != ListingMode::Directory) return;
       if (currentDir_.empty()) return;
+      HandleMissingCurrentDir();
       // Preserve the current top visible row to avoid scroll jumps.
       autoRefreshTopKey_.reset();
       if (list_) {
@@ -2094,6 +2095,41 @@ void FilePanel::ScheduleAutoRefresh() {
   }
 }
 
+void FilePanel::HandleMissingCurrentDir() {
+  if (listingMode_ != ListingMode::Directory) return;
+  if (currentDir_.empty()) return;
+
+  std::error_code ec;
+  if (fs::exists(currentDir_, ec) && fs::is_directory(currentDir_, ec)) return;
+
+  fs::path candidate = currentDir_.parent_path();
+  while (!candidate.empty()) {
+    ec.clear();
+    if (fs::exists(candidate, ec) && fs::is_directory(candidate, ec)) break;
+    candidate = candidate.parent_path();
+  }
+  if (candidate.empty()) {
+    candidate = fs::path(wxGetHomeDir().ToStdString());
+  }
+
+  const auto prev = currentDir_;
+  if (!LoadDirectory(candidate)) return;
+
+  // Replace the current history entry so Back doesn't lead to a missing path.
+  if (historyIndex_ >= 0 && historyIndex_ < static_cast<int>(history_.size())) {
+    history_[historyIndex_] = currentDir_;
+  }
+  UpdateNavButtons();
+
+  if (statusText_) {
+    statusText_->SetLabel(
+        wxString::Format("Folder removed: %s\nMoved to: %s",
+                         wxString::FromUTF8(prev.string()).c_str(),
+                         wxString::FromUTF8(currentDir_.string()).c_str()));
+    statusText_->Refresh();
+  }
+}
+
 void FilePanel::SetDirectory(const std::string& path) {
   history_.clear();
   historyIndex_ = -1;
@@ -2104,6 +2140,7 @@ fs::path FilePanel::GetDirectoryPath() const { return currentDir_; }
 
 void FilePanel::RefreshListing() {
   if (currentDir_.empty()) return;
+  HandleMissingCurrentDir();
   LoadDirectory(currentDir_);
   UpdateStatusText();
 }

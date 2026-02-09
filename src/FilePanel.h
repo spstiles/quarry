@@ -146,6 +146,7 @@ private:
   void UpdateFsWatcher();
   void StopFsWatcher();
   void ScheduleAutoRefresh();
+  void HandleMissingCurrentDir();
 
   wxPanel* sidebarRoot_{nullptr};
   wxPanel* listRoot_{nullptr};
