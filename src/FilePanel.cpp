@@ -3876,7 +3876,7 @@ static bool LooksLikeExtractableArchiveName(const fs::path& pathLike) {
   };
   return endsWith(".zip") || endsWith(".7z") || endsWith(".tar") || endsWith(".tar.gz") ||
          endsWith(".tgz") || endsWith(".tar.bz2") || endsWith(".tbz2") || endsWith(".tar.xz") ||
-         endsWith(".txz");
+         endsWith(".txz") || endsWith(".deb") || endsWith(".iso");
 }
 
 bool FilePanel::IsExtractableArchivePath(const fs::path& path) const {
@@ -3931,9 +3931,21 @@ void FilePanel::ExtractArchiveTo(const fs::path& archivePath, const fs::path& ds
     } else if (HasCommand("bsdtar")) {
       extractor = {"bsdtar", "-xf"};
     }
+  } else if (name.size() >= 4 && name.rfind(".deb") == name.size() - 4) {
+    if (HasCommand("dpkg-deb")) {
+      extractor = {"dpkg-deb", "-x"};
+    } else if (HasCommand("bsdtar")) {
+      extractor = {"bsdtar", "-xf"};
+    }
   } else if (name.size() >= 3 && name.rfind(".7z") == name.size() - 3) {
     if (HasCommand("7z")) {
       extractor = {"7z", "x", "-y"};
+    }
+  } else if (name.size() >= 4 && name.rfind(".iso") == name.size() - 4) {
+    if (HasCommand("7z")) {
+      extractor = {"7z", "x", "-y"};
+    } else if (HasCommand("bsdtar")) {
+      extractor = {"bsdtar", "-xf"};
     }
   } else {
     // tar and tar.* variants.
@@ -3944,7 +3956,7 @@ void FilePanel::ExtractArchiveTo(const fs::path& archivePath, const fs::path& ds
     }
   }
   if (extractor.empty()) {
-    wxMessageBox("No suitable extractor found (need tar/unzip/7z/bsdtar).",
+    wxMessageBox("No suitable extractor found (need tar/unzip/7z/bsdtar/dpkg-deb).",
                  "Quarry",
                  wxOK | wxICON_ERROR,
                  DialogParent());
@@ -3954,7 +3966,11 @@ void FilePanel::ExtractArchiveTo(const fs::path& archivePath, const fs::path& ds
   // Simple local->local: run extractor directly (existing behavior).
   if (!srcIsUri && !dstIsUri) {
     std::vector<std::string> args;
-    if (!extractor.empty() && extractor[0] == "7z") {
+    if (!extractor.empty() && extractor[0] == "dpkg-deb") {
+      args = extractor;
+      args.push_back(archivePath.string());
+      args.push_back(dstDir.string());
+    } else if (!extractor.empty() && extractor[0] == "7z") {
       args = extractor;
       args.push_back("-o" + dstDir.string());
       args.push_back(archivePath.string());
@@ -4002,7 +4018,9 @@ void FilePanel::ExtractArchiveTo(const fs::path& archivePath, const fs::path& ds
   // Build extractor invocation for the staged archive and output folder.
   // We extract into "$TMP/out" regardless of destination type.
   std::string extractCmd;
-  if (!extractor.empty() && extractor[0] == "7z") {
+  if (!extractor.empty() && extractor[0] == "dpkg-deb") {
+    extractCmd = "dpkg-deb -x \"$TMP/$BASENAME\" \"$TMP/out\"";
+  } else if (!extractor.empty() && extractor[0] == "7z") {
     extractCmd = "7z x -y -o\"$TMP/out\" \"$TMP/$BASENAME\"";
   } else if (!extractor.empty() && extractor[0] == "unzip") {
     extractCmd = "unzip -o \"$TMP/$BASENAME\" -d \"$TMP/out\"";
