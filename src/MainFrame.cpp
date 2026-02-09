@@ -48,6 +48,10 @@
 #include <wx/dc.h>
 #include <wx/artprov.h>
 
+#ifdef QUARRY_USE_GIO
+#include <gio/gio.h>
+#endif
+
 namespace {
 class QueueVListBox final : public wxVListBox {
 public:
@@ -326,6 +330,121 @@ static std::uintmax_t EstimateTotalBytes(const std::vector<std::filesystem::path
 
   return total;
 }
+
+#ifdef QUARRY_USE_GIO
+static std::uintmax_t EstimateTotalBytesGio(const std::vector<std::filesystem::path>& sources,
+                                            const CancelFn& shouldCancel,
+                                            const CopyProgressFn& onProgress) {
+  namespace fs = std::filesystem;
+  std::uintmax_t total = 0;
+
+  GCancellable* cancellable = g_cancellable_new();
+  std::atomic_bool done{false};
+  std::thread cancelWatcher;
+  if (shouldCancel) {
+    cancelWatcher = std::thread([&done, cancellable, &shouldCancel]() {
+      using namespace std::chrono_literals;
+      while (!done.load()) {
+        if (shouldCancel()) {
+          g_cancellable_cancel(cancellable);
+          break;
+        }
+        std::this_thread::sleep_for(50ms);
+      }
+    });
+  }
+
+  auto report = [&](GFile* f) {
+    if (!onProgress || !f) return;
+    char* parse = g_file_get_parse_name(f);
+    if (!parse) return;
+    onProgress(fs::path(parse));
+    g_free(parse);
+  };
+
+  auto scanOne = [&](auto&& self, GFile* f) -> void {
+    if (!f) return;
+    if (g_cancellable_is_cancelled(cancellable)) return;
+
+    const auto type = g_file_query_file_type(f, G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, cancellable);
+    if (type != G_FILE_TYPE_DIRECTORY) {
+      if (type == G_FILE_TYPE_REGULAR) {
+        GError* infoErr = nullptr;
+        GFileInfo* info = g_file_query_info(f,
+                                            "standard::size",
+                                            G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS,
+                                            cancellable,
+                                            &infoErr);
+        if (info) {
+          const auto sz = g_file_info_get_size(info);
+          if (sz > 0) total += static_cast<std::uintmax_t>(sz);
+          g_object_unref(info);
+        }
+        if (infoErr) g_error_free(infoErr);
+      }
+      return;
+    }
+
+    GError* enumErr = nullptr;
+    GFileEnumerator* en =
+        g_file_enumerate_children(f,
+                                  "standard::name,standard::type,standard::size",
+                                  G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS,
+                                  cancellable,
+                                  &enumErr);
+    if (!en) {
+      if (enumErr) g_error_free(enumErr);
+      return;
+    }
+
+    for (;;) {
+      if (g_cancellable_is_cancelled(cancellable)) break;
+      GError* nextErr = nullptr;
+      GFileInfo* info = g_file_enumerator_next_file(en, cancellable, &nextErr);
+      if (!info) {
+        if (nextErr) g_error_free(nextErr);
+        break;
+      }
+
+      const char* name = g_file_info_get_name(info);
+      const auto ctype = g_file_info_get_file_type(info);
+      if (name && *name) {
+        GFile* child = g_file_get_child(f, name);
+        if (child) {
+          report(child);
+          if (ctype == G_FILE_TYPE_DIRECTORY) {
+            self(self, child);
+          } else if (ctype == G_FILE_TYPE_REGULAR) {
+            const auto sz = g_file_info_get_size(info);
+            if (sz > 0) total += static_cast<std::uintmax_t>(sz);
+          }
+          g_object_unref(child);
+        }
+      }
+
+      g_object_unref(info);
+    }
+
+    g_object_unref(en);
+  };
+
+  for (const auto& src : sources) {
+    if (g_cancellable_is_cancelled(cancellable)) break;
+    const auto s = src.string();
+    if (s.empty()) continue;
+    GFile* f = g_file_new_for_commandline_arg(s.c_str());
+    if (!f) continue;
+    report(f);
+    scanOne(scanOne, f);
+    g_object_unref(f);
+  }
+
+  done.store(true);
+  if (cancelWatcher.joinable()) cancelWatcher.join();
+  g_object_unref(cancellable);
+  return total;
+}
+#endif
 
 static wxString FormatHMS(std::chrono::seconds s) {
   const auto total = s.count();
@@ -1472,14 +1591,23 @@ void MainFrame::CopyMoveWithProgressInternal(const wxString& title,
 
     // Only scan local sources for total bytes; for remote sources, just show speed and unknown remaining.
     std::uintmax_t total = 0;
-    bool canScan = true;
+    bool anyUri = false;
     for (const auto& p : sources) {
       if (LooksLikeUriPath(p)) {
-        canScan = false;
+        anyUri = true;
         break;
       }
     }
-    if (canScan) total = EstimateTotalBytes(sources, shouldCancel, scanProgress);
+
+    if (!anyUri) {
+      total = EstimateTotalBytes(sources, shouldCancel, scanProgress);
+    } else {
+#ifdef QUARRY_USE_GIO
+      total = EstimateTotalBytesGio(sources, shouldCancel, scanProgress);
+#else
+      total = 0;
+#endif
+    }
     {
       std::lock_guard<std::mutex> lock(state->mu);
       state->totalBytes = total;
