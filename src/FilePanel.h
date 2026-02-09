@@ -197,6 +197,10 @@ private:
   bool autoRefreshInProgress_{false};
   std::optional<std::string> autoRefreshTopKey_{};
 
+  wxTimer mountsPoll_{};
+  int mountsPollTimerId_{wxID_ANY};
+  std::size_t lastDevicesSig_{0};
+
   wxTreeItemId hiddenRoot_{};
   wxTreeItemId computerRoot_{};
   wxTreeItemId homeRoot_{};

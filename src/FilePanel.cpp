@@ -1271,6 +1271,7 @@ FilePanel::FilePanel(wxWindow* sidebarParent, wxWindow* listParent) {
 FilePanel::~FilePanel() {
   StopFsWatcher();
   if (fsWatchDebounce_.IsRunning()) fsWatchDebounce_.Stop();
+  if (mountsPoll_.IsRunning()) mountsPoll_.Stop();
 }
 
 wxWindow* FilePanel::SidebarWindow() const { return sidebarRoot_; }
@@ -1377,6 +1378,57 @@ void FilePanel::BuildLayout(wxWindow* sidebarParent, wxWindow* listParent) {
       autoRefreshTopKey_.reset();
       UpdateStatusText();
     }, fsWatchTimerId_);
+  }
+
+  if (mountsPollTimerId_ == wxID_ANY) {
+    mountsPollTimerId_ = wxWindow::NewControlId();
+    mountsPoll_.SetOwner(listRoot_, mountsPollTimerId_);
+    listRoot_->Bind(wxEVT_TIMER, [this](wxTimerEvent&) {
+      if (!tree_ || !devicesRoot_.IsOk()) return;
+
+      // Signature based on mounts + labels, so we only rebuild the Devices group
+      // when something actually changes (e.g. USB drive plugged/unplugged).
+      std::size_t sig = 0;
+      {
+        std::string buf;
+        buf.reserve(4096);
+
+        // Labels: include best-effort directory listing (good enough for detecting change).
+        std::error_code ec;
+        const fs::path byLabel("/dev/disk/by-label");
+        if (fs::exists(byLabel, ec) && fs::is_directory(byLabel, ec)) {
+          std::vector<std::string> names;
+          for (const auto& ent : fs::directory_iterator(byLabel, ec)) {
+            if (ec) break;
+            names.push_back(ent.path().filename().string());
+          }
+          std::sort(names.begin(), names.end());
+          for (const auto& n : names) {
+            buf += "L:";
+            buf += n;
+            buf.push_back('\n');
+          }
+        }
+
+        // Mounts: hash full /proc/mounts content.
+        std::ifstream f("/proc/mounts");
+        if (f.is_open()) {
+          buf.append(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        }
+
+        sig = std::hash<std::string>{}(buf);
+      }
+
+      if (sig == lastDevicesSig_) return;
+      lastDevicesSig_ = sig;
+
+      tree_->Freeze();
+      PopulateDevices(devicesRoot_);
+      tree_->Thaw();
+    }, mountsPollTimerId_);
+
+    // 1.5s is responsive without being noisy.
+    mountsPoll_.Start(1500);
   }
 
   // Sidebar tree should behave like a modern file-manager sidebar (Nemo/Dolphin):
@@ -3457,6 +3509,30 @@ static std::unordered_map<std::string, std::string> BuildDeviceLabelMap() {
 
 void FilePanel::PopulateDevices(const wxTreeItemId& devicesItem) {
   if (!tree_ || !devicesItem.IsOk()) return;
+
+  // Preserve selection if it was inside the Devices group.
+  std::optional<std::string> selectedPath;
+  {
+    auto sel = tree_->GetSelection();
+    while (sel.IsOk()) {
+      if (sel == devicesItem) break;
+      auto parent = tree_->GetItemParent(sel);
+      if (!parent.IsOk()) break;
+      sel = parent;
+    }
+    const bool selUnderDevices = sel.IsOk() && sel == devicesItem;
+    if (selUnderDevices) {
+      const auto origSel = tree_->GetSelection();
+      if (origSel.IsOk()) {
+        if (auto* data = dynamic_cast<TreeNodeData*>(tree_->GetItemData(origSel))) {
+          if (data->kind == TreeNodeData::Kind::Path && !data->path.empty()) {
+            selectedPath = data->path.string();
+          }
+        }
+      }
+    }
+  }
+
   tree_->DeleteChildren(devicesItem);
 
   const auto devLabels = BuildDeviceLabelMap();
@@ -3517,6 +3593,21 @@ void FilePanel::PopulateDevices(const wxTreeItemId& devicesItem) {
 
   if (tree_->GetChildrenCount(devicesItem, false) == 0) {
     tree_->AppendItem(devicesItem, "(none)");
+  }
+
+  if (selectedPath) {
+    wxTreeItemIdValue ck;
+    auto c = tree_->GetFirstChild(devicesItem, ck);
+    while (c.IsOk()) {
+      if (auto* data = dynamic_cast<TreeNodeData*>(tree_->GetItemData(c))) {
+        if (data->kind == TreeNodeData::Kind::Path && data->path.string() == *selectedPath) {
+          tree_->SelectItem(c);
+          tree_->EnsureVisible(c);
+          break;
+        }
+      }
+      c = tree_->GetNextChild(devicesItem, ck);
+    }
   }
 }
 
