@@ -3655,6 +3655,8 @@ void FilePanel::SyncTreeToCurrentDir() {
   ignoreTreeEvent_ = false;
 }
 
+static bool LooksLikeExtractableArchiveName(const fs::path& pathLike);
+
 void FilePanel::ShowListContextMenu(const wxDataViewItem& contextItem,
                                     const wxPoint& screenPos,
                                     bool isBackgroundContext) {
@@ -3709,7 +3711,10 @@ void FilePanel::ShowListContextMenu(const wxDataViewItem& contextItem,
     allowTrashDelete = allowRemoteOps;
     allowRename = allowRemoteOps;
   }
-  const bool canExtract = allowFsOps && single && IsExtractableArchivePath(selected[0]);
+  const bool canExtract =
+      single &&
+      ((allowFsOps && IsExtractableArchivePath(selected[0])) ||
+       (allowRemoteOps && LooksLikeExtractableArchiveName(selected[0])));
   const bool canMakeBootable = allowFsOps && single && IsIsoImagePath(selected[0]);
   const bool canSaveShare = (listingMode_ == ListingMode::Gio) && single;
   menu.Enable(ID_CTX_OPEN, hasSelection);
@@ -3734,10 +3739,21 @@ void FilePanel::ShowListContextMenu(const wxDataViewItem& contextItem,
   }, ID_CTX_EXTRACT_HERE);
   menu.Bind(wxEVT_MENU, [this, selected](wxCommandEvent&) {
     if (selected.size() != 1) return;
-    wxDirDialog dlg(DialogParent(), "Extract to...", currentDir_.string(),
-                    wxDD_DEFAULT_STYLE | wxDD_DIR_MUST_EXIST);
-    if (dlg.ShowModal() != wxID_OK) return;
-    ExtractArchiveTo(selected[0], std::filesystem::path(dlg.GetPath().ToStdString()));
+    if (listingMode_ == ListingMode::Directory) {
+      wxDirDialog dlg(DialogParent(), "Extract to...", currentDir_.string(),
+                      wxDD_DEFAULT_STYLE | wxDD_DIR_MUST_EXIST);
+      if (dlg.ShowModal() != wxID_OK) return;
+      ExtractArchiveTo(selected[0], std::filesystem::path(dlg.GetPath().ToStdString()));
+    } else if (listingMode_ == ListingMode::Gio) {
+      wxTextEntryDialog dlg(DialogParent(),
+                            "Destination folder URI (example: smb://server/share/folder/):",
+                            "Extract To...");
+      dlg.SetValue(wxString::FromUTF8(currentDir_.string()));
+      if (dlg.ShowModal() != wxID_OK) return;
+      const auto uri = dlg.GetValue().ToStdString();
+      if (uri.empty()) return;
+      ExtractArchiveTo(selected[0], fs::path(uri));
+    }
   }, ID_CTX_EXTRACT_TO);
   menu.Bind(wxEVT_MENU, [this, selected](wxCommandEvent&) {
     if (selected.size() != 1) return;
@@ -3848,46 +3864,41 @@ void FilePanel::MakeBootableUsbStick(const fs::path& isoPath) {
                "Quarry", wxOK | wxICON_INFORMATION, DialogParent());
 }
 
+static bool LooksLikeExtractableArchiveName(const fs::path& pathLike) {
+  const auto name = pathLike.filename().string();
+  std::string lower;
+  lower.reserve(name.size());
+  for (const auto c : name) lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+
+  const auto endsWith = [&](const std::string& suffix) -> bool {
+    return lower.size() >= suffix.size() &&
+           lower.compare(lower.size() - suffix.size(), suffix.size(), suffix) == 0;
+  };
+  return endsWith(".zip") || endsWith(".7z") || endsWith(".tar") || endsWith(".tar.gz") ||
+         endsWith(".tgz") || endsWith(".tar.bz2") || endsWith(".tbz2") || endsWith(".tar.xz") ||
+         endsWith(".txz");
+}
+
 bool FilePanel::IsExtractableArchivePath(const fs::path& path) const {
   if (path.empty()) return false;
   std::error_code ec;
   if (!fs::exists(path, ec) || fs::is_directory(path, ec)) return false;
-
-  auto extLower = [](std::string s) -> std::string {
-    for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return s;
-  };
-
-  const auto name = extLower(path.filename().string());
-  const auto endsWith = [&](const std::string& suffix) -> bool {
-    return name.size() >= suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
-  };
-
-  return endsWith(".zip") || endsWith(".7z") || endsWith(".tar") || endsWith(".tar.gz") || endsWith(".tgz") ||
-         endsWith(".tar.bz2") || endsWith(".tbz2") || endsWith(".tar.xz") || endsWith(".txz");
+  return LooksLikeExtractableArchiveName(path);
 }
 
 void FilePanel::ExtractArchiveTo(const fs::path& archivePath, const fs::path& dstDir) {
-  if (listingMode_ != ListingMode::Directory) {
-    wxMessageBox("Extract is only available for local files right now.",
-                 "Quarry",
-                 wxOK | wxICON_INFORMATION,
-                 DialogParent());
-    return;
-  }
   if (archivePath.empty() || dstDir.empty()) return;
 
-  std::error_code ec;
-  if (!fs::exists(archivePath, ec) || fs::is_directory(archivePath, ec)) return;
-  if (!fs::exists(dstDir, ec) || !fs::is_directory(dstDir, ec)) return;
-
-  if (!IsExtractableArchivePath(archivePath)) {
-    wxMessageBox("Unsupported archive type.",
-                 "Quarry",
-                 wxOK | wxICON_INFORMATION,
-                 DialogParent());
+  auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(DialogParent()));
+  if (!frame) {
+    wxMessageBox("Extract is not available here.", "Quarry", wxOK | wxICON_INFORMATION, DialogParent());
     return;
   }
+
+  const std::string srcStr = archivePath.string();
+  const std::string dstStr = dstDir.string();
+  const bool srcIsUri = LooksLikeUri(srcStr);
+  const bool dstIsUri = LooksLikeUri(dstStr);
 
   auto lower = [](std::string s) -> std::string {
     for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -3895,27 +3906,44 @@ void FilePanel::ExtractArchiveTo(const fs::path& archivePath, const fs::path& ds
   };
   const auto name = lower(archivePath.filename().string());
 
-  std::vector<std::string> args;
+  if (!LooksLikeExtractableArchiveName(archivePath)) {
+    wxMessageBox("Unsupported archive type.",
+                 "Quarry",
+                 wxOK | wxICON_INFORMATION,
+                 DialogParent());
+    return;
+  }
+
+  // Validate local paths when involved.
+  std::error_code ec;
+  if (!srcIsUri) {
+    if (!fs::exists(archivePath, ec) || fs::is_directory(archivePath, ec)) return;
+  }
+  if (!dstIsUri) {
+    if (!fs::exists(dstDir, ec) || !fs::is_directory(dstDir, ec)) return;
+  }
+
+  // Pick an extractor command.
+  std::vector<std::string> extractor;
   if (name.size() >= 4 && name.rfind(".zip") == name.size() - 4) {
     if (HasCommand("unzip")) {
-      args = {"unzip", "-o", archivePath.string(), "-d", dstDir.string()};
+      extractor = {"unzip", "-o"};
     } else if (HasCommand("bsdtar")) {
-      args = {"bsdtar", "-xf", archivePath.string(), "-C", dstDir.string()};
+      extractor = {"bsdtar", "-xf"};
     }
   } else if (name.size() >= 3 && name.rfind(".7z") == name.size() - 3) {
     if (HasCommand("7z")) {
-      args = {"7z", "x", "-y", "-o" + dstDir.string(), archivePath.string()};
+      extractor = {"7z", "x", "-y"};
     }
   } else {
     // tar and tar.* variants.
     if (HasCommand("tar")) {
-      args = {"tar", "-xf", archivePath.string(), "-C", dstDir.string()};
+      extractor = {"tar", "-xf"};
     } else if (HasCommand("bsdtar")) {
-      args = {"bsdtar", "-xf", archivePath.string(), "-C", dstDir.string()};
+      extractor = {"bsdtar", "-xf"};
     }
   }
-
-  if (args.empty()) {
+  if (extractor.empty()) {
     wxMessageBox("No suitable extractor found (need tar/unzip/7z/bsdtar).",
                  "Quarry",
                  wxOK | wxICON_ERROR,
@@ -3923,11 +3951,99 @@ void FilePanel::ExtractArchiveTo(const fs::path& archivePath, const fs::path& ds
     return;
   }
 
-  auto* frame = dynamic_cast<MainFrame*>(wxGetTopLevelParent(DialogParent()));
-  if (!frame) {
-    wxMessageBox("Extract is not available here.", "Quarry", wxOK | wxICON_INFORMATION, DialogParent());
+  // Simple local->local: run extractor directly (existing behavior).
+  if (!srcIsUri && !dstIsUri) {
+    std::vector<std::string> args;
+    if (!extractor.empty() && extractor[0] == "7z") {
+      args = extractor;
+      args.push_back("-o" + dstDir.string());
+      args.push_back(archivePath.string());
+    } else {
+      args = extractor;
+      args.push_back(archivePath.string());
+      args.push_back("-C");
+      args.push_back(dstDir.string());
+      if (extractor[0] == "unzip") {
+        // unzip uses "-d" instead of "-C"
+        args = extractor;
+        args.push_back(archivePath.string());
+        args.push_back("-d");
+        args.push_back(dstDir.string());
+      }
+    }
+
+    if (statusText_) {
+      statusText_->SetLabel(wxString::Format("Queued extract: %s", archivePath.filename().string()));
+      statusText_->Refresh();
+    }
+    frame->StartExtractOperation(args, dstDir, /*treeChanged=*/true);
     return;
   }
+
+  // Remote support: stage to temp dir, extract locally, then copy results to destination if needed.
+  // NOTE: Uses external tools and gio copy; progress is best-effort.
+  auto shQuote = [](const std::string& s) -> std::string {
+    std::string out;
+    out.reserve(s.size() + 2);
+    out.push_back('\'');
+    for (const char c : s) {
+      if (c == '\'') out += "'\\''";
+      else out.push_back(c);
+    }
+    out.push_back('\'');
+    return out;
+  };
+
+  const std::string srcQ = shQuote(srcStr);
+  const std::string dstQ = shQuote(dstStr);
+  const std::string baseName = archivePath.filename().string().empty() ? "archive" : archivePath.filename().string();
+  const std::string baseQ = shQuote(baseName);
+
+  // Build extractor invocation for the staged archive and output folder.
+  // We extract into "$TMP/out" regardless of destination type.
+  std::string extractCmd;
+  if (!extractor.empty() && extractor[0] == "7z") {
+    extractCmd = "7z x -y -o\"$TMP/out\" \"$TMP/$BASENAME\"";
+  } else if (!extractor.empty() && extractor[0] == "unzip") {
+    extractCmd = "unzip -o \"$TMP/$BASENAME\" -d \"$TMP/out\"";
+  } else if (!extractor.empty() && extractor[0] == "tar") {
+    extractCmd = "tar -xf \"$TMP/$BASENAME\" -C \"$TMP/out\"";
+  } else if (!extractor.empty() && extractor[0] == "bsdtar") {
+    extractCmd = "bsdtar -xf \"$TMP/$BASENAME\" -C \"$TMP/out\"";
+  } else {
+    extractCmd = "false";
+  }
+
+  std::string copyOutCmd;
+  if (dstIsUri) {
+    // Copy top-level extracted entries to the remote destination.
+    copyOutCmd =
+        "find \"$TMP/out\" -mindepth 1 -maxdepth 1 -print0 | "
+        "xargs -0 -I{} gio copy -r -- \"{}\" " +
+        dstQ;
+  } else {
+    // Copy extracted contents into local destination directory.
+    copyOutCmd = "cp -a \"$TMP/out/.\" " + dstQ;
+  }
+
+  std::string stageInCmd;
+  if (srcIsUri) {
+    stageInCmd = "gio copy -- " + srcQ + " \"$TMP/$BASENAME\"";
+  } else {
+    stageInCmd = "cp -- " + srcQ + " \"$TMP/$BASENAME\"";
+  }
+
+  const std::string script =
+      "set -e; "
+      "TMP=\"$(mktemp -d -t quarry-extract-XXXXXX)\"; "
+      "BASENAME=" + baseQ + "; "
+      "cleanup(){ rm -rf \"$TMP\"; }; trap cleanup EXIT INT TERM; "
+      "mkdir -p \"$TMP/out\"; " +
+      stageInCmd + "; " +
+      extractCmd + "; " +
+      copyOutCmd + "; ";
+
+  std::vector<std::string> args = {"sh", "-lc", script};
 
   if (statusText_) {
     statusText_->SetLabel(wxString::Format("Queued extract: %s", archivePath.filename().string()));
