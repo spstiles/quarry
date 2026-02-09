@@ -133,6 +133,8 @@ private:
   bool IsExtractableArchivePath(const std::filesystem::path& path) const;
   void ExtractArchiveTo(const std::filesystem::path& archivePath, const std::filesystem::path& dstDir);
   bool HasCommand(const wxString& name) const;
+  bool IsIsoImagePath(const std::filesystem::path& path) const;
+  void MakeBootableUsbStick(const std::filesystem::path& isoPath);
 
   void UpdateAddressBar();
   void EnterAddressEditMode();

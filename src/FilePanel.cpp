@@ -1035,6 +1035,7 @@ enum MenuId : int {
   ID_CTX_REFRESH,
   ID_CTX_EXTRACT_HERE,
   ID_CTX_EXTRACT_TO,
+  ID_CTX_MAKE_BOOTABLE_USB,
   ID_CTX_SAVE_CONNECTION,
   ID_CTX_COPY,
   ID_CTX_CUT,
@@ -3677,6 +3678,7 @@ void FilePanel::ShowListContextMenu(const wxDataViewItem& contextItem,
   menu.AppendSeparator();
   menu.Append(ID_CTX_EXTRACT_HERE, "Extract Here");
   menu.Append(ID_CTX_EXTRACT_TO, "Extract To...");
+  menu.Append(ID_CTX_MAKE_BOOTABLE_USB, "Make Bootable USB Stick...");
   menu.Append(ID_CTX_SAVE_CONNECTION, "Save this share...");
   menu.AppendSeparator();
   menu.Append(ID_CTX_COPY, "Copy");
@@ -3708,11 +3710,13 @@ void FilePanel::ShowListContextMenu(const wxDataViewItem& contextItem,
     allowRename = allowRemoteOps;
   }
   const bool canExtract = allowFsOps && single && IsExtractableArchivePath(selected[0]);
+  const bool canMakeBootable = allowFsOps && single && IsIsoImagePath(selected[0]);
   const bool canSaveShare = (listingMode_ == ListingMode::Gio) && single;
   menu.Enable(ID_CTX_OPEN, hasSelection);
   menu.Enable(ID_CTX_REFRESH, true);
   menu.Enable(ID_CTX_EXTRACT_HERE, canExtract);
   menu.Enable(ID_CTX_EXTRACT_TO, canExtract);
+  menu.Enable(ID_CTX_MAKE_BOOTABLE_USB, canMakeBootable);
   menu.Enable(ID_CTX_SAVE_CONNECTION, canSaveShare);
   menu.Enable(ID_CTX_COPY, allowCopyPaste && hasSelection);
   menu.Enable(ID_CTX_CUT, allowCopyPaste && hasSelection);
@@ -3735,6 +3739,10 @@ void FilePanel::ShowListContextMenu(const wxDataViewItem& contextItem,
     if (dlg.ShowModal() != wxID_OK) return;
     ExtractArchiveTo(selected[0], std::filesystem::path(dlg.GetPath().ToStdString()));
   }, ID_CTX_EXTRACT_TO);
+  menu.Bind(wxEVT_MENU, [this, selected](wxCommandEvent&) {
+    if (selected.size() != 1) return;
+    MakeBootableUsbStick(selected[0]);
+  }, ID_CTX_MAKE_BOOTABLE_USB);
   menu.Bind(wxEVT_MENU, [this, selected](wxCommandEvent&) {
     if (selected.size() != 1) return;
     const auto uri = selected[0].string();
@@ -3770,6 +3778,68 @@ bool FilePanel::HasCommand(const wxString& name) const {
   // Safe: name is a fixed literal we control (no spaces).
   const wxString cmd = wxString::Format("sh -lc 'command -v %s >/dev/null 2>&1'", name);
   return wxExecute(cmd, wxEXEC_SYNC) == 0;
+}
+
+bool FilePanel::IsIsoImagePath(const fs::path& path) const {
+  if (path.empty()) return false;
+  std::error_code ec;
+  if (!fs::exists(path, ec) || fs::is_directory(path, ec)) return false;
+
+  const auto name = path.filename().string();
+  std::string lower;
+  lower.reserve(name.size());
+  for (const auto c : name) lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+  return lower.size() >= 4 && lower.compare(lower.size() - 4, 4, ".iso") == 0;
+}
+
+void FilePanel::MakeBootableUsbStick(const fs::path& isoPath) {
+  if (!IsIsoImagePath(isoPath)) return;
+
+  const wxString isoWx = wxString::FromUTF8(isoPath.string());
+  const int rc = wxMessageBox(
+      wxString::Format("This will create a bootable USB stick from:\n\n%s\n\n"
+                       "This will erase data on the target USB device.\n\nContinue?",
+                       isoWx.c_str()),
+      "Make Bootable USB Stick",
+      wxYES_NO | wxNO_DEFAULT | wxICON_WARNING,
+      DialogParent());
+  if (rc != wxYES) return;
+
+  if (HasCommand("usb-imagewriter")) {
+    const wxString cmd0 = "usb-imagewriter";
+    const wxString cmd1 = isoWx;
+    const wxChar* const argv[] = {cmd0.wc_str(), cmd1.wc_str(), nullptr};
+    if (wxExecute(argv, wxEXEC_ASYNC) == 0) {
+      wxMessageBox("Failed to start usb-imagewriter.", "Quarry", wxOK | wxICON_ERROR, DialogParent());
+    }
+    return;
+  }
+
+  if (HasCommand("mintstick")) {
+    const wxString cmd0 = "mintstick";
+    const wxChar* const argv[] = {cmd0.wc_str(), nullptr};
+    (void)wxExecute(argv, wxEXEC_ASYNC);
+    wxMessageBox(wxString::Format("Started mintstick.\n\nSelect the ISO:\n%s",
+                                  isoWx.c_str()),
+                 "Quarry", wxOK | wxICON_INFORMATION, DialogParent());
+    return;
+  }
+
+  if (HasCommand("gnome-disks")) {
+    const wxString cmd0 = "gnome-disks";
+    const wxChar* const argv[] = {cmd0.wc_str(), nullptr};
+    (void)wxExecute(argv, wxEXEC_ASYNC);
+    wxMessageBox("Started Disks.\n\nUse its menu to restore a disk image to a USB drive.",
+                 "Quarry", wxOK | wxICON_INFORMATION, DialogParent());
+    return;
+  }
+
+  wxMessageBox("No USB image writer tool was found.\n\n"
+               "Install one of these and try again:\n"
+               "- usb-imagewriter\n"
+               "- mintstick\n"
+               "- gnome-disk-utility",
+               "Quarry", wxOK | wxICON_INFORMATION, DialogParent());
 }
 
 bool FilePanel::IsExtractableArchivePath(const fs::path& path) const {
