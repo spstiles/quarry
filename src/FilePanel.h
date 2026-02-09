@@ -193,6 +193,8 @@ private:
   wxTimer fsWatchDebounce_{};
   int fsWatchTimerId_{wxID_ANY};
   bool fsWatchPending_{false};
+  bool autoRefreshInProgress_{false};
+  std::optional<std::string> autoRefreshTopKey_{};
 
   wxTreeItemId hiddenRoot_{};
   wxTreeItemId computerRoot_{};

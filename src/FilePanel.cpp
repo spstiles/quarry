@@ -1348,7 +1348,25 @@ void FilePanel::BuildLayout(wxWindow* sidebarParent, wxWindow* listParent) {
       fsWatchPending_ = false;
       if (listingMode_ != ListingMode::Directory) return;
       if (currentDir_.empty()) return;
+      // Preserve the current top visible row to avoid scroll jumps.
+      autoRefreshTopKey_.reset();
+      if (list_) {
+        const auto top = list_->GetTopItem();
+        if (top.IsOk()) {
+          const int row = list_->ItemToRow(top);
+          if (row != wxNOT_FOUND) {
+            wxVariant v;
+            list_->GetValue(v, static_cast<unsigned int>(row), COL_FULLPATH);
+            const auto key = v.GetString().ToStdString();
+            if (!key.empty()) autoRefreshTopKey_ = key;
+          }
+        }
+      }
+
+      autoRefreshInProgress_ = true;
       (void)LoadDirectory(currentDir_);
+      autoRefreshInProgress_ = false;
+      autoRefreshTopKey_.reset();
       UpdateStatusText();
     }, fsWatchTimerId_);
   }
@@ -2908,7 +2926,7 @@ void FilePanel::ReselectAndReveal(const std::vector<std::string>& selectedKeys,
   list_->Freeze();
   list_->UnselectAll();
 
-  wxDataViewItem revealItem;
+  wxDataViewItem firstSelectedItem;
 
   for (const auto& key : selectedKeys) {
     const auto it = keyToRow.find(key);
@@ -2916,17 +2934,36 @@ void FilePanel::ReselectAndReveal(const std::vector<std::string>& selectedKeys,
     const auto item = list_->RowToItem(it->second);
     if (!item.IsOk()) continue;
     list_->Select(item);
-    if (!revealItem.IsOk()) revealItem = item;
+    if (!firstSelectedItem.IsOk()) firstSelectedItem = item;
   }
 
-  if (!revealItem.IsOk() && currentKey) {
+  wxDataViewItem desiredCurrent;
+  if (currentKey) {
     const auto it = keyToRow.find(*currentKey);
-    if (it != keyToRow.end()) revealItem = list_->RowToItem(it->second);
+    if (it != keyToRow.end()) desiredCurrent = list_->RowToItem(it->second);
   }
 
-  if (revealItem.IsOk()) {
-    list_->SetCurrentItem(revealItem);
-    list_->EnsureVisible(revealItem, list_->GetColumn(COL_NAME));
+  if (desiredCurrent.IsOk()) {
+    list_->SetCurrentItem(desiredCurrent);
+  }
+
+  // Avoid UI "jumping around" during auto-refresh: preserve scroll position by
+  // keeping the same top item visible when possible.
+  if (autoRefreshInProgress_) {
+    if (autoRefreshTopKey_) {
+      const auto it = keyToRow.find(*autoRefreshTopKey_);
+      if (it != keyToRow.end()) {
+        const auto topItem = list_->RowToItem(it->second);
+        if (topItem.IsOk()) list_->EnsureVisible(topItem, list_->GetColumn(COL_NAME));
+      }
+    }
+  } else {
+    wxDataViewItem revealItem = firstSelectedItem;
+    if (!revealItem.IsOk()) revealItem = desiredCurrent;
+    if (revealItem.IsOk()) {
+      list_->SetCurrentItem(revealItem);
+      list_->EnsureVisible(revealItem, list_->GetColumn(COL_NAME));
+    }
   }
 
   list_->Thaw();
