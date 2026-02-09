@@ -30,6 +30,33 @@ bool LooksLikeUriString(const std::string& s) {
 }
 
 #ifdef QUARRY_USE_GIO
+std::string PercentDecode(std::string s) {
+  auto hex = [](unsigned char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+  };
+
+  std::string out;
+  out.reserve(s.size());
+  for (size_t i = 0; i < s.size(); i++) {
+    if (s[i] == '%' && i + 2 < s.size()) {
+      const int hi = hex(static_cast<unsigned char>(s[i + 1]));
+      const int lo = hex(static_cast<unsigned char>(s[i + 2]));
+      if (hi >= 0 && lo >= 0) {
+        out.push_back(static_cast<char>((hi << 4) | lo));
+        i += 2;
+        continue;
+      }
+    }
+    out.push_back(s[i]);
+  }
+  return out;
+}
+#endif
+
+#ifdef QUARRY_USE_GIO
 struct GioProgressCtx {
   const CancelFn* shouldCancel{nullptr};
   const CopyProgressFn* onProgress{nullptr};
@@ -718,6 +745,33 @@ bool IsDirectoryAny(const fs::path& p) {
   }
   std::error_code ec;
   return fs::is_directory(p, ec);
+}
+
+std::string BaseNameAny(const fs::path& p) {
+  const auto s = p.string();
+  if (LooksLikeUriString(s)) {
+#ifdef QUARRY_USE_GIO
+    GFile* f = g_file_new_for_commandline_arg(s.c_str());
+    if (!f) return p.filename().string();
+    char* base = g_file_get_basename(f);
+    g_object_unref(f);
+    if (base) {
+      std::string out(base);
+      g_free(base);
+      if (!out.empty()) return out;
+    }
+
+    // Fallback: best-effort basename from URI and percent decode.
+    std::string t = s;
+    while (t.size() > 1 && t.back() == '/') t.pop_back();
+    const auto slash = t.find_last_of('/');
+    if (slash != std::string::npos && slash + 1 < t.size()) return PercentDecode(t.substr(slash + 1));
+    return PercentDecode(t);
+#else
+    return p.filename().string();
+#endif
+  }
+  return p.filename().string();
 }
 
 fs::path JoinDirAndNameAny(const fs::path& dir, const std::string& name) {

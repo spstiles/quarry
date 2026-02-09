@@ -1631,10 +1631,10 @@ void MainFrame::CopyMoveWithProgressInternal(const wxString& title,
 
       {
         std::lock_guard<std::mutex> lock(state->mu);
-        state->currentLabel = src.filename().string();
+        state->currentLabel = BaseNameAny(src);
       }
 
-      auto dst = JoinDirAndNameAny(dstDir, src.filename().string());
+      auto dst = JoinDirAndNameAny(dstDir, BaseNameAny(src));
 
       // Conflict handling (delegated to UI thread).
       bool skipItem = false;
@@ -2072,7 +2072,7 @@ void MainFrame::TrashWithProgressInternal(const std::vector<std::filesystem::pat
 
       {
         std::lock_guard<std::mutex> lock(state->mu);
-        const auto fn = src.filename().string();
+        const auto fn = BaseNameAny(src);
         state->currentLabel = fn.empty() ? src.string() : fn;
       }
 
@@ -2398,7 +2398,7 @@ void MainFrame::DeleteWithProgressInternal(const std::vector<std::filesystem::pa
 
       {
         std::lock_guard<std::mutex> lock(state->mu);
-        const auto fn = src.filename().string();
+        const auto fn = BaseNameAny(src);
         state->currentLabel = fn.empty() ? src.string() : fn;
       }
 

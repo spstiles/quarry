@@ -41,4 +41,5 @@ OpResult TrashPath(const std::filesystem::path& src, const CancelFn& shouldCance
 
 bool PathExistsAny(const std::filesystem::path& p);
 bool IsDirectoryAny(const std::filesystem::path& p);
+std::string BaseNameAny(const std::filesystem::path& p);
 std::filesystem::path JoinDirAndNameAny(const std::filesystem::path& dir, const std::string& name);
