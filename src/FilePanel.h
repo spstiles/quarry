@@ -9,6 +9,8 @@
 #include <vector>
 
 #include <wx/dataview.h>
+#include <wx/fswatcher.h>
+#include <wx/timer.h>
 #include <wx/treectrl.h>
 
 class wxButton;
@@ -38,6 +40,7 @@ public:
   };
 
   FilePanel(wxWindow* sidebarParent, wxWindow* listParent);
+  ~FilePanel();
 
   wxWindow* SidebarWindow() const;
   wxWindow* ListWindow() const;
@@ -140,6 +143,10 @@ private:
   void EnterAddressEditMode();
   void ExitAddressEditMode();
 
+  void UpdateFsWatcher();
+  void StopFsWatcher();
+  void ScheduleAutoRefresh();
+
   wxPanel* sidebarRoot_{nullptr};
   wxPanel* listRoot_{nullptr};
   wxPanel* addressRoot_{nullptr};
@@ -180,6 +187,12 @@ private:
   bool suppressNextContextMenu_{false};
   bool renameHandling_{false};
   bool addressEditMode_{true};
+
+  std::unique_ptr<wxFileSystemWatcher> fsWatcher_{};
+  std::filesystem::path watchedDir_{};
+  wxTimer fsWatchDebounce_{};
+  int fsWatchTimerId_{wxID_ANY};
+  bool fsWatchPending_{false};
 
   wxTreeItemId hiddenRoot_{};
   wxTreeItemId computerRoot_{};

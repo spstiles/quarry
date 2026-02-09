@@ -48,6 +48,8 @@
 #include <wx/time.h>
 #include <wx/treectrl.h>
 #include <wx/utils.h>
+#include <wx/fswatcher.h>
+#include <wx/timer.h>
 
 #include <sys/wait.h>
 
@@ -1266,6 +1268,11 @@ FilePanel::FilePanel(wxWindow* sidebarParent, wxWindow* listParent) {
   BuildLayout(sidebarParent, listParent);
 }
 
+FilePanel::~FilePanel() {
+  StopFsWatcher();
+  if (fsWatchDebounce_.IsRunning()) fsWatchDebounce_.Stop();
+}
+
 wxWindow* FilePanel::SidebarWindow() const { return sidebarRoot_; }
 
 wxWindow* FilePanel::ListWindow() const { return listRoot_; }
@@ -1327,6 +1334,24 @@ void FilePanel::SetSort(int columnIndex, bool ascending) {
 void FilePanel::BuildLayout(wxWindow* sidebarParent, wxWindow* listParent) {
   sidebarRoot_ = new wxPanel(sidebarParent, wxID_ANY);
   listRoot_ = new wxPanel(listParent, wxID_ANY);
+
+  if (!fsWatcher_) {
+    fsWatcher_ = std::make_unique<wxFileSystemWatcher>();
+    fsWatcher_->Bind(wxEVT_FSWATCHER, [this](wxFileSystemWatcherEvent&) { ScheduleAutoRefresh(); });
+  }
+
+  if (fsWatchTimerId_ == wxID_ANY) {
+    fsWatchTimerId_ = wxWindow::NewControlId();
+    fsWatchDebounce_.SetOwner(listRoot_, fsWatchTimerId_);
+    listRoot_->Bind(wxEVT_TIMER, [this](wxTimerEvent&) {
+      if (!fsWatchPending_) return;
+      fsWatchPending_ = false;
+      if (listingMode_ != ListingMode::Directory) return;
+      if (currentDir_.empty()) return;
+      (void)LoadDirectory(currentDir_);
+      UpdateStatusText();
+    }, fsWatchTimerId_);
+  }
 
   // Sidebar tree should behave like a modern file-manager sidebar (Nemo/Dolphin):
   // no connector "branch" lines and full-row highlight.
@@ -2000,6 +2025,50 @@ void FilePanel::BindDirContentsChanged(
   onDirContentsChanged_ = std::move(onChanged);
 }
 
+void FilePanel::StopFsWatcher() {
+  if (!fsWatcher_) return;
+  fsWatcher_->RemoveAll();
+  watchedDir_.clear();
+}
+
+void FilePanel::UpdateFsWatcher() {
+  if (!fsWatcher_) return;
+  if (listingMode_ != ListingMode::Directory) {
+    StopFsWatcher();
+    return;
+  }
+  if (currentDir_.empty()) {
+    StopFsWatcher();
+    return;
+  }
+
+  std::error_code ec;
+  if (!fs::exists(currentDir_, ec) || !fs::is_directory(currentDir_, ec)) {
+    StopFsWatcher();
+    return;
+  }
+
+  if (watchedDir_ == currentDir_) return;
+
+  StopFsWatcher();
+  watchedDir_ = currentDir_;
+
+  const wxString dirWx = wxString::FromUTF8(currentDir_.string());
+  fsWatcher_->Add(wxFileName::DirName(dirWx));
+}
+
+void FilePanel::ScheduleAutoRefresh() {
+  if (listingMode_ != ListingMode::Directory) return;
+  if (!listRoot_ || !list_) return;
+  if (currentDir_.empty()) return;
+  if (watchedDir_ != currentDir_) return;
+
+  fsWatchPending_ = true;
+  if (!fsWatchDebounce_.IsRunning()) {
+    fsWatchDebounce_.StartOnce(200);
+  }
+}
+
 void FilePanel::SetDirectory(const std::string& path) {
   history_.clear();
   historyIndex_ = -1;
@@ -2207,6 +2276,7 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
     currentDir_ = kVirtualRecent;
     if (pathCtrl_) pathCtrl_->ChangeValue("Recent");
     UpdateAddressBar();
+    UpdateFsWatcher();
 
     std::vector<Entry> entries;
     const auto recent = ReadRecentPaths(/*limit=*/200);
@@ -2282,6 +2352,7 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
         currentDir_ = fs::path(effectiveUri);
         if (pathCtrl_) pathCtrl_->ChangeValue(currentDir_.string());
         UpdateAddressBar();
+        UpdateFsWatcher();
 
         // Best-effort tree sync: highlight Network group.
         SyncTreeToCurrentDir();
@@ -2418,6 +2489,7 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
   if (pathCtrl_) pathCtrl_->ChangeValue(currentDir_.string());
   SyncTreeToCurrentDir();
   UpdateAddressBar();
+  UpdateFsWatcher();
 
   std::string err;
   auto entries = ListDir(currentDir_, &err);
