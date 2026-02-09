@@ -1337,7 +1337,14 @@ void FilePanel::BuildLayout(wxWindow* sidebarParent, wxWindow* listParent) {
 
   if (!fsWatcher_) {
     fsWatcher_ = std::make_unique<wxFileSystemWatcher>();
-    fsWatcher_->Bind(wxEVT_FSWATCHER, [this](wxFileSystemWatcherEvent&) { ScheduleAutoRefresh(); });
+    fsWatcher_->Bind(wxEVT_FSWATCHER, [this](wxFileSystemWatcherEvent& e) {
+      if (e.IsError()) return;
+      // Avoid refresh loops/jumps: ignore ACCESS/MODIFY/ATTRIB events which can
+      // be triggered just by reading the directory or by metadata updates.
+      const int ct = e.GetChangeType();
+      if ((ct & (wxFSW_EVENT_CREATE | wxFSW_EVENT_DELETE | wxFSW_EVENT_RENAME)) == 0) return;
+      ScheduleAutoRefresh();
+    });
   }
 
   if (fsWatchTimerId_ == wxID_ANY) {
