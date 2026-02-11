@@ -3251,6 +3251,46 @@ void FilePanel::CreateFolder() {
     return;
   }
 
+  const auto selectAndRevealCreated = [&](const std::string& createdName, bool isGio) {
+    if (!list_) return;
+    const bool createdDir = true;
+    const std::string newKey =
+        isGio ? JoinDirAndNameAny(currentDir_, createdName).string()
+              : (currentDir_ / fs::path(createdName)).string();
+
+    std::optional<int> targetRow;
+    for (size_t i = 0; i < currentEntries_.size(); i++) {
+      const auto full = !currentEntries_[i].fullPath.empty()
+                            ? currentEntries_[i].fullPath
+                            : (currentDir_ / currentEntries_[i].name).string();
+      if (!newKey.empty() && full == newKey) {
+        targetRow = static_cast<int>(i);
+        break;
+      }
+    }
+    if (!targetRow) {
+      for (size_t i = 0; i < currentEntries_.size(); i++) {
+        if (currentEntries_[i].isDir != createdDir) continue;
+        if (currentEntries_[i].name == createdName) {
+          targetRow = static_cast<int>(i);
+          break;
+        }
+      }
+    }
+
+    if (targetRow && *targetRow >= 0) {
+      const auto item = list_->RowToItem(*targetRow);
+      if (item.IsOk()) {
+        list_->Freeze();
+        list_->UnselectAll();
+        list_->Select(item);
+        list_->SetCurrentItem(item);
+        list_->EnsureVisible(item, list_->GetColumn(COL_NAME));
+        list_->Thaw();
+      }
+    }
+  };
+
   if (listingMode_ == ListingMode::Directory) {
     std::error_code ec;
     fs::create_directory(currentDir_ / name, ec);
@@ -3262,6 +3302,7 @@ void FilePanel::CreateFolder() {
     }
     RefreshAll();
     RefreshTree();
+    selectAndRevealCreated(name, /*isGio=*/false);
     NotifyDirContentsChanged(true);
     return;
   }
@@ -3331,6 +3372,7 @@ void FilePanel::CreateFolder() {
     }
 
     RefreshAll();
+    selectAndRevealCreated(name, /*isGio=*/true);
     NotifyDirContentsChanged(false);
     return;
 #else
