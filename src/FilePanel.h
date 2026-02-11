@@ -192,6 +192,8 @@ private:
   wxDataViewItem dragAnchorItem_{};
   long long dragSnapshotAtMs_{0};
   std::vector<std::filesystem::path> dragSelectionSnapshot_{};
+  long long lastMultiSelectionAtMs_{0};
+  std::vector<std::filesystem::path> lastMultiSelectionSnapshot_{};
 
   std::unique_ptr<wxFileSystemWatcher> fsWatcher_{};
   std::filesystem::path watchedDir_{};
