@@ -270,6 +270,11 @@ struct AsyncFileOpState {
   std::atomic<size_t> done{0};
   std::atomic<std::uintmax_t> bytesDone{0};
 
+  // For copy/move operations: destination directory and the top-level items
+  // that were successfully created/updated there (used for selecting in the UI).
+  std::filesystem::path dstDir{};
+  std::vector<std::filesystem::path> completedDsts{};
+
   bool finished{false};
   bool hasDir{false};
   bool scanDone{false};
@@ -1427,6 +1432,12 @@ void MainFrame::CopyMoveWithProgressInternal(const wxString& title,
   fileOp_->state = std::make_shared<AsyncFileOpState>();
 
   {
+    std::lock_guard<std::mutex> lock(fileOp_->state->mu);
+    fileOp_->state->dstDir = dstDir;
+    fileOp_->state->completedDsts.clear();
+  }
+
+  {
     for (const auto& p : sources) {
       if (IsDirectoryAny(p)) {
         fileOp_->state->hasDir = true;
@@ -1714,6 +1725,11 @@ void MainFrame::CopyMoveWithProgressInternal(const wxString& title,
         }
       }
 
+      if (result.ok) {
+        std::lock_guard<std::mutex> lock(state->mu);
+        state->completedDsts.push_back(dst);
+      }
+
       state->done.fetch_add(1);
     }
 
@@ -1874,6 +1890,18 @@ void MainFrame::CopyMoveWithProgressInternal(const wxString& title,
       if (state->hasDir) {
         if (top_) top_->RefreshTree();
         if (bottom_) bottom_->RefreshTree();
+      }
+
+      std::filesystem::path opDstDir{};
+      std::vector<std::filesystem::path> created{};
+      {
+        std::lock_guard<std::mutex> lock(state->mu);
+        opDstDir = state->dstDir;
+        created = state->completedDsts;
+      }
+      if (!opDstDir.empty() && !created.empty()) {
+        if (top_ && top_->GetDirectoryPath() == opDstDir) top_->SelectAndRevealPaths(created);
+        if (bottom_ && bottom_->GetDirectoryPath() == opDstDir) bottom_->SelectAndRevealPaths(created);
       }
 
       if (fileOp_->dlg) fileOp_->dlg->Destroy();

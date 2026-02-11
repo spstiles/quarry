@@ -69,6 +69,9 @@ public:
   void TrashSelection();
   void DeleteSelectionPermanent();
 
+  // Selects items by absolute path/URI in the current list view and scrolls to the first match.
+  void SelectAndRevealPaths(const std::vector<std::filesystem::path>& paths);
+
   // Seeds credentials for a location for this application instance.
   // This avoids extra auth prompts and can optionally persist via the OS keyring when supported.
   void SeedMountCredentials(const std::string& uri,

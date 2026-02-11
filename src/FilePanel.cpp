@@ -3228,6 +3228,50 @@ std::vector<fs::path> FilePanel::GetSelectedPaths() const {
   return paths;
 }
 
+void FilePanel::SelectAndRevealPaths(const std::vector<fs::path>& paths) {
+  if (!list_) return;
+  if (paths.empty()) return;
+  if (currentEntries_.empty()) return;
+
+  std::unordered_set<std::string> targets;
+  targets.reserve(paths.size());
+  for (const auto& p : paths) {
+    const auto s = p.string();
+    if (!s.empty()) targets.insert(s);
+  }
+  if (targets.empty()) return;
+
+  std::vector<int> rows;
+  rows.reserve(targets.size());
+  for (size_t i = 0; i < currentEntries_.size(); i++) {
+    const auto full = !currentEntries_[i].fullPath.empty()
+                          ? currentEntries_[i].fullPath
+                          : (currentDir_ / currentEntries_[i].name).string();
+    if (full.empty()) continue;
+    if (targets.find(full) == targets.end()) continue;
+    rows.push_back(static_cast<int>(i));
+  }
+  if (rows.empty()) return;
+
+  std::sort(rows.begin(), rows.end());
+
+  list_->Freeze();
+  list_->UnselectAll();
+  wxDataViewItem first{};
+  for (const int row : rows) {
+    if (row < 0) continue;
+    const auto item = list_->RowToItem(row);
+    if (!item.IsOk()) continue;
+    if (!first.IsOk()) first = item;
+    list_->Select(item);
+  }
+  if (first.IsOk()) {
+    list_->SetCurrentItem(first);
+    list_->EnsureVisible(first, list_->GetColumn(COL_NAME));
+  }
+  list_->Thaw();
+}
+
 void FilePanel::BeginInlineRename() {
   if (listingMode_ != ListingMode::Directory && listingMode_ != ListingMode::Gio) return;
   if (listingMode_ == ListingMode::Gio) {
