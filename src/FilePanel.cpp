@@ -2838,6 +2838,8 @@ void FilePanel::OnListValueChanged(wxDataViewEvent& event) {
       !currentEntries_[row].fullPath.empty() ? currentEntries_[row].fullPath
                                              : (currentDir_ / oldName).string();
   const bool isGio = listingMode_ == ListingMode::Gio || LooksLikeUri(oldStr);
+  const std::string newKey =
+      isGio ? JoinDirAndNameAny(currentDir_, newName).string() : (currentDir_ / fs::path(newName)).string();
 
   if (isGio) {
 #ifdef QUARRY_USE_GIO
@@ -2878,6 +2880,42 @@ void FilePanel::OnListValueChanged(wxDataViewEvent& event) {
 
   RefreshAll();
   if (renamedDir) RefreshTree();
+
+  // After rename, keep the renamed item selected and ensure it remains visible.
+  if (list_) {
+    std::optional<int> targetRow;
+    for (size_t i = 0; i < currentEntries_.size(); i++) {
+      const auto full = !currentEntries_[i].fullPath.empty()
+                            ? currentEntries_[i].fullPath
+                            : (currentDir_ / currentEntries_[i].name).string();
+      if (!newKey.empty() && full == newKey) {
+        targetRow = static_cast<int>(i);
+        break;
+      }
+    }
+    if (!targetRow) {
+      for (size_t i = 0; i < currentEntries_.size(); i++) {
+        if (currentEntries_[i].isDir != renamedDir) continue;
+        if (currentEntries_[i].name == newName) {
+          targetRow = static_cast<int>(i);
+          break;
+        }
+      }
+    }
+
+    if (targetRow && *targetRow >= 0) {
+      const auto item = list_->RowToItem(*targetRow);
+      if (item.IsOk()) {
+        list_->Freeze();
+        list_->UnselectAll();
+        list_->Select(item);
+        list_->SetCurrentItem(item);
+        list_->EnsureVisible(item, list_->GetColumn(COL_NAME));
+        list_->Thaw();
+      }
+    }
+  }
+
   NotifyDirContentsChanged(renamedDir);
 }
 
