@@ -1775,18 +1775,26 @@ void FilePanel::BindEvents() {
       }
 
       const auto trySnapshot = [&](const std::vector<fs::path>& snap, long long snapAt, long long maxAgeMs) {
-        if (!anchorPath) return;
         if (snap.size() <= 1) return;
         if (snapAt <= 0) return;
         if ((now - snapAt) > maxAgeMs) return;
-        const bool inSnapshot = std::find(snap.begin(), snap.end(), *anchorPath) != snap.end();
-        if (inSnapshot) paths = snap;
+        if (anchorPath) {
+          const bool inSnapshot = std::find(snap.begin(), snap.end(), *anchorPath) != snap.end();
+          if (!inSnapshot) return;
+        }
+        // Either we couldn't resolve the anchor path (rare) or it matches; use snapshot.
+        paths = snap;
       };
 
       // Prefer the immediate pre-drag snapshot; otherwise fall back to the last
       // known multi-selection snapshot (e.g. when drag begins without a fresh click).
-      trySnapshot(dragSelectionSnapshot_, dragSnapshotAtMs_, 1200);
-      if (paths.size() <= 1) trySnapshot(lastMultiSelectionSnapshot_, lastMultiSelectionAtMs_, 2500);
+      trySnapshot(dragSelectionSnapshot_, dragSnapshotAtMs_, 2000);
+      if (paths.size() <= 1) {
+        // If selection has already collapsed, be more forgiving: as long as we
+        // had a multi-selection very recently, assume the user intended to drag it.
+        // (We still require anchor match when we can resolve it.)
+        trySnapshot(lastMultiSelectionSnapshot_, lastMultiSelectionAtMs_, 8000);
+      }
     }
     if (paths.empty()) return;
 
