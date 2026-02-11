@@ -189,6 +189,10 @@ private:
   bool renameHandling_{false};
   bool addressEditMode_{true};
 
+  wxDataViewItem dragAnchorItem_{};
+  long long dragSnapshotAtMs_{0};
+  std::vector<std::filesystem::path> dragSelectionSnapshot_{};
+
   std::unique_ptr<wxFileSystemWatcher> fsWatcher_{};
   std::filesystem::path watchedDir_{};
   wxTimer fsWatchDebounce_{};

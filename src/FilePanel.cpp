@@ -1561,6 +1561,21 @@ void FilePanel::BindEvents() {
     });
   }
 
+  list_->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& e) {
+    // Snapshot selection before the native control possibly collapses it to the clicked row.
+    if (!list_) {
+      e.Skip();
+      return;
+    }
+    wxDataViewItem hitItem;
+    wxDataViewColumn* hitCol = nullptr;
+    list_->HitTest(e.GetPosition(), hitItem, hitCol);
+    dragAnchorItem_ = hitItem;
+    dragSnapshotAtMs_ = wxGetLocalTimeMillis().GetValue();
+    dragSelectionSnapshot_ = GetSelectedPaths();
+    e.Skip();
+  });
+
   list_->Bind(wxEVT_DATAVIEW_ITEM_ACTIVATED, [this](wxDataViewEvent& e) { OpenSelectedIfDir(e); });
   list_->Bind(wxEVT_DATAVIEW_ITEM_START_EDITING, [this](wxDataViewEvent& e) {
     if (!allowInlineEdit_) {
@@ -1734,7 +1749,36 @@ void FilePanel::BindEvents() {
 
   list_->Bind(wxEVT_DATAVIEW_ITEM_BEGIN_DRAG, [this](wxDataViewEvent& e) {
     if (listingMode_ != ListingMode::Directory && listingMode_ != ListingMode::Gio) return;
-    const auto paths = GetSelectedPaths();
+    auto paths = GetSelectedPaths();
+
+    // On some platforms, clicking a selected row before dragging collapses the
+    // selection to just that row. If we had a multi-selection a moment ago and
+    // the drag started from a selected item, prefer the snapshot.
+    if (paths.size() <= 1 && dragSelectionSnapshot_.size() > 1) {
+      const long long now = wxGetLocalTimeMillis().GetValue();
+      if ((now - dragSnapshotAtMs_) < 800 && dragAnchorItem_.IsOk() && e.GetItem().IsOk() &&
+          dragAnchorItem_ == e.GetItem()) {
+        // Ensure the anchor item is part of the snapshot; otherwise ignore it.
+        std::optional<fs::path> anchorPath;
+        {
+          const int row = list_->ItemToRow(e.GetItem());
+          if (row != wxNOT_FOUND) {
+            wxVariant v;
+            list_->GetValue(v, static_cast<unsigned int>(row), COL_FULLPATH);
+            const auto s = v.GetString().ToStdString();
+            if (!s.empty()) anchorPath = fs::path(s);
+          }
+        }
+        if (anchorPath) {
+          const bool inSnapshot = std::find(dragSelectionSnapshot_.begin(),
+                                            dragSelectionSnapshot_.end(),
+                                            *anchorPath) != dragSelectionSnapshot_.end();
+          if (inSnapshot) {
+            paths = dragSelectionSnapshot_;
+          }
+        }
+      }
+    }
     if (paths.empty()) return;
 
     auto* composite = new wxDataObjectComposite();
