@@ -1755,6 +1755,7 @@ void FilePanel::BindEvents() {
   list_->Bind(wxEVT_DATAVIEW_ITEM_BEGIN_DRAG, [this](wxDataViewEvent& e) {
     if (listingMode_ != ListingMode::Directory && listingMode_ != ListingMode::Gio) return;
     auto paths = GetSelectedPaths();
+    bool restoreVisualSelection = false;
 
     // On some platforms, clicking a selected row before dragging collapses the
     // selection to just that row. If we had a multi-selection a moment ago and
@@ -1784,6 +1785,7 @@ void FilePanel::BindEvents() {
         }
         // Either we couldn't resolve the anchor path (rare) or it matches; use snapshot.
         paths = snap;
+        restoreVisualSelection = true;
       };
 
       // Prefer the immediate pre-drag snapshot; otherwise fall back to the last
@@ -1797,6 +1799,32 @@ void FilePanel::BindEvents() {
       }
     }
     if (paths.empty()) return;
+
+    if (restoreVisualSelection && list_ && paths.size() > 1) {
+      // Keep all rows highlighted during the drag for clarity.
+      std::unordered_map<std::string, int> keyToRow;
+      keyToRow.reserve(currentEntries_.size());
+      for (size_t i = 0; i < currentEntries_.size(); i++) {
+        const auto full = !currentEntries_[i].fullPath.empty()
+                              ? currentEntries_[i].fullPath
+                              : (currentDir_ / currentEntries_[i].name).string();
+        keyToRow.emplace(full, static_cast<int>(i));
+      }
+
+      list_->Freeze();
+      list_->UnselectAll();
+      wxDataViewItem desiredCurrent;
+      for (const auto& p : paths) {
+        const auto it = keyToRow.find(p.string());
+        if (it == keyToRow.end()) continue;
+        const auto item = list_->RowToItem(it->second);
+        if (!item.IsOk()) continue;
+        list_->Select(item);
+        if (!desiredCurrent.IsOk() && e.GetItem().IsOk() && item == e.GetItem()) desiredCurrent = item;
+      }
+      if (desiredCurrent.IsOk()) list_->SetCurrentItem(desiredCurrent);
+      list_->Thaw();
+    }
 
     auto* composite = new wxDataObjectComposite();
 
