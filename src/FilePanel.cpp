@@ -4309,36 +4309,20 @@ void FilePanel::OpenDebPackage(const fs::path& path) {
     return wxExecute(argv, wxEXEC_ASYNC) != 0;
   };
 
-  // Prefer a GUI package installer when available.
+  // Prefer a dedicated .deb installer UI (GDebi) when available.
   if (HasCommand("gdebi-gtk")) {
     if (!launch("gdebi-gtk")) {
       wxMessageBox("Failed to start GDebi Package Installer.", "Quarry", wxOK | wxICON_ERROR, DialogParent());
     }
     return;
   }
-  if (HasCommand("mintinstall")) {
-    if (!launch("mintinstall")) {
-      wxMessageBox("Failed to start Software Manager.", "Quarry", wxOK | wxICON_ERROR, DialogParent());
-    }
-    return;
-  }
-  if (HasCommand("gnome-software")) {
-    if (!launch("gnome-software")) {
-      wxMessageBox("Failed to start GNOME Software.", "Quarry", wxOK | wxICON_ERROR, DialogParent());
-    }
-    return;
-  }
 
-  if (!wxLaunchDefaultApplication(path.string())) {
-    wxMessageBox("No package installer was found for .deb files.\n\n"
-                 "Install one of these and try again:\n"
-                 "- gdebi\n"
-                 "- mintinstall\n"
-                 "- gnome-software",
-                 "Quarry",
-                 wxOK | wxICON_INFORMATION,
-                 DialogParent());
-  }
+  wxMessageBox("No dedicated .deb installer was found.\n\n"
+               "Install GDebi and try again:\n"
+               "  sudo apt install gdebi\n",
+               "Quarry",
+               wxOK | wxICON_INFORMATION,
+               DialogParent());
 }
 
 void FilePanel::MakeBootableUsbStick(const fs::path& isoPath) {
