@@ -140,6 +140,8 @@ private:
   void ExtractArchiveTo(const std::filesystem::path& archivePath, const std::filesystem::path& dstDir);
   bool HasCommand(const wxString& name) const;
   bool IsIsoImagePath(const std::filesystem::path& path) const;
+  bool IsDebPackagePath(const std::filesystem::path& path) const;
+  void OpenDebPackage(const std::filesystem::path& path);
   void MakeBootableUsbStick(const std::filesystem::path& isoPath);
 
   void UpdateAddressBar();

@@ -2397,6 +2397,11 @@ void FilePanel::OpenSelectedIfDir(wxDataViewEvent& event) {
     return;
   }
 
+  if (IsDebPackagePath(path)) {
+    OpenDebPackage(path);
+    return;
+  }
+
   wxLaunchDefaultApplication(path.string());
 }
 
@@ -2466,6 +2471,11 @@ void FilePanel::OpenSelection() {
   const auto path = fs::path(p);
   if (typeVar.GetString() == "Dir") {
     NavigateTo(path, /*recordHistory=*/true);
+    return;
+  }
+
+  if (IsDebPackagePath(path)) {
+    OpenDebPackage(path);
     return;
   }
 
@@ -4263,6 +4273,72 @@ bool FilePanel::IsIsoImagePath(const fs::path& path) const {
   lower.reserve(name.size());
   for (const auto c : name) lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
   return lower.size() >= 4 && lower.compare(lower.size() - 4, 4, ".iso") == 0;
+}
+
+bool FilePanel::IsDebPackagePath(const fs::path& path) const {
+  if (path.empty()) return false;
+  const auto name = path.filename().string();
+  std::string lower;
+  lower.reserve(name.size());
+  for (const auto c : name) lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+  return lower.size() >= 4 && lower.compare(lower.size() - 4, 4, ".deb") == 0;
+}
+
+void FilePanel::OpenDebPackage(const fs::path& path) {
+  const std::string s = path.string();
+  if (s.empty()) return;
+
+  // If it's a file:// URI, treat it as a normal local path.
+  if (LooksLikeUri(s) && UriScheme(s) == "file") {
+    const auto lp = UriToPath(s);
+    if (lp) return OpenDebPackage(*lp);
+  }
+
+  // Remote .deb install isn't supported yet; fall back to the default handler for the URI.
+  if (LooksLikeUri(s) && UriScheme(s) != "file") {
+    (void)wxLaunchDefaultApplication(s);
+    return;
+  }
+
+  std::error_code ec;
+  if (!fs::exists(path, ec) || fs::is_directory(path, ec)) return;
+
+  const wxString debWx = wxString::FromUTF8(path.string());
+  const auto launch = [&](const wxString& exe) -> bool {
+    const wxChar* const argv[] = {exe.wc_str(), debWx.wc_str(), nullptr};
+    return wxExecute(argv, wxEXEC_ASYNC) != 0;
+  };
+
+  // Prefer a GUI package installer when available.
+  if (HasCommand("gdebi-gtk")) {
+    if (!launch("gdebi-gtk")) {
+      wxMessageBox("Failed to start GDebi Package Installer.", "Quarry", wxOK | wxICON_ERROR, DialogParent());
+    }
+    return;
+  }
+  if (HasCommand("mintinstall")) {
+    if (!launch("mintinstall")) {
+      wxMessageBox("Failed to start Software Manager.", "Quarry", wxOK | wxICON_ERROR, DialogParent());
+    }
+    return;
+  }
+  if (HasCommand("gnome-software")) {
+    if (!launch("gnome-software")) {
+      wxMessageBox("Failed to start GNOME Software.", "Quarry", wxOK | wxICON_ERROR, DialogParent());
+    }
+    return;
+  }
+
+  if (!wxLaunchDefaultApplication(path.string())) {
+    wxMessageBox("No package installer was found for .deb files.\n\n"
+                 "Install one of these and try again:\n"
+                 "- gdebi\n"
+                 "- mintinstall\n"
+                 "- gnome-software",
+                 "Quarry",
+                 wxOK | wxICON_INFORMATION,
+                 DialogParent());
+  }
 }
 
 void FilePanel::MakeBootableUsbStick(const fs::path& isoPath) {
