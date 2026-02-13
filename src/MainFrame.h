@@ -113,6 +113,8 @@ private:
   bool panelsInitialized_{false};
   std::string pendingTopDir_{};
   std::string pendingBottomDir_{};
+  std::optional<std::filesystem::path> pendingTopSelect_{};
+  std::optional<std::filesystem::path> pendingBottomSelect_{};
 
   std::optional<int> pendingVSash_{};
   std::optional<int> pendingHSash_{};

@@ -53,6 +53,47 @@
 #endif
 
 namespace {
+struct StartupLocation final {
+  std::string dir{};
+  std::optional<std::filesystem::path> select{};
+};
+
+StartupLocation NormalizeStartupLocation(std::string s) {
+  StartupLocation out;
+  out.dir = std::move(s);
+
+  if (out.dir.empty()) return out;
+
+#ifdef QUARRY_USE_GIO
+  // Convert file:// URIs into local paths so we can handle "file passed on CLI"
+  // without showing a "Not a directory" warning.
+  if (out.dir.rfind("file://", 0) == 0) {
+    GFile* f = g_file_new_for_uri(out.dir.c_str());
+    if (f) {
+      char* p = g_file_get_path(f);
+      g_object_unref(f);
+      if (p) {
+        out.dir.assign(p);
+        g_free(p);
+      }
+    }
+  }
+#endif
+
+  std::error_code ec;
+  const std::filesystem::path p(out.dir);
+  if (!std::filesystem::exists(p, ec) || ec) return out;
+
+  ec.clear();
+  if (std::filesystem::is_directory(p, ec) && !ec) return out;
+
+  // If a file was provided, open its parent folder and select it.
+  out.select = p;
+  const auto parent = p.parent_path();
+  if (!parent.empty()) out.dir = parent.string();
+  return out;
+}
+
 class QueueVListBox final : public wxVListBox {
 public:
   explicit QueueVListBox(wxWindow* parent)
@@ -868,6 +909,17 @@ MainFrame::MainFrame(std::string topDir, std::string bottomDir)
   pendingTopDir_ = topDir.empty() ? home : std::move(topDir);
   pendingBottomDir_ = bottomDir.empty() ? pendingTopDir_ : std::move(bottomDir);
 
+  {
+    auto top = NormalizeStartupLocation(pendingTopDir_);
+    pendingTopDir_ = std::move(top.dir);
+    pendingTopSelect_ = std::move(top.select);
+  }
+  {
+    auto bottom = NormalizeStartupLocation(pendingBottomDir_);
+    pendingBottomDir_ = std::move(bottom.dir);
+    pendingBottomSelect_ = std::move(bottom.select);
+  }
+
   LoadStartupView();
 
   SetMinSize(wxSize(900, 500));
@@ -1095,6 +1147,8 @@ void MainFrame::InitPanelsIfNeeded() {
 
   if (!pendingTopDir_.empty()) top_->SetDirectory(pendingTopDir_);
   if (!pendingBottomDir_.empty()) bottom_->SetDirectory(pendingBottomDir_);
+  if (pendingTopSelect_) top_->SelectAndRevealPaths({*pendingTopSelect_});
+  if (pendingBottomSelect_) bottom_->SelectAndRevealPaths({*pendingBottomSelect_});
 
   SetActivePane(activePane_);
   Layout();

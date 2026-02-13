@@ -34,6 +34,7 @@ public:
   struct Entry {
     std::string name;
     bool isDir{false};
+    std::string typeLabel;
     std::uintmax_t size{0};
     std::string modified;
     std::string fullPath;

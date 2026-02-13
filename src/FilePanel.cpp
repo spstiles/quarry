@@ -19,6 +19,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <system_error>
+#include <unistd.h>
+#include <limits.h>
 
 #include <wx/button.h>
 #include <wx/dataview.h>
@@ -34,6 +36,7 @@
 #include <wx/dataobj.h>
 #include <wx/event.h>
 #include <wx/imaglist.h>
+#include <wx/listbox.h>
 #include <wx/menu.h>
 #include <wx/msgdlg.h>
 #include <wx/process.h>
@@ -89,6 +92,39 @@ public:
 
 std::string PercentDecode(std::string s);
 std::string TrimRight(std::string s);
+
+bool DebugOpenEnabled() {
+  const char* v = std::getenv("QUARRY_DEBUG_OPEN");
+  return v && *v && std::string(v) != "0";
+}
+
+std::string SelfExePath() {
+  std::array<char, PATH_MAX> buf{};
+  const ssize_t n = readlink("/proc/self/exe", buf.data(), buf.size() - 1);
+  if (n <= 0) return {};
+  buf[static_cast<size_t>(n)] = '\0';
+  return std::string(buf.data());
+}
+
+bool IsSelfAppInfo(GAppInfo* app) {
+  if (!app) return false;
+  const char* id = g_app_info_get_id(app);
+  if (id && std::string(id) == "com.spstiles.quarry.desktop") return true;
+
+  const char* exec = g_app_info_get_executable(app);
+  if (!exec || !*exec) return false;
+
+  const std::string self = SelfExePath();
+  if (!self.empty() && self == exec) return true;
+
+  // Conservative fallback: if the app id contains "quarry" and the executable is
+  // exactly "quarry", treat it as us to avoid recursion.
+  if (id && std::string(id).find("quarry") != std::string::npos && std::string(exec) == "quarry") {
+    return true;
+  }
+
+  return false;
+}
 
 bool LooksLikeUri(const std::string& s) {
   const auto pos = s.find("://");
@@ -402,6 +438,401 @@ std::optional<fs::path> UriToPath(const std::string& uri) {
   if (decoded.empty()) return std::nullopt;
   if (decoded[0] != '/') return std::nullopt;
   return fs::path(decoded);
+}
+
+#ifdef QUARRY_USE_GIO
+std::string DescribeContentType(const std::string& contentType) {
+  if (contentType.empty()) return {};
+  char* desc = g_content_type_get_description(contentType.c_str());
+  if (desc) {
+    std::string out(desc);
+    g_free(desc);
+    if (!out.empty()) {
+      // Some systems return an unhelpful description like "<mime> type".
+      // Prefer an extension-based label in that case.
+      auto lower = out;
+      for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      const bool endsWithType = lower.size() >= 5 && lower.rfind(" type") == (lower.size() - 5);
+      const bool looksLikeMime = (out.find('/') != std::string::npos) && (out.find(' ') == std::string::npos);
+      if (!endsWithType && !looksLikeMime) return out;
+    }
+  }
+  return {};
+}
+
+std::string DescribeExtensionType(const fs::path& path, bool isDir);
+
+std::string DescribeGFileTypeLabel(GFile* file, const fs::path& fallbackPath, bool isDir) {
+  if (isDir) return "Folder";
+  if (!file) return DescribeExtensionType(fallbackPath, /*isDir=*/false);
+
+  GError* err = nullptr;
+  GFileInfo* info = g_file_query_info(file,
+                                      "standard::content-type",
+                                      G_FILE_QUERY_INFO_NONE,
+                                      /*cancellable=*/nullptr,
+                                      &err);
+  if (!info) {
+    if (err) g_error_free(err);
+    return DescribeExtensionType(fallbackPath, /*isDir=*/false);
+  }
+  const char* ct = g_file_info_get_content_type(info);
+  const std::string ctStr = ct ? ct : "";
+  g_object_unref(info);
+
+  auto label = DescribeContentType(ctStr);
+  if (label.empty()) label = DescribeExtensionType(fallbackPath, /*isDir=*/false);
+  if (label.empty()) label = "File";
+  return label;
+}
+
+bool LaunchGFileWithDefaultApp(GFile* file, wxWindow* parent, const std::string& fallbackLabel) {
+  if (!file) return false;
+
+  GError* err = nullptr;
+  char* fileUri = g_file_get_uri(file);
+  const std::string fileUriStr = fileUri ? fileUri : "";
+  if (fileUri) g_free(fileUri);
+
+  const bool isFileUri = fileUriStr.rfind("file://", 0) == 0;
+
+  const auto tryLaunch = [&](GAppInfo* app) -> bool {
+    if (!app) return false;
+    if (isFileUri && IsSelfAppInfo(app)) {
+      if (DebugOpenEnabled()) std::fprintf(stderr, "[quarry] open: skipping self app\n");
+      return false;
+    }
+    if (DebugOpenEnabled()) {
+      const char* appId = g_app_info_get_id(app);
+      std::fprintf(stderr, "[quarry] open: trying app=%s\n", appId ? appId : "(unknown)");
+    }
+
+    gboolean ok = FALSE;
+    if (!fileUriStr.empty()) {
+      GList* uris = nullptr;
+      uris = g_list_append(uris, g_strdup(fileUriStr.c_str()));
+      ok = g_app_info_launch_uris(app, uris, /*context=*/nullptr, &err);
+      g_list_free_full(uris, g_free);
+      if (DebugOpenEnabled()) {
+        std::fprintf(stderr, "[quarry] open: launch_uris ok=%d uri=%s\n", ok ? 1 : 0, fileUriStr.c_str());
+      }
+    } else {
+      GList* files = nullptr;
+      files = g_list_append(files, file);
+      ok = g_app_info_launch(app, files, /*context=*/nullptr, &err);
+      g_list_free(files);
+      if (DebugOpenEnabled()) {
+        std::fprintf(stderr, "[quarry] open: launch_files ok=%d\n", ok ? 1 : 0);
+      }
+    }
+    return ok;
+  };
+
+  // Best effort: ask GIO for a handler for this specific file.
+  if (GAppInfo* handler = g_file_query_default_handler(file, /*cancellable=*/nullptr, &err)) {
+    const bool ok = tryLaunch(handler);
+    g_object_unref(handler);
+    if (ok) return true;
+  }
+
+  std::string contentType;
+  {
+    GFileInfo* info = g_file_query_info(file,
+                                        "standard::content-type",
+                                        G_FILE_QUERY_INFO_NONE,
+                                        /*cancellable=*/nullptr,
+                                        &err);
+    if (info) {
+      if (const char* ct = g_file_info_get_content_type(info)) contentType = ct;
+      g_object_unref(info);
+    } else if (err) {
+      g_error_free(err);
+      err = nullptr;
+    }
+  }
+
+  auto tryContentType = [&](const std::string& ct) -> bool {
+    if (ct.empty()) return false;
+    if (DebugOpenEnabled()) std::fprintf(stderr, "[quarry] open: content-type=%s\n", ct.c_str());
+
+    if (GAppInfo* app = g_app_info_get_default_for_type(ct.c_str(), /*must_support_uris=*/FALSE)) {
+      const bool ok = tryLaunch(app);
+      g_object_unref(app);
+      if (ok) return true;
+    }
+
+    // If no default exists, Nemo/GIO will often still have a recommended list.
+    if (GList* rec = g_app_info_get_recommended_for_type(ct.c_str())) {
+      for (GList* it = rec; it; it = it->next) {
+        auto* app = static_cast<GAppInfo*>(it->data);
+        if (!app) continue;
+        if (tryLaunch(app)) {
+          g_list_free_full(rec, g_object_unref);
+          return true;
+        }
+      }
+      g_list_free_full(rec, g_object_unref);
+    }
+
+    // Last resort: try any handler for the type.
+    if (GList* all = g_app_info_get_all_for_type(ct.c_str())) {
+      for (GList* it = all; it; it = it->next) {
+        auto* app = static_cast<GAppInfo*>(it->data);
+        if (!app) continue;
+        if (tryLaunch(app)) {
+          g_list_free_full(all, g_object_unref);
+          return true;
+        }
+      }
+      g_list_free_full(all, g_object_unref);
+    }
+
+    return false;
+  };
+
+  if (tryContentType(contentType)) return true;
+
+  // Heuristic fallback: if we got a very specific spreadsheet type with no
+  // association, try broader spreadsheet types that are commonly mapped.
+  if (contentType == "application/vnd.ms-excel.sheet.macroEnabled.12") {
+    if (tryContentType("application/vnd.ms-excel")) return true;
+    if (tryContentType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")) return true;
+  }
+
+  // Fall back to URI-based launch.
+  // Important: do not use file:// URI scheme handler fallback for local files, or we can
+  // end up recursively launching Quarry if it is registered as x-scheme-handler/file.
+  if (!fileUriStr.empty() && !isFileUri) {
+    if (DebugOpenEnabled()) {
+      std::fprintf(stderr, "[quarry] open: uri-fallback=%s\n", fileUriStr.c_str());
+    }
+    const gboolean ok = g_app_info_launch_default_for_uri(fileUriStr.c_str(), /*context=*/nullptr, &err);
+    if (ok) return true;
+  }
+
+  wxString errWx = "Unable to open this item.";
+  if (err && err->message) errWx = wxString::FromUTF8(err->message);
+  if (err) g_error_free(err);
+  wxMessageBox(wxString::Format("Failed to open:\n\n%s\n\n%s",
+                                wxString::FromUTF8(fallbackLabel).c_str(),
+                                errWx.c_str()),
+               "Quarry", wxOK | wxICON_ERROR, parent);
+  return false;
+}
+
+struct OpenWithApp final {
+  GAppInfo* app{nullptr};
+  std::string label{};
+  bool isDefault{false};
+};
+
+std::vector<OpenWithApp> CollectOpenWithApps(const std::string& contentType, bool allowSelf) {
+  std::vector<OpenWithApp> out;
+  if (contentType.empty()) return out;
+
+  std::unordered_set<std::string> seen;
+  auto addApp = [&](GAppInfo* app, bool isDefault) {
+    if (!app) return;
+    if (!allowSelf && IsSelfAppInfo(app)) return;
+
+    const char* id = g_app_info_get_id(app);
+    const char* exe = g_app_info_get_executable(app);
+    std::string key;
+    if (id && *id) key = std::string("id:") + id;
+    else if (exe && *exe) key = std::string("exe:") + exe;
+    if (!key.empty() && seen.find(key) != seen.end()) return;
+    if (!key.empty()) seen.insert(key);
+
+    const char* dn = g_app_info_get_display_name(app);
+    const char* nm = g_app_info_get_name(app);
+    std::string label = dn ? dn : (nm ? nm : "(unnamed)");
+    if (id && *id) label += "  [" + std::string(id) + "]";
+
+    g_object_ref(app);
+    out.push_back(OpenWithApp{.app = app, .label = std::move(label), .isDefault = isDefault});
+  };
+
+  if (GAppInfo* def = g_app_info_get_default_for_type(contentType.c_str(), /*must_support_uris=*/FALSE)) {
+    addApp(def, /*isDefault=*/true);
+    g_object_unref(def);
+  }
+
+  if (GList* rec = g_app_info_get_recommended_for_type(contentType.c_str())) {
+    for (GList* it = rec; it; it = it->next) addApp(static_cast<GAppInfo*>(it->data), /*isDefault=*/false);
+    g_list_free_full(rec, g_object_unref);
+  }
+
+  if (GList* all = g_app_info_get_all_for_type(contentType.c_str())) {
+    for (GList* it = all; it; it = it->next) addApp(static_cast<GAppInfo*>(it->data), /*isDefault=*/false);
+    g_list_free_full(all, g_object_unref);
+  }
+
+  std::stable_sort(out.begin(), out.end(), [](const OpenWithApp& a, const OpenWithApp& b) {
+    return a.isDefault && !b.isDefault;
+  });
+  return out;
+}
+
+struct OpenWithChoice final {
+  int selection{-1};
+  bool setDefault{false};
+};
+
+std::optional<OpenWithChoice> PromptOpenWith(wxWindow* parent,
+                                            const std::string& contentType,
+                                            const std::vector<OpenWithApp>& apps) {
+  if (!parent) return std::nullopt;
+  if (apps.empty()) return std::nullopt;
+
+  wxDialog dlg(parent, wxID_ANY, "Open With...");
+  auto* root = new wxBoxSizer(wxVERTICAL);
+
+  root->Add(new wxStaticText(&dlg,
+                             wxID_ANY,
+                             wxString::Format("Open with (%s):", wxString::FromUTF8(contentType).c_str())),
+            0,
+            wxALL,
+            10);
+
+  wxArrayString choices;
+  choices.reserve(apps.size());
+  for (const auto& a : apps) choices.Add(wxString::FromUTF8(a.label));
+
+  auto* list = new wxListBox(&dlg, wxID_ANY, wxDefaultPosition, wxSize(520, 260), choices);
+  list->SetSelection(0);
+  root->Add(list, 1, wxEXPAND | wxLEFT | wxRIGHT, 10);
+
+  auto* setDefault = new wxCheckBox(&dlg, wxID_ANY, "Set as default for this file type");
+  setDefault->SetValue(false);
+  root->Add(setDefault, 0, wxALL, 10);
+
+  auto* btns = dlg.CreateButtonSizer(wxOK | wxCANCEL);
+  if (btns) root->Add(btns, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+
+  dlg.SetSizerAndFit(root);
+  dlg.CentreOnParent();
+
+  if (dlg.ShowModal() != wxID_OK) return std::nullopt;
+
+  OpenWithChoice out;
+  out.selection = list->GetSelection();
+  out.setDefault = setDefault->GetValue();
+  if (out.selection < 0 || static_cast<size_t>(out.selection) >= apps.size()) return std::nullopt;
+  return out;
+}
+
+std::string DescribeLocalPathType(const fs::path& path, bool isDir) {
+  if (isDir) return "Folder";
+  if (path.empty()) return "File";
+  GError* err = nullptr;
+  GFile* file = g_file_new_for_path(path.string().c_str());
+  if (!file) return "File";
+  GFileInfo* info = g_file_query_info(file,
+                                      "standard::content-type",
+                                      G_FILE_QUERY_INFO_NONE,
+                                      /*cancellable=*/nullptr,
+                                      &err);
+  g_object_unref(file);
+  if (!info) {
+    if (err) g_error_free(err);
+    return "File";
+  }
+  const char* ct = g_file_info_get_content_type(info);
+  const std::string ctStr = ct ? ct : "";
+  g_object_unref(info);
+  auto label = DescribeContentType(ctStr);
+  if (label.empty()) label = DescribeExtensionType(path, /*isDir=*/false);
+  if (label.empty()) label = "File";
+  return label;
+}
+
+void OpenDefaultHandlerForUri(const std::string& uri, wxWindow* parent) {
+  if (uri.empty()) return;
+  GFile* file = g_file_new_for_uri(uri.c_str());
+  if (!file) return;
+  (void)LaunchGFileWithDefaultApp(file, parent, uri);
+  g_object_unref(file);
+}
+
+void OpenDefaultHandlerForLocalPath(const fs::path& path, wxWindow* parent) {
+  if (path.empty()) return;
+  GFile* file = g_file_new_for_path(path.string().c_str());
+  if (!file) return;
+  (void)LaunchGFileWithDefaultApp(file, parent, path.string());
+  g_object_unref(file);
+}
+#endif
+
+std::string DescribeExtensionType(const fs::path& path, bool isDir) {
+  if (isDir) return "Folder";
+  auto ext = path.extension().string();
+  if (!ext.empty() && ext.front() == '.') ext.erase(ext.begin());
+  if (ext.empty()) return "File";
+  for (auto& c : ext) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  return ext + " file";
+}
+
+struct ActivationDecision final {
+  enum class Action { Navigate, OpenLocalPath, OpenUri };
+  Action action{Action::OpenLocalPath};
+  fs::path localPath{};
+  std::string uri{};
+};
+
+std::optional<ActivationDecision> DecideActivation(const std::string& fullPathOrUri) {
+  if (fullPathOrUri.empty()) return std::nullopt;
+
+  // Normalize file:// URIs to local filesystem paths when possible.
+  if (LooksLikeUri(fullPathOrUri)) {
+    const auto scheme = UriScheme(fullPathOrUri);
+    if (scheme == "file") {
+      if (const auto p = UriToPath(fullPathOrUri)) {
+        return DecideActivation(p->string());
+      }
+    }
+
+#ifdef QUARRY_USE_GIO
+    if (IsGioLocationUri(fullPathOrUri)) {
+      GFile* file = g_file_new_for_uri(fullPathOrUri.c_str());
+      if (file) {
+        const auto type = g_file_query_file_type(file, G_FILE_QUERY_INFO_NONE, /*cancellable=*/nullptr);
+        g_object_unref(file);
+        const bool isDir = type == G_FILE_TYPE_DIRECTORY || type == G_FILE_TYPE_MOUNTABLE ||
+                           type == G_FILE_TYPE_SHORTCUT;
+        if (isDir) {
+          ActivationDecision out;
+          out.action = ActivationDecision::Action::Navigate;
+          out.uri = fullPathOrUri;
+          return out;
+        }
+      }
+      ActivationDecision out;
+      out.action = ActivationDecision::Action::OpenUri;
+      out.uri = fullPathOrUri;
+      return out;
+    }
+#endif
+
+    // Unknown scheme: best effort, treat as openable item.
+    ActivationDecision out;
+    out.action = ActivationDecision::Action::OpenUri;
+    out.uri = fullPathOrUri;
+    return out;
+  }
+
+  // Local filesystem path.
+  const fs::path path(fullPathOrUri);
+  std::error_code ec;
+  const bool isDir = fs::is_directory(path, ec) && !ec;
+  ActivationDecision out;
+  if (isDir) {
+    out.action = ActivationDecision::Action::Navigate;
+    out.localPath = path;
+  } else {
+    out.action = ActivationDecision::Action::OpenLocalPath;
+    out.localPath = path;
+  }
+  return out;
 }
 
 std::optional<fs::path> ReadXdgUserDir(const std::string& key) {
@@ -801,9 +1232,9 @@ std::vector<FilePanel::Entry> ListGioLocation(const std::string& uri, std::strin
   }
 
   GError* error = nullptr;
-  GFileEnumerator* en = g_file_enumerate_children(
+ GFileEnumerator* en = g_file_enumerate_children(
       file,
-      "standard::name,standard::display-name,standard::edit-name,standard::type,standard::size,standard::target-uri,time::modified",
+      "standard::name,standard::display-name,standard::edit-name,standard::content-type,standard::type,standard::size,standard::target-uri,time::modified",
       G_FILE_QUERY_INFO_NONE,
       nullptr,
       &error);
@@ -833,12 +1264,14 @@ std::vector<FilePanel::Entry> ListGioLocation(const std::string& uri, std::strin
     const char* displayName = g_file_info_get_display_name(info);
     const char* editName =
         g_file_info_get_attribute_string(info, G_FILE_ATTRIBUTE_STANDARD_EDIT_NAME);
+    const char* ct = g_file_info_get_content_type(info);
     const auto ftype = g_file_info_get_file_type(info);
     // Treat only known navigable container-like types as directories.
     // In particular, G_FILE_TYPE_SPECIAL is often not a directory and attempting to
     // enumerate it yields "Not a directory".
     const bool isDir = ftype == G_FILE_TYPE_DIRECTORY || ftype == G_FILE_TYPE_MOUNTABLE ||
                        ftype == G_FILE_TYPE_SHORTCUT;
+    std::string typeLabel = isDir ? "Folder" : DescribeContentType(ct ? ct : "");
 
     std::uintmax_t size = 0;
     if (!isDir) size = static_cast<std::uintmax_t>(g_file_info_get_size(info));
@@ -864,11 +1297,18 @@ std::vector<FilePanel::Entry> ListGioLocation(const std::string& uri, std::strin
       if (childUri) fullPath = childUri;
     }
 
+    if (!isDir && typeLabel.empty()) {
+      const std::string display = editName ? editName : (displayName ? displayName : (name ? name : ""));
+      typeLabel = DescribeExtensionType(fs::path(display), /*isDir=*/false);
+    }
+    if (!isDir && typeLabel.empty()) typeLabel = "File";
+
     entries.push_back(FilePanel::Entry{
         // Prefer a user-facing label. Some SMB backends return 8.3 short names for standard::name.
         // edit-name is often the best "typed" name; display-name is localized/presented.
         .name = editName ? editName : (displayName ? displayName : (name ? name : "")),
         .isDir = isDir,
+        .typeLabel = typeLabel,
         .size = size,
         .modified = modified,
         .fullPath = fullPath,
@@ -891,7 +1331,7 @@ std::vector<FilePanel::Entry> ListGioLocation(const std::string& uri, std::strin
   // Prefer "gio list" for remote locations (smb://, sftp://, etc.).
   // We include --hidden to match local directory listing behavior.
   const std::string cmd =
-      "gio list --hidden -l -u -d -a standard::name,standard::display-name,standard::edit-name,time::modified " +
+      "gio list --hidden -l -u -d -a standard::name,standard::display-name,standard::edit-name,standard::content-type,time::modified " +
       ShellQuote(uri) + " 2>&1";
 
   FILE* pipe = popen(cmd.c_str(), "r");
@@ -968,6 +1408,7 @@ std::vector<FilePanel::Entry> ListGioLocation(const std::string& uri, std::strin
     entries.push_back(FilePanel::Entry{
         .name = name,
         .isDir = isDir,
+        .typeLabel = DescribeExtensionType(fs::path(name), isDir),
         .size = size,
         .modified = modified,
         .fullPath = itemUri,
@@ -1034,6 +1475,7 @@ void SetRowName(wxDataViewListCtrl* list, unsigned int row, const std::string& n
 
 enum MenuId : int {
   ID_CTX_OPEN = wxID_HIGHEST + 200,
+  ID_CTX_OPEN_WITH,
   ID_CTX_REFRESH,
   ID_CTX_EXTRACT_HERE,
   ID_CTX_EXTRACT_TO,
@@ -1089,13 +1531,13 @@ std::vector<FilePanel::Entry> ListDir(const fs::path& dir, std::string* errorMes
   {
     GFile* file = g_file_new_for_path(dir.string().c_str());
     if (file) {
-      GError* error = nullptr;
-      GFileEnumerator* en = g_file_enumerate_children(
-          file,
-          "standard::name,standard::display-name,standard::edit-name,standard::type,standard::size,time::modified",
-          G_FILE_QUERY_INFO_NONE,
-          nullptr,
-          &error);
+	      GError* error = nullptr;
+	      GFileEnumerator* en = g_file_enumerate_children(
+	          file,
+	          "standard::name,standard::display-name,standard::edit-name,standard::content-type,standard::type,standard::size,time::modified",
+	          G_FILE_QUERY_INFO_NONE,
+	          nullptr,
+	          &error);
 
       if (en) {
         for (;;) {
@@ -1119,31 +1561,39 @@ std::vector<FilePanel::Entry> ListDir(const fs::path& dir, std::string* errorMes
             modified = FormatUnixSeconds(static_cast<long long>(unixSec));
           }
 
-          const char* displayName = g_file_info_get_display_name(info);
-          const char* editName =
-              g_file_info_get_attribute_string(info, G_FILE_ATTRIBUTE_STANDARD_EDIT_NAME);
-          const char* name = g_file_info_get_name(info);
+	          const char* displayName = g_file_info_get_display_name(info);
+	          const char* editName =
+	              g_file_info_get_attribute_string(info, G_FILE_ATTRIBUTE_STANDARD_EDIT_NAME);
+	          const char* name = g_file_info_get_name(info);
+	          const char* ct = g_file_info_get_content_type(info);
+	          std::string typeLabel = isDir ? "Folder" : DescribeContentType(ct ? ct : "");
 
-          std::string fullPath;
-          if (name && *name) {
-            if (GFile* child = g_file_get_child(file, name)) {
-              if (char* p = g_file_get_path(child)) {
-                fullPath = p;
+	          std::string fullPath;
+	          if (name && *name) {
+	            if (GFile* child = g_file_get_child(file, name)) {
+	              if (char* p = g_file_get_path(child)) {
+	                fullPath = p;
                 g_free(p);
               } else {
                 fullPath = (dir / fs::path(name)).string();
               }
-              g_object_unref(child);
-            }
-          }
+	              g_object_unref(child);
+	            }
+	          }
 
-          entries.push_back(FilePanel::Entry{
-              .name = editName ? editName : (displayName ? displayName : (name ? name : "")),
-              .isDir = isDir,
-              .size = size,
-              .modified = modified,
-              .fullPath = fullPath,
-          });
+	          if (!isDir && typeLabel.empty() && !fullPath.empty()) {
+	            typeLabel = DescribeExtensionType(fs::path(fullPath), /*isDir=*/false);
+	          }
+	          if (!isDir && typeLabel.empty()) typeLabel = "File";
+
+		          entries.push_back(FilePanel::Entry{
+		              .name = editName ? editName : (displayName ? displayName : (name ? name : "")),
+		              .isDir = isDir,
+		              .typeLabel = typeLabel,
+	              .size = size,
+	              .modified = modified,
+	              .fullPath = fullPath,
+	          });
 
           g_object_unref(info);
         }
@@ -1179,14 +1629,15 @@ std::vector<FilePanel::Entry> ListDir(const fs::path& dir, std::string* errorMes
     }
 
     const auto filename = de.path().filename().string();
-    entries.push_back(FilePanel::Entry{
-        .name = filename,
-        .isDir = isDir,
-        .size = size,
-        .modified = FormatFileTime(de.last_write_time(ec)),
-        .fullPath = de.path().string(),
-    });
-  }
+	    entries.push_back(FilePanel::Entry{
+	        .name = filename,
+	        .isDir = isDir,
+	        .typeLabel = DescribeExtensionType(de.path(), isDir),
+	        .size = size,
+	        .modified = FormatFileTime(de.last_write_time(ec)),
+	        .fullPath = de.path().string(),
+	    });
+	  }
 
   return entries;
 }
@@ -2384,25 +2835,43 @@ void FilePanel::OpenSelectedIfDir(wxDataViewEvent& event) {
   const int row = list_->ItemToRow(event.GetItem());
   if (row == wxNOT_FOUND) return;
 
-  wxVariant typeVar;
-  list_->GetValue(typeVar, row, COL_TYPE);
   wxVariant pathVar;
   list_->GetValue(pathVar, row, COL_FULLPATH);
   const auto p = pathVar.GetString().ToStdString();
   if (p.empty()) return;
 
-  const auto path = fs::path(p);
-  if (typeVar.GetString() == "Dir") {
-    NavigateTo(path, /*recordHistory=*/true);
+  if (DebugOpenEnabled()) {
+    std::fprintf(stderr, "[quarry] activated: %s\n", p.c_str());
+  }
+
+  const auto dec = DecideActivation(p);
+  if (!dec) return;
+
+  if (dec->action == ActivationDecision::Action::Navigate) {
+    if (!dec->uri.empty()) NavigateTo(fs::path(dec->uri), /*recordHistory=*/true);
+    else NavigateTo(dec->localPath, /*recordHistory=*/true);
     return;
   }
 
-  if (IsDebPackagePath(path)) {
-    OpenDebPackage(path);
+  if (dec->action == ActivationDecision::Action::OpenLocalPath) {
+    if (IsDebPackagePath(dec->localPath)) {
+      OpenDebPackage(dec->localPath);
+      return;
+    }
+#ifdef QUARRY_USE_GIO
+    OpenDefaultHandlerForLocalPath(dec->localPath, DialogParent());
+#else
+    wxLaunchDefaultApplication(dec->localPath.string());
+#endif
     return;
   }
 
-  wxLaunchDefaultApplication(path.string());
+  // URI case
+#ifdef QUARRY_USE_GIO
+  OpenDefaultHandlerForUri(dec->uri, DialogParent());
+#else
+  wxLaunchDefaultApplication(dec->uri);
+#endif
 }
 
 void FilePanel::OnTreeSelectionChanged() {
@@ -2460,26 +2929,39 @@ void FilePanel::OpenSelection() {
   }
   if (row == wxNOT_FOUND) return;
 
-  wxVariant typeVar;
-  list_->GetValue(typeVar, row, COL_TYPE);
-
   wxVariant pathVar;
   list_->GetValue(pathVar, row, COL_FULLPATH);
   const auto p = pathVar.GetString().ToStdString();
   if (p.empty()) return;
 
-  const auto path = fs::path(p);
-  if (typeVar.GetString() == "Dir") {
-    NavigateTo(path, /*recordHistory=*/true);
+  const auto dec = DecideActivation(p);
+  if (!dec) return;
+
+  if (dec->action == ActivationDecision::Action::Navigate) {
+    if (!dec->uri.empty()) NavigateTo(fs::path(dec->uri), /*recordHistory=*/true);
+    else NavigateTo(dec->localPath, /*recordHistory=*/true);
     return;
   }
 
-  if (IsDebPackagePath(path)) {
-    OpenDebPackage(path);
+  if (dec->action == ActivationDecision::Action::OpenLocalPath) {
+    if (IsDebPackagePath(dec->localPath)) {
+      OpenDebPackage(dec->localPath);
+      return;
+    }
+#ifdef QUARRY_USE_GIO
+    OpenDefaultHandlerForLocalPath(dec->localPath, DialogParent());
+#else
+    wxLaunchDefaultApplication(dec->localPath.string());
+#endif
     return;
   }
 
-  wxLaunchDefaultApplication(path.string());
+  // URI case
+#ifdef QUARRY_USE_GIO
+  OpenDefaultHandlerForUri(dec->uri, DialogParent());
+#else
+  wxLaunchDefaultApplication(dec->uri);
+#endif
 }
 
 bool FilePanel::LoadDirectory(const fs::path& dir) {
@@ -2505,15 +2987,22 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
       std::string modified;
       ec.clear();
       const auto ft = fs::last_write_time(p, ec);
-      if (!ec) modified = FormatFileTime(ft);
-      entries.push_back(Entry{
-          .name = p.filename().string(),
-          .isDir = isDir,
-          .size = size,
-          .modified = modified,
-          .fullPath = p.string(),
-      });
-    }
+	      if (!ec) modified = FormatFileTime(ft);
+	      const std::string typeLabel =
+#ifdef QUARRY_USE_GIO
+	          DescribeLocalPathType(p, isDir);
+#else
+	          DescribeExtensionType(p, isDir);
+#endif
+	      entries.push_back(Entry{
+	          .name = p.filename().string(),
+	          .isDir = isDir,
+	          .typeLabel = typeLabel,
+	          .size = size,
+	          .modified = modified,
+	          .fullPath = p.string(),
+	      });
+	    }
 
     SortEntries(entries);
     Populate(entries);
@@ -2692,6 +3181,20 @@ bool FilePanel::LoadDirectory(const fs::path& dir) {
   const auto resolved = ec ? dir : canonical;
 
   if (!fs::exists(resolved, ec) || !fs::is_directory(resolved, ec)) {
+    // If a file was passed to NavigateTo/SetDirectory (e.g. from an external
+    // opener or CLI), treat it as an "open" request rather than warning.
+    if (fs::exists(resolved, ec) && !fs::is_directory(resolved, ec)) {
+      if (IsDebPackagePath(resolved)) {
+        OpenDebPackage(resolved);
+      } else {
+#ifdef QUARRY_USE_GIO
+        OpenDefaultHandlerForLocalPath(resolved, DialogParent());
+#else
+        wxLaunchDefaultApplication(resolved.string());
+#endif
+      }
+      return false;
+    }
     const wxString resolvedWx = wxString::FromUTF8(resolved.string());
     wxMessageBox(wxString::Format("Not a directory:\n\n%s", resolvedWx.c_str()), "Quarry",
                  wxOK | wxICON_WARNING, DialogParent());
@@ -2784,15 +3287,18 @@ void FilePanel::ShowProperties() {
     return;
   }
 
-  const auto path = selected[0];
-  std::error_code ec;
-  const bool isDir = fs::is_directory(path, ec);
-  const auto size = (!ec && !isDir) ? fs::file_size(path, ec) : 0;
-  const auto type = isDir ? "Directory" : "File";
+	  const auto path = selected[0];
+	  std::error_code ec;
+	  const bool isDir = fs::is_directory(path, ec);
+	  const auto size = (!ec && !isDir) ? fs::file_size(path, ec) : 0;
+	  std::string type = isDir ? "Directory" : "File";
+#ifdef QUARRY_USE_GIO
+	  if (!isDir) type = DescribeLocalPathType(path, /*isDir=*/false);
+#endif
 
-  wxString msg;
-  msg << "Name: " << path.filename().string() << "\n"
-      << "Type: " << type << "\n"
+	  wxString msg;
+	  msg << "Name: " << path.filename().string() << "\n"
+	      << "Type: " << type << "\n"
       << "Path: " << path.string() << "\n";
   if (!isDir) {
     msg << "Size: " << HumanSize(size) << "\n";
@@ -2967,8 +3473,8 @@ void FilePanel::SortEntries(std::vector<Entry>& entries) const {
         break;
       }
       case SortColumn::Type: {
-        const auto at = a.isDir ? "dir" : "file";
-        const auto bt = b.isDir ? "dir" : "file";
+        const auto at = icase(a.typeLabel);
+        const auto bt = icase(b.typeLabel);
         rel = (at < bt) ? -1 : (at > bt ? 1 : 0);
         break;
       }
@@ -3131,14 +3637,16 @@ void FilePanel::Populate(const std::vector<Entry>& entries) {
 	    wxDataViewIconText iconText(wxString::FromUTF8(e.name), bundle);
 	    wxVariant nameVar;
 	    nameVar << iconText;
-	    cols.push_back(nameVar);
-	    cols.push_back(wxVariant(e.isDir ? "" : HumanSize(e.size)));
-	    cols.push_back(wxVariant(e.isDir ? "Dir" : "File"));
-	    cols.push_back(wxVariant(e.modified));
-	    const auto full = !e.fullPath.empty() ? e.fullPath : (currentDir_ / e.name).string();
-	    cols.push_back(wxVariant(full));
-	    list_->AppendItem(cols);
-	  }
+		    cols.push_back(nameVar);
+		    cols.push_back(wxVariant(e.isDir ? "" : HumanSize(e.size)));
+		    const wxString typeWx =
+		        wxString::FromUTF8(e.typeLabel.empty() ? (e.isDir ? "Folder" : "File") : e.typeLabel);
+		    cols.push_back(wxVariant(typeWx));
+		    cols.push_back(wxVariant(e.modified));
+		    const auto full = !e.fullPath.empty() ? e.fullPath : (currentDir_ / e.name).string();
+		    cols.push_back(wxVariant(full));
+		    list_->AppendItem(cols);
+		  }
   list_->Thaw();
 }
 
@@ -4143,6 +4651,7 @@ void FilePanel::ShowListContextMenu(const wxDataViewItem& contextItem,
 
   wxMenu menu;
   menu.Append(ID_CTX_OPEN, "Open");
+  menu.Append(ID_CTX_OPEN_WITH, "Open With...");
   menu.Append(ID_CTX_REFRESH, "Refresh");
   menu.AppendSeparator();
   menu.Append(ID_CTX_EXTRACT_HERE, "Extract Here");
@@ -4165,6 +4674,11 @@ void FilePanel::ShowListContextMenu(const wxDataViewItem& contextItem,
   const auto selected = GetSelectedPaths();
   const bool hasSelection = !selected.empty();
   const bool single = selected.size() == 1;
+  bool canOpenWith = false;
+  if (single) {
+    const auto dec = DecideActivation(selected[0].string());
+    canOpenWith = dec && dec->action != ActivationDecision::Action::Navigate;
+  }
   const bool allowCopyPaste = listingMode_ == ListingMode::Directory || listingMode_ == ListingMode::Gio;
   const bool allowFsOps = listingMode_ == ListingMode::Directory;
   bool allowRemoteOps = false;
@@ -4185,6 +4699,7 @@ void FilePanel::ShowListContextMenu(const wxDataViewItem& contextItem,
   const bool canMakeBootable = allowFsOps && single && IsIsoImagePath(selected[0]);
   const bool canSaveShare = (listingMode_ == ListingMode::Gio) && single;
   menu.Enable(ID_CTX_OPEN, hasSelection);
+  menu.Enable(ID_CTX_OPEN_WITH, canOpenWith);
   menu.Enable(ID_CTX_REFRESH, true);
   menu.Enable(ID_CTX_EXTRACT_HERE, canExtract);
   menu.Enable(ID_CTX_EXTRACT_TO, canExtract);
@@ -4199,6 +4714,124 @@ void FilePanel::ShowListContextMenu(const wxDataViewItem& contextItem,
   menu.Enable(ID_CTX_PASTE, allowCopyPaste && g_clipboard && !g_clipboard->paths.empty());
 
   menu.Bind(wxEVT_MENU, [this](wxCommandEvent&) { OpenSelection(); }, ID_CTX_OPEN);
+  menu.Bind(wxEVT_MENU, [this, selected](wxCommandEvent&) {
+    if (selected.size() != 1) return;
+#ifndef QUARRY_USE_GIO
+    wxMessageBox("Open With... is not available here (built without GIO).",
+                 "Open With...",
+                 wxOK | wxICON_INFORMATION,
+                 DialogParent());
+    return;
+#else
+    const std::string target = selected[0].string();
+    const auto dec = DecideActivation(target);
+    if (!dec || dec->action == ActivationDecision::Action::Navigate) return;
+
+    std::string displayLabel = target;
+    GFile* file = nullptr;
+    bool isLocalFile = false;
+    if (dec->action == ActivationDecision::Action::OpenLocalPath) {
+      displayLabel = dec->localPath.string();
+      file = g_file_new_for_path(displayLabel.c_str());
+      isLocalFile = true;
+    } else {
+      displayLabel = dec->uri;
+      file = g_file_new_for_uri(displayLabel.c_str());
+    }
+    if (!file) return;
+
+    GError* err = nullptr;
+    std::string contentType;
+    if (GFileInfo* info = g_file_query_info(file,
+                                            "standard::content-type",
+                                            G_FILE_QUERY_INFO_NONE,
+                                            /*cancellable=*/nullptr,
+                                            &err)) {
+      if (const char* ct = g_file_info_get_content_type(info)) contentType = ct;
+      g_object_unref(info);
+    }
+    if (err) {
+      wxString errWx = err->message ? wxString::FromUTF8(err->message) : "Unable to determine file type.";
+      g_error_free(err);
+      g_object_unref(file);
+      wxMessageBox(wxString::Format("Open With... failed:\n\n%s\n\n%s",
+                                    wxString::FromUTF8(displayLabel).c_str(),
+                                    errWx.c_str()),
+                   "Open With...",
+                   wxOK | wxICON_ERROR,
+                   DialogParent());
+      return;
+    }
+    if (contentType.empty()) {
+      g_object_unref(file);
+      OpenSelection();
+      return;
+    }
+
+    auto apps = CollectOpenWithApps(contentType, /*allowSelf=*/!isLocalFile);
+    if (apps.empty()) {
+      g_object_unref(file);
+      wxMessageBox("No applications were found for this file type.",
+                   "Open With...",
+                   wxOK | wxICON_INFORMATION,
+                   DialogParent());
+      return;
+    }
+
+    const auto choice = PromptOpenWith(DialogParent(), contentType, apps);
+    if (!choice) {
+      g_object_unref(file);
+      for (auto& a : apps) g_object_unref(a.app);
+      return;
+    }
+
+    const int sel = choice->selection;
+
+    // Launch selected app.
+    GError* launchErr = nullptr;
+    gboolean ok = FALSE;
+    if (char* uri = g_file_get_uri(file)) {
+      GList* uris = nullptr;
+      uris = g_list_append(uris, uri);
+      ok = g_app_info_launch_uris(apps[static_cast<size_t>(sel)].app, uris, nullptr, &launchErr);
+      g_list_free(uris);
+      g_free(uri);
+    } else {
+      GList* files = nullptr;
+      files = g_list_append(files, file);
+      ok = g_app_info_launch(apps[static_cast<size_t>(sel)].app, files, nullptr, &launchErr);
+      g_list_free(files);
+    }
+
+    if (!ok) {
+      wxString errWx = "Unable to open this item.";
+      if (launchErr && launchErr->message) errWx = wxString::FromUTF8(launchErr->message);
+      if (launchErr) g_error_free(launchErr);
+      wxMessageBox(wxString::Format("Failed to open:\n\n%s\n\n%s",
+                                    wxString::FromUTF8(displayLabel).c_str(),
+                                    errWx.c_str()),
+                   "Open With...",
+                   wxOK | wxICON_ERROR,
+                   DialogParent());
+    } else {
+      if (choice->setDefault) {
+        GError* setErr = nullptr;
+        const gboolean setOk = g_app_info_set_as_default_for_type(apps[static_cast<size_t>(sel)].app,
+                                                                  contentType.c_str(),
+                                                                  &setErr);
+        if (!setOk) {
+          wxString setErrWx = "Unable to set default application.";
+          if (setErr && setErr->message) setErrWx = wxString::FromUTF8(setErr->message);
+          if (setErr) g_error_free(setErr);
+          wxMessageBox(setErrWx, "Open With...", wxOK | wxICON_WARNING, DialogParent());
+        }
+      }
+    }
+
+    g_object_unref(file);
+    for (auto& a : apps) g_object_unref(a.app);
+#endif
+  }, ID_CTX_OPEN_WITH);
   menu.Bind(wxEVT_MENU, [this](wxCommandEvent&) { RefreshAll(); }, ID_CTX_REFRESH);
   menu.Bind(wxEVT_MENU, [this, selected](wxCommandEvent&) {
     if (selected.size() != 1) return;
