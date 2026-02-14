@@ -34,6 +34,7 @@ public:
   struct Entry {
     std::string name;
     bool isDir{false};
+    std::string contentType;
     std::string typeLabel;
     std::uintmax_t size{0};
     std::string modified;
@@ -137,6 +138,7 @@ private:
   void SetStatus(const wxString& message);
   void Populate(const std::vector<Entry>& entries);
   wxWindow* DialogParent() const;
+  void PasteInto(const std::filesystem::path& dstDir);
   bool IsExtractableArchivePath(const std::filesystem::path& path) const;
   void ExtractArchiveTo(const std::filesystem::path& archivePath, const std::filesystem::path& dstDir);
   bool HasCommand(const wxString& name) const;

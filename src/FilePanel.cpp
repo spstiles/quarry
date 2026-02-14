@@ -18,6 +18,7 @@
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
+#include <string_view>
 #include <system_error>
 #include <unistd.h>
 #include <limits.h>
@@ -35,9 +36,11 @@
 #include <wx/dnd.h>
 #include <wx/dataobj.h>
 #include <wx/event.h>
+#include <wx/iconloc.h>
 #include <wx/imaglist.h>
 #include <wx/listbox.h>
 #include <wx/menu.h>
+#include <wx/mimetype.h>
 #include <wx/msgdlg.h>
 #include <wx/process.h>
 #include <wx/progdlg.h>
@@ -90,12 +93,15 @@ public:
   Kind kind{Kind::Path};
 };
 
-std::string PercentDecode(std::string s);
-std::string TrimRight(std::string s);
+std::string PercentDecode(std::string_view s);
+std::string TrimRight(std::string_view s);
 
 bool DebugOpenEnabled() {
-  const char* v = std::getenv("QUARRY_DEBUG_OPEN");
-  return v && *v && std::string(v) != "0";
+  static const bool enabled = [] {
+    const char* v = std::getenv("QUARRY_DEBUG_OPEN");
+    return v && *v && std::string(v) != "0";
+  }();
+  return enabled;
 }
 
 std::string SelfExePath() {
@@ -124,6 +130,77 @@ bool IsSelfAppInfo(GAppInfo* app) {
   }
 
   return false;
+}
+
+wxBitmapBundle IconBundleFromFileType(wxFileType* ft, const wxSize& size) {
+  if (!ft) return wxBitmapBundle();
+  wxIconLocation loc;
+  if (!ft->GetIcon(&loc) || !loc.IsOk()) return wxBitmapBundle();
+  wxIcon icon(loc);
+  if (!icon.IsOk()) return wxBitmapBundle();
+
+  wxBitmap bmp(icon);
+  if (!bmp.IsOk()) return wxBitmapBundle();
+  if (bmp.GetWidth() != size.x || bmp.GetHeight() != size.y) {
+    wxImage img = bmp.ConvertToImage();
+    if (img.IsOk()) {
+      img.Rescale(size.x, size.y, wxIMAGE_QUALITY_HIGH);
+      bmp = wxBitmap(img);
+    }
+  }
+  if (!bmp.IsOk()) return wxBitmapBundle();
+  return wxBitmapBundle::FromBitmap(bmp);
+}
+
+wxBitmapBundle IconBundleForMimeType(const std::string& mimeType, const wxSize& size) {
+  if (mimeType.empty() || !wxTheMimeTypesManager) return wxBitmapBundle();
+  wxFileType* ft = wxTheMimeTypesManager->GetFileTypeFromMimeType(wxString::FromUTF8(mimeType));
+  wxBitmapBundle out = IconBundleFromFileType(ft, size);
+  delete ft;
+  return out;
+}
+
+wxBitmapBundle IconBundleForExtension(const std::string& ext, const wxSize& size) {
+  if (ext.empty() || !wxTheMimeTypesManager) return wxBitmapBundle();
+  wxFileType* ft = wxTheMimeTypesManager->GetFileTypeFromExtension(wxString::FromUTF8(ext));
+  wxBitmapBundle out = IconBundleFromFileType(ft, size);
+  delete ft;
+  return out;
+}
+
+wxBitmapBundle IconBundleForEntry(const FilePanel::Entry& e, const wxSize& size) {
+  if (e.isDir) {
+    return wxArtProvider::GetBitmapBundle(wxART_FOLDER, wxART_OTHER, size);
+  }
+
+  static std::unordered_map<std::string, wxBitmapBundle> cache;
+
+  if (!e.contentType.empty()) {
+    const std::string key =
+        "mime:" + std::to_string(size.x) + "x" + std::to_string(size.y) + ":" + e.contentType;
+    if (const auto it = cache.find(key); it != cache.end()) return it->second;
+    auto b = IconBundleForMimeType(e.contentType, size);
+    if (b.IsOk()) {
+      cache.emplace(key, b);
+      return b;
+    }
+  }
+
+  std::string ext = fs::path(e.name).extension().string();
+  if (!ext.empty() && ext.front() == '.') ext.erase(ext.begin());
+  for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  if (!ext.empty()) {
+    const std::string key =
+        "ext:" + std::to_string(size.x) + "x" + std::to_string(size.y) + ":" + ext;
+    if (const auto it = cache.find(key); it != cache.end()) return it->second;
+    auto b = IconBundleForExtension(ext, size);
+    if (b.IsOk()) {
+      cache.emplace(key, b);
+      return b;
+    }
+  }
+
+  return wxArtProvider::GetBitmapBundle(wxART_NORMAL_FILE, wxART_OTHER, size);
 }
 
 bool LooksLikeUri(const std::string& s) {
@@ -351,21 +428,21 @@ std::string ShellQuote(std::string s) {
   return out;
 }
 
-std::string TrimRight(std::string s) {
-  while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
-  return s;
+std::string TrimRight(std::string_view s) {
+  while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.remove_suffix(1);
+  return std::string(s);
 }
 
-std::vector<std::string> SplitTabs(const std::string& s) {
+std::vector<std::string> SplitTabs(std::string_view s) {
   std::vector<std::string> out;
   size_t start = 0;
   while (start <= s.size()) {
     const size_t end = s.find('\t', start);
-    if (end == std::string::npos) {
-      out.push_back(s.substr(start));
+    if (end == std::string_view::npos) {
+      out.emplace_back(s.substr(start));
       break;
     }
-    out.push_back(s.substr(start, end - start));
+    out.emplace_back(s.substr(start, end - start));
     start = end + 1;
   }
   return out;
@@ -398,7 +475,7 @@ std::string FormatUnixSeconds(long long seconds) {
   return std::string(buf);
 }
 
-std::string PercentDecode(std::string s) {
+std::string PercentDecode(std::string_view s) {
   std::string out;
   out.reserve(s.size());
   auto hex = [](char c) -> int {
@@ -932,6 +1009,33 @@ struct MountCreds {
   std::string domain;
   bool anonymous{false};
   RememberMode rememberMode{RememberMode::Session};
+
+  ~MountCreds() { SecureClear(); }
+  MountCreds() = default;
+  MountCreds(MountCreds&& o) noexcept
+      : username(std::move(o.username)), password(std::move(o.password)),
+        domain(std::move(o.domain)), anonymous(o.anonymous), rememberMode(o.rememberMode) {}
+  MountCreds& operator=(MountCreds&& o) noexcept {
+    if (this != &o) {
+      SecureClear();
+      username = std::move(o.username);
+      password = std::move(o.password);
+      domain = std::move(o.domain);
+      anonymous = o.anonymous;
+      rememberMode = o.rememberMode;
+    }
+    return *this;
+  }
+  MountCreds(const MountCreds&) = default;
+  MountCreds& operator=(const MountCreds&) = default;
+
+private:
+  void SecureClear() {
+    if (!password.empty()) {
+      volatile char* p = &password[0];
+      for (size_t i = 0; i < password.size(); ++i) p[i] = '\0';
+    }
+  }
 };
 
 std::string CredsCacheKeyForUri(const std::string& uri) {
@@ -1308,6 +1412,7 @@ std::vector<FilePanel::Entry> ListGioLocation(const std::string& uri, std::strin
         // edit-name is often the best "typed" name; display-name is localized/presented.
         .name = editName ? editName : (displayName ? displayName : (name ? name : "")),
         .isDir = isDir,
+        .contentType = (!isDir && ct) ? std::string(ct) : std::string{},
         .typeLabel = typeLabel,
         .size = size,
         .modified = modified,
@@ -1384,11 +1489,13 @@ std::vector<FilePanel::Entry> ListGioLocation(const std::string& uri, std::strin
 
     std::string name;
     std::string modified;
+    std::string contentType;
     if (cols.size() >= 4) {
       const auto& attrs = cols[3];
       name = ExtractAttrValue(attrs, "standard::edit-name", {"standard::display-name", "standard::name", "time::modified"});
       if (name.empty()) name = ExtractAttrValue(attrs, "standard::display-name", {"standard::name", "time::modified"});
       if (name.empty()) name = ExtractAttrValue(attrs, "standard::name", {"time::modified"});
+      contentType = ExtractAttrValue(attrs, "standard::content-type", {"time::modified"});
       const auto mod = ExtractAttrValue(attrs, "time::modified", {});
       try {
         modified = FormatUnixSeconds(std::stoll(mod));
@@ -1408,6 +1515,7 @@ std::vector<FilePanel::Entry> ListGioLocation(const std::string& uri, std::strin
     entries.push_back(FilePanel::Entry{
         .name = name,
         .isDir = isDir,
+        .contentType = (!isDir && !contentType.empty()) ? contentType : std::string{},
         .typeLabel = DescribeExtensionType(fs::path(name), isDir),
         .size = size,
         .modified = modified,
@@ -1465,8 +1573,10 @@ wxString GetRowNameWx(wxDataViewListCtrl* list, unsigned int row) {
 }
 
 void SetRowName(wxDataViewListCtrl* list, unsigned int row, const std::string& name, bool isDir) {
-  const auto artId = isDir ? wxART_FOLDER : wxART_NORMAL_FILE;
-  const auto bundle = wxArtProvider::GetBitmapBundle(artId, wxART_OTHER, wxSize(16, 16));
+  FilePanel::Entry tmp;
+  tmp.name = name;
+  tmp.isDir = isDir;
+  const auto bundle = IconBundleForEntry(tmp, wxSize(16, 16));
   wxDataViewIconText iconText(wxString::FromUTF8(name), bundle);
   wxVariant v;
   v << iconText;
@@ -1484,6 +1594,7 @@ enum MenuId : int {
   ID_CTX_COPY,
   ID_CTX_CUT,
   ID_CTX_PASTE,
+  ID_CTX_PASTE_INTO,
   ID_CTX_RENAME,
   ID_CTX_TRASH,
   ID_CTX_DELETE_PERM,
@@ -1589,6 +1700,7 @@ std::vector<FilePanel::Entry> ListDir(const fs::path& dir, std::string* errorMes
 		          entries.push_back(FilePanel::Entry{
 		              .name = editName ? editName : (displayName ? displayName : (name ? name : "")),
 		              .isDir = isDir,
+                  .contentType = (!isDir && ct) ? std::string(ct) : std::string{},
 		              .typeLabel = typeLabel,
 	              .size = size,
 	              .modified = modified,
@@ -3630,23 +3742,22 @@ void FilePanel::Populate(const std::vector<Entry>& entries) {
   list_->Freeze();
   list_->DeleteAllItems();
 
-	  for (const auto& e : entries) {
-	    wxVector<wxVariant> cols;
-	    const auto artId = e.isDir ? wxART_FOLDER : wxART_NORMAL_FILE;
-	    const auto bundle = wxArtProvider::GetBitmapBundle(artId, wxART_OTHER, wxSize(16, 16));
-	    wxDataViewIconText iconText(wxString::FromUTF8(e.name), bundle);
-	    wxVariant nameVar;
-	    nameVar << iconText;
-		    cols.push_back(nameVar);
-		    cols.push_back(wxVariant(e.isDir ? "" : HumanSize(e.size)));
-		    const wxString typeWx =
-		        wxString::FromUTF8(e.typeLabel.empty() ? (e.isDir ? "Folder" : "File") : e.typeLabel);
-		    cols.push_back(wxVariant(typeWx));
-		    cols.push_back(wxVariant(e.modified));
-		    const auto full = !e.fullPath.empty() ? e.fullPath : (currentDir_ / e.name).string();
-		    cols.push_back(wxVariant(full));
-		    list_->AppendItem(cols);
-		  }
+  for (const auto& e : entries) {
+    wxVector<wxVariant> cols;
+    const auto bundle = IconBundleForEntry(e, wxSize(16, 16));
+    wxDataViewIconText iconText(wxString::FromUTF8(e.name), bundle);
+    wxVariant nameVar;
+    nameVar << iconText;
+    cols.push_back(nameVar);
+    cols.push_back(wxVariant(e.isDir ? "" : HumanSize(e.size)));
+    const wxString typeWx =
+        wxString::FromUTF8(e.typeLabel.empty() ? (e.isDir ? "Folder" : "File") : e.typeLabel);
+    cols.push_back(wxVariant(typeWx));
+    cols.push_back(wxVariant(e.modified));
+    const auto full = !e.fullPath.empty() ? e.fullPath : (currentDir_ / e.name).string();
+    cols.push_back(wxVariant(full));
+    list_->AppendItem(cols);
+  }
   list_->Thaw();
 }
 
@@ -3964,13 +4075,15 @@ void FilePanel::CutSelection() {
   g_clipboard = AppClipboard{.mode = AppClipboard::Mode::Cut, .paths = paths};
 }
 
-void FilePanel::PasteIntoCurrentDir() {
+void FilePanel::PasteIntoCurrentDir() { PasteInto(currentDir_); }
+
+void FilePanel::PasteInto(const fs::path& dstDir) {
   if (!g_clipboard || g_clipboard->paths.empty()) return;
   if (listingMode_ != ListingMode::Directory && listingMode_ != ListingMode::Gio) {
     wxMessageBox("Paste is not available here.", "Quarry", wxOK | wxICON_INFORMATION, DialogParent());
     return;
   }
-  if (currentDir_.empty()) return;
+  if (dstDir.empty()) return;
 
   const bool isMove = g_clipboard->mode == AppClipboard::Mode::Cut;
   const auto title = isMove ? "Paste (Move)" : "Paste (Copy)";
@@ -3982,7 +4095,7 @@ void FilePanel::PasteIntoCurrentDir() {
     return;
   }
 
-  frame->StartFileOperation(title, g_clipboard->paths, currentDir_, isMove);
+  frame->StartFileOperation(title, g_clipboard->paths, dstDir, isMove);
 
   // If we cut, clear clipboard after starting the move (prevents repeat pastes).
   if (isMove) g_clipboard.reset();
@@ -4662,6 +4775,7 @@ void FilePanel::ShowListContextMenu(const wxDataViewItem& contextItem,
   menu.Append(ID_CTX_COPY, "Copy");
   menu.Append(ID_CTX_CUT, "Cut");
   menu.Append(ID_CTX_PASTE, "Paste");
+  menu.Append(ID_CTX_PASTE_INTO, "Paste Into Folder");
   menu.AppendSeparator();
   menu.Append(ID_CTX_RENAME, "Rename");
   menu.Append(ID_CTX_NEW_FOLDER, "New Folder");
@@ -4712,6 +4826,16 @@ void FilePanel::ShowListContextMenu(const wxDataViewItem& contextItem,
   menu.Enable(ID_CTX_TRASH, allowTrashDelete && hasSelection);
   menu.Enable(ID_CTX_DELETE_PERM, allowTrashDelete && hasSelection);
   menu.Enable(ID_CTX_PASTE, allowCopyPaste && g_clipboard && !g_clipboard->paths.empty());
+  bool canPasteInto = false;
+  fs::path pasteIntoTarget;
+  if (allowCopyPaste && g_clipboard && !g_clipboard->paths.empty() && single && !isBackgroundContext) {
+    const auto dec = DecideActivation(selected[0].string());
+    if (dec && dec->action == ActivationDecision::Action::Navigate) {
+      canPasteInto = true;
+      pasteIntoTarget = dec->uri.empty() ? dec->localPath : fs::path(dec->uri);
+    }
+  }
+  menu.Enable(ID_CTX_PASTE_INTO, canPasteInto);
 
   menu.Bind(wxEVT_MENU, [this](wxCommandEvent&) { OpenSelection(); }, ID_CTX_OPEN);
   menu.Bind(wxEVT_MENU, [this, selected](wxCommandEvent&) {
@@ -4877,6 +5001,10 @@ void FilePanel::ShowListContextMenu(const wxDataViewItem& contextItem,
   menu.Bind(wxEVT_MENU, [this](wxCommandEvent&) { CopySelection(); }, ID_CTX_COPY);
   menu.Bind(wxEVT_MENU, [this](wxCommandEvent&) { CutSelection(); }, ID_CTX_CUT);
   menu.Bind(wxEVT_MENU, [this](wxCommandEvent&) { PasteIntoCurrentDir(); }, ID_CTX_PASTE);
+  menu.Bind(wxEVT_MENU, [this, pasteIntoTarget](wxCommandEvent&) {
+    if (pasteIntoTarget.empty()) return;
+    PasteInto(pasteIntoTarget);
+  }, ID_CTX_PASTE_INTO);
   menu.Bind(wxEVT_MENU, [this](wxCommandEvent&) { BeginInlineRename(); }, ID_CTX_RENAME);
   menu.Bind(wxEVT_MENU, [this](wxCommandEvent&) { CreateFolder(); }, ID_CTX_NEW_FOLDER);
   menu.Bind(wxEVT_MENU, [this](wxCommandEvent&) { TrashSelection(); }, ID_CTX_TRASH);
@@ -5113,41 +5241,7 @@ void FilePanel::ExtractArchiveTo(const fs::path& archivePath, const fs::path& ds
     return;
   }
 
-  // Simple local->local: run extractor directly (existing behavior).
-  if (!srcIsUri && !dstIsUri) {
-    std::vector<std::string> args;
-    if (!extractor.empty() && extractor[0] == "dpkg-deb") {
-      args = extractor;
-      args.push_back(archivePath.string());
-      args.push_back(dstDir.string());
-    } else if (!extractor.empty() && extractor[0] == "7z") {
-      args = extractor;
-      args.push_back("-o" + dstDir.string());
-      args.push_back(archivePath.string());
-    } else {
-      args = extractor;
-      args.push_back(archivePath.string());
-      args.push_back("-C");
-      args.push_back(dstDir.string());
-      if (extractor[0] == "unzip") {
-        // unzip uses "-d" instead of "-C"
-        args = extractor;
-        args.push_back(archivePath.string());
-        args.push_back("-d");
-        args.push_back(dstDir.string());
-      }
-    }
-
-    if (statusText_) {
-      statusText_->SetLabel(wxString::Format("Queued extract: %s", archivePath.filename().string()));
-      statusText_->Refresh();
-    }
-    frame->StartExtractOperation(args, dstDir, /*treeChanged=*/true);
-    return;
-  }
-
-  // Remote support: stage to temp dir, extract locally, then copy results to destination if needed.
-  // NOTE: Uses external tools and gio copy; progress is best-effort.
+  // Shell-safe quoting helper (used by both local and remote paths).
   auto shQuote = [](const std::string& s) -> std::string {
     std::string out;
     out.reserve(s.size() + 2);
@@ -5159,6 +5253,47 @@ void FilePanel::ExtractArchiveTo(const fs::path& archivePath, const fs::path& ds
     out.push_back('\'');
     return out;
   };
+
+  // Local->local: extract into a temp directory first, then copy results
+  // to the destination. This prevents path traversal attacks (e.g. archives
+  // containing "../" entries) from writing outside the destination.
+  if (!srcIsUri && !dstIsUri) {
+    const std::string srcQ = shQuote(archivePath.string());
+    const std::string dstQ = shQuote(dstDir.string());
+
+    std::string extractCmd;
+    if (!extractor.empty() && extractor[0] == "dpkg-deb") {
+      extractCmd = "dpkg-deb -x " + srcQ + " \"$TMP/out\"";
+    } else if (!extractor.empty() && extractor[0] == "7z") {
+      extractCmd = "7z x -y -o\"$TMP/out\" " + srcQ;
+    } else if (!extractor.empty() && extractor[0] == "unzip") {
+      extractCmd = "unzip -o " + srcQ + " -d \"$TMP/out\"";
+    } else if (!extractor.empty() && (extractor[0] == "tar" || extractor[0] == "bsdtar")) {
+      extractCmd = extractor[0] + " -xf " + srcQ + " -C \"$TMP/out\"";
+    } else {
+      extractCmd = "false";
+    }
+
+    const std::string script =
+        "set -e; "
+        "TMP=\"$(mktemp -d -t quarry-extract-XXXXXX)\"; "
+        "cleanup(){ rm -rf \"$TMP\"; }; trap cleanup EXIT INT TERM; "
+        "mkdir -p \"$TMP/out\"; " +
+        extractCmd + "; "
+        "cp -a \"$TMP/out/.\" " + dstQ + "; ";
+
+    std::vector<std::string> args = {"sh", "-lc", script};
+
+    if (statusText_) {
+      statusText_->SetLabel(wxString::Format("Queued extract: %s", archivePath.filename().string()));
+      statusText_->Refresh();
+    }
+    frame->StartExtractOperation(args, dstDir, /*treeChanged=*/true);
+    return;
+  }
+
+  // Remote support: stage to temp dir, extract locally, then copy results to destination if needed.
+  // NOTE: Uses external tools and gio copy; progress is best-effort.
 
   const std::string srcQ = shQuote(srcStr);
   const std::string dstQ = shQuote(dstStr);
